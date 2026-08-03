@@ -10,5 +10,6 @@ Non-negotiables:
 - Search for duplicates BEFORE filing (JQL on project = AOS).
 - Description template: `## Repro / ## Expected / ## Actual / ## Evidence / ## Suspected cause / ## Refs`. Stories: current vs desired behavior + acceptance criteria.
 - QA sweeps: one tracking Task ("QA sweep — <scope> <date>"), findings filed as linked issues.
+- **Milestones = JIRA releases** (fix versions). Every issue gets the `fixVersion` of the release that ships it (first milestone: `v0.1.0` — plugin MVP, epic AOS-1). Releases are created in the AgentOS UI (Releases page) — the MCP connector cannot create them, only assign existing ones. Milestone-sized integration verification (per CLAUDE.md standing rules) is gated per release.
 
 Filing with fully-prepared content is ponytail (micro-model) work; drafting content from raw findings is default-worker work.
