@@ -207,10 +207,16 @@ def log_error():
 
 
 def main():
+    # No disk writes of any kind - including error.log - are allowed before
+    # opt-in is positively established. `enabled` must be set before the
+    # first statement that can raise, so a malformed-stdin or unresolvable-cwd
+    # failure (which happens pre-gate) exits silently instead of logging.
+    enabled = False
     try:
         hook = json.load(sys.stdin)
         cwd = hook.get("cwd") or os.getcwd()
-        if not is_enabled(cwd):
+        enabled = is_enabled(cwd)
+        if not enabled:
             return
         transcript = hook.get("transcript_path")
         if not transcript or not os.path.exists(transcript):
@@ -243,7 +249,8 @@ def main():
         finally:
             conn.close()
     except Exception:
-        log_error()
+        if enabled:
+            log_error()
 
 
 if __name__ == "__main__":
