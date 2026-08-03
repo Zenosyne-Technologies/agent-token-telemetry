@@ -7,26 +7,42 @@ Report token usage from `~/.claude/telemetry/usage.db`. If the file does not exi
 
 Run these queries with `sqlite3 -header -column ~/.claude/telemetry/usage.db "<SQL>"`:
 
-Totals (today and last 7 days):
+Totals for today (from start of day):
 
 ```sql
-SELECT CASE WHEN ts >= strftime('%s','now','start of day') THEN 'today' ELSE 'last 7d' END AS period,
-       SUM(in_tok) AS input, SUM(out_tok) AS output,
+SELECT SUM(in_tok) AS input, SUM(out_tok) AS output,
        SUM(cache_r) AS cache_read, SUM(cache_w) AS cache_write,
        COUNT(*) AS events
-FROM events WHERE ts >= strftime('%s','now','-7 days')
-GROUP BY period ORDER BY period DESC;
+FROM events WHERE ts >= strftime('%s','now','start of day');
+```
+
+Totals for the trailing 7 days (including today):
+
+```sql
+SELECT SUM(in_tok) AS input, SUM(out_tok) AS output,
+       SUM(cache_r) AS cache_read, SUM(cache_w) AS cache_write,
+       COUNT(*) AS events
+FROM events WHERE ts >= strftime('%s','now','-7 days');
 ```
 
 By project (last 7 days):
 
 ```sql
 SELECT p.path, SUM(e.in_tok) AS input, SUM(e.out_tok) AS output,
-       SUM(e.cache_r) AS cache_read, COUNT(*) AS events
+       SUM(e.cache_r) AS cache_read, SUM(e.cache_w) AS cache_write, COUNT(*) AS events
 FROM events e JOIN sessions s ON s.id = e.session_id
 JOIN projects p ON p.id = s.project_id
 WHERE e.ts >= strftime('%s','now','-7 days')
 GROUP BY p.path ORDER BY output DESC;
+```
+
+By agent (last 7 days):
+
+```sql
+SELECT COALESCE(agent, CASE kind WHEN 0 THEN 'main' ELSE 'subagent' END) AS agent,
+       SUM(in_tok) AS input, SUM(out_tok) AS output, COUNT(*) AS events
+FROM events WHERE ts >= strftime('%s','now','-7 days')
+GROUP BY 1 ORDER BY output DESC;
 ```
 
 By model (last 7 days):
