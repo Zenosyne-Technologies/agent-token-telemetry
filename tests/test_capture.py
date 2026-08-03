@@ -221,6 +221,9 @@ class TestMain(unittest.TestCase):
     def test_malformed_stdin_never_raises(self):
         sys.stdin = io.StringIO("this is not json")
         capture.main()  # must not raise
+        # Pre-opt-in failures must write nothing to disk - not even the
+        # telemetry directory itself.
+        self.assertFalse(self.db.parent.exists())
 
     def test_missing_transcript_never_raises(self):
         (self.proj / ".claude" / "telemetry").touch()
@@ -230,6 +233,15 @@ class TestMain(unittest.TestCase):
         }))
         capture.main()  # must not raise
         self.assertEqual(self.count_events(), 0)
+
+    def test_error_after_optin_still_logged(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        write_jsonl(self.transcript, [entry()])
+        # Force a failure after the opt-in gate: pre-create the DB path as a
+        # directory so sqlite3.connect() raises.
+        self.db.mkdir(parents=True)
+        self.run_main()  # must not raise
+        self.assertTrue((self.db.parent / "error.log").exists())
 
 
 class TestConcurrency(unittest.TestCase):

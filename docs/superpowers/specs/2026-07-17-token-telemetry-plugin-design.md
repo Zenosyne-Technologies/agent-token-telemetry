@@ -38,7 +38,7 @@ Input: hook JSON on stdin (`session_id`, `cwd`, `transcript_path`, `hook_event_n
 2. **Incremental read:** `cursors` table stores last byte offset per transcript (append-only JSONL). Read only new bytes → constant cost regardless of session length; re-fired hooks re-read nothing (this is the dedup mechanism).
 3. **Aggregate delta:** sum `message.usage` fields (input, output, cache-read, cache-creation) of new assistant entries, grouped by model → one row per model in the delta (normally exactly one). `dur_ms` = last − first timestamp in delta. Git branch/commit via `git -C <cwd>` (best-effort, empty on failure).
 4. **Single transaction:** insert event row(s) + upsert cursor. DB in WAL mode (parallel sessions/subagents don't block).
-5. **Never break a session:** top-level try/except; always exit 0; failures appended to `~/.claude/telemetry/error.log`.
+5. **Never break a session:** top-level try/except; always exits 0 regardless; failures are logged to `~/.claude/telemetry/error.log` only once opt-in is established (step 1) — earlier failures exit silently.
 6. Zero-token deltas (no new assistant usage) insert nothing.
 
 ## Schema
