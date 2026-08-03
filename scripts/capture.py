@@ -205,6 +205,12 @@ def main():
         transcript = hook.get("transcript_path")
         if not transcript or not os.path.exists(transcript):
             return
+        # git_meta() shells out to git (up to ~4s across two calls) and has no
+        # dependency on cursor/DB state, so it must run before the write lock
+        # is taken below — otherwise it would hold that lock for the duration
+        # of the subprocess calls, and a peer process's own BEGIN IMMEDIATE
+        # could exceed connect()'s 5s busy-wait and drop its event.
+        branch, sha = git_meta(cwd)
         conn = connect(db_path())
         try:
             # Take the write lock up front so concurrent hook firings on the
@@ -219,7 +225,6 @@ def main():
             if not groups and new_offset == offset:
                 conn.rollback()
                 return
-            branch, sha = git_meta(cwd)
             kind_hint = 1 if hook.get("hook_event_name") == "SubagentStop" else 0
             agent = hook.get("agent_type") or hook.get("agent_name")
             record(conn, str(find_project_root(cwd)),
