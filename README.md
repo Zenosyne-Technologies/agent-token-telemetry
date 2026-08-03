@@ -23,8 +23,10 @@ Restart Claude Code (hooks load at session start).
 
 Data lives in `~/.claude/telemetry/usage.db` (SQLite, WAL). Query it directly
 with sqlite3/DuckDB/Grafana. Capture errors go to `~/.claude/telemetry/error.log`
-and never break a session. Cost is never stored — it is derived at query time
-from the pricing map in `commands/token-stats.md`.
+and never break a session — that error log is written regardless of per-project
+opt-in, since opt-in gates usage capture, not the plugin's own error log. Cost
+is never stored — it is derived at query time from the pricing map in
+`commands/token-stats.md`.
 
 ## Design
 
