@@ -153,3 +153,71 @@ def record(conn, project, session_uuid, kind_hint, agent, groups,
             "INSERT INTO cursors(transcript, offset, session_id) VALUES (?,?,?)"
             " ON CONFLICT(transcript) DO UPDATE SET offset=excluded.offset",
             (str(transcript), new_offset, session_id))
+
+
+def find_project_root(cwd):
+    p = Path(cwd)
+    for candidate in (p, *p.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return p
+
+
+def is_enabled(cwd):
+    root = find_project_root(cwd)
+    return ((Path(cwd) / ".claude" / "telemetry").exists()
+            or (root / ".claude" / "telemetry").exists())
+
+
+def git_meta(cwd):
+    def run(*args):
+        try:
+            out = subprocess.run(["git", "-C", str(cwd), *args],
+                                 capture_output=True, text=True, timeout=2)
+            return out.stdout.strip() or None
+        except Exception:
+            return None
+    return run("rev-parse", "--abbrev-ref", "HEAD"), run("rev-parse", "--short", "HEAD")
+
+
+def log_error():
+    try:
+        log = db_path().parent / "error.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a") as f:
+            f.write(f"--- {datetime.now().isoformat()}\n{traceback.format_exc()}\n")
+    except Exception:
+        pass
+
+
+def main():
+    try:
+        hook = json.load(sys.stdin)
+        cwd = hook.get("cwd") or os.getcwd()
+        if not is_enabled(cwd):
+            return
+        transcript = hook.get("transcript_path")
+        if not transcript or not os.path.exists(transcript):
+            return
+        conn = connect(db_path())
+        try:
+            offset = get_offset(conn, transcript)
+            entries, new_offset = read_new_entries(transcript, offset)
+            groups = aggregate(entries)
+            if not groups and new_offset == offset:
+                return
+            branch, sha = git_meta(cwd)
+            kind_hint = 1 if hook.get("hook_event_name") == "SubagentStop" else 0
+            agent = hook.get("agent_type") or hook.get("agent_name")
+            record(conn, str(find_project_root(cwd)),
+                   hook.get("session_id") or "unknown", kind_hint, agent,
+                   groups, transcript, new_offset, branch, sha)
+        finally:
+            conn.close()
+    except Exception:
+        log_error()
+
+
+if __name__ == "__main__":
+    main()
+    sys.exit(0)

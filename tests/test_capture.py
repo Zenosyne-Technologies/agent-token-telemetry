@@ -151,5 +151,85 @@ class TestDbLayer(unittest.TestCase):
         self.assertEqual(agent, "explorer")
 
 
+import io
+import os
+import sqlite3 as _sqlite3
+
+
+class TestMain(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.proj = self.root / "proj"
+        (self.proj / ".claude").mkdir(parents=True)
+        self.transcript = self.root / "sess.jsonl"
+        self.db = self.root / "telemetry" / "usage.db"
+        os.environ["TOKEN_TELEMETRY_DB"] = str(self.db)
+        self._stdin = sys.stdin
+
+    def tearDown(self):
+        sys.stdin = self._stdin
+        os.environ.pop("TOKEN_TELEMETRY_DB", None)
+        self.tmp.cleanup()
+
+    def run_main(self, session_id="sess-1", event="Stop"):
+        sys.stdin = io.StringIO(json.dumps({
+            "session_id": session_id,
+            "transcript_path": str(self.transcript),
+            "cwd": str(self.proj),
+            "hook_event_name": event,
+        }))
+        capture.main()
+
+    def count_events(self):
+        if not self.db.exists():
+            return 0
+        conn = _sqlite3.connect(self.db)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_no_marker_no_db(self):
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertFalse(self.db.exists())
+
+    def test_marker_records_event(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.count_events(), 1)
+
+    def test_refire_is_noop(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.run_main()  # nothing new appended
+        self.assertEqual(self.count_events(), 1)
+
+    def test_incremental_second_turn(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        with open(self.transcript, "ab") as f:
+            f.write(json.dumps(entry(inp=1)).encode() + b"\n")
+        self.run_main()
+        self.assertEqual(self.count_events(), 2)
+
+    def test_malformed_stdin_never_raises(self):
+        sys.stdin = io.StringIO("this is not json")
+        capture.main()  # must not raise
+
+    def test_missing_transcript_never_raises(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        sys.stdin = io.StringIO(json.dumps({
+            "session_id": "s", "transcript_path": str(self.root / "nope.jsonl"),
+            "cwd": str(self.proj), "hook_event_name": "Stop",
+        }))
+        capture.main()  # must not raise
+        self.assertEqual(self.count_events(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
