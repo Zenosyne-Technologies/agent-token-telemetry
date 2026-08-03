@@ -172,8 +172,14 @@ def is_enabled(cwd):
 def git_meta(cwd):
     def run(*args):
         try:
-            out = subprocess.run(["git", "-C", str(cwd), *args],
-                                 capture_output=True, text=True, timeout=2)
+            # A hostile repo's tracked .git/config can set core.fsmonitor or
+            # core.hooksPath to run arbitrary programs when git invokes them.
+            # These -c overrides beat repo config and neutralize that; do not
+            # remove them.
+            out = subprocess.run(
+                ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                 "-C", str(cwd), *args],
+                capture_output=True, text=True, timeout=2)
             return out.stdout.strip() or None
         except Exception:
             return None
@@ -201,10 +207,17 @@ def main():
             return
         conn = connect(db_path())
         try:
+            # Take the write lock up front so concurrent hook firings on the
+            # same transcript serialize instead of racing the cursor
+            # read/aggregate/insert sequence (double-count or dropped events).
+            # sqlite3.connect(..., timeout=5) in connect() busy-waits for the
+            # lock; record()'s `with conn:` commits this transaction on exit.
+            conn.execute("BEGIN IMMEDIATE")
             offset = get_offset(conn, transcript)
             entries, new_offset = read_new_entries(transcript, offset)
             groups = aggregate(entries)
             if not groups and new_offset == offset:
+                conn.rollback()
                 return
             branch, sha = git_meta(cwd)
             kind_hint = 1 if hook.get("hook_event_name") == "SubagentStop" else 0
