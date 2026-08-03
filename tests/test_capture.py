@@ -99,5 +99,57 @@ class TestAggregate(unittest.TestCase):
         self.assertAlmostEqual(g["last"] - g["first"], 30.0)
 
 
+class TestDbLayer(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = pathlib.Path(self.tmp.name) / "sub" / "usage.db"
+        self.conn = capture.connect(self.db)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_schema_created_and_idempotent(self):
+        tables = {r[0] for r in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertLessEqual(
+            {"projects", "models", "sessions", "events", "cursors"}, tables)
+        capture.connect(self.db).close()  # second connect must not raise
+
+    def test_get_or_create_dedupes(self):
+        a = capture.get_or_create(self.conn, "models", "name", "claude-sonnet-5")
+        b = capture.get_or_create(self.conn, "models", "name", "claude-sonnet-5")
+        self.assertEqual(a, b)
+
+    def test_record_inserts_events_and_cursor(self):
+        groups = capture.aggregate([entry(), entry(model="claude-haiku-4-5", side=True)])
+        capture.record(self.conn, "/proj", "sess-1", 0, None, groups, "/t.jsonl", 500)
+        rows = self.conn.execute(
+            "SELECT kind, in_tok, out_tok FROM events ORDER BY kind").fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][0], 0)   # main turn
+        self.assertEqual(rows[1][0], 1)   # sidechain -> subagent
+        self.assertEqual(capture.get_offset(self.conn, "/t.jsonl"), 500)
+
+    def test_cursor_upsert_advances(self):
+        groups = capture.aggregate([entry()])
+        capture.record(self.conn, "/proj", "sess-1", 0, None, groups, "/t.jsonl", 100)
+        capture.record(self.conn, "/proj", "sess-1", 0, None, groups, "/t.jsonl", 200)
+        self.assertEqual(capture.get_offset(self.conn, "/t.jsonl"), 200)
+
+    def test_unknown_transcript_offset_is_zero(self):
+        self.assertEqual(capture.get_offset(self.conn, "/never-seen.jsonl"), 0)
+
+    def test_subagent_kind_hint(self):
+        groups = capture.aggregate([entry()])  # not sidechain
+        capture.record(self.conn, "/proj", "sess-1", 1, "explorer", groups, "/t2.jsonl", 50)
+        kind, agent = self.conn.execute(
+            "SELECT kind, agent FROM events WHERE session_id="
+            "(SELECT id FROM sessions WHERE uuid='sess-1') ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(kind, 1)
+        self.assertEqual(agent, "explorer")
+
+
 if __name__ == "__main__":
     unittest.main()
