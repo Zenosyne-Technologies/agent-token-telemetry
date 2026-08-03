@@ -1,0 +1,11 @@
+{
+  "name": "agent-token-telemetry",
+  "owner": { "name": "Zenosyne" },
+  "plugins": [
+    {
+      "name": "token-telemetry",
+      "source": "./",
+      "description": "Token usage telemetry for Claude Code sessions"
+    }
+  ]
+}
