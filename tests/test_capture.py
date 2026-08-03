@@ -154,6 +154,7 @@ class TestDbLayer(unittest.TestCase):
 import io
 import os
 import sqlite3 as _sqlite3
+import subprocess
 
 
 class TestMain(unittest.TestCase):
@@ -229,6 +230,73 @@ class TestMain(unittest.TestCase):
         }))
         capture.main()  # must not raise
         self.assertEqual(self.count_events(), 0)
+
+
+class TestConcurrency(unittest.TestCase):
+    """Regression test for the get_offset/get_or_create race: parallel hook
+    firings against the same DB must neither double-count nor drop events."""
+
+    SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "capture.py"
+    NPROCS = 8
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.proj = self.root / "proj"
+        (self.proj / ".claude").mkdir(parents=True)
+        (self.proj / ".claude" / "telemetry").touch()
+        self.db = self.root / "telemetry" / "usage.db"
+        self.env = dict(os.environ)
+        self.env["TOKEN_TELEMETRY_DB"] = str(self.db)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def count_events(self):
+        conn = _sqlite3.connect(self.db)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_parallel_firings_no_double_count_no_drop(self):
+        model = "claude-never-before-seen-concurrency-model"
+        hook_files = []
+        for i in range(self.NPROCS):
+            transcript = self.root / f"transcript-{i}.jsonl"
+            write_jsonl(transcript, [entry(model=model)])
+            hook_path = self.root / f"hook-{i}.json"
+            hook_path.write_text(json.dumps({
+                "session_id": f"sess-{i}",
+                "transcript_path": str(transcript),
+                "cwd": str(self.proj),
+                "hook_event_name": "SubagentStop",
+            }))
+            hook_files.append(hook_path)
+
+        # Launch all processes first, feeding each its hook JSON from its own
+        # file (not a pipe) so starting them isn't gated on stdin writes -
+        # this keeps the firings genuinely simultaneous.
+        procs = []
+        opened = []
+        for hook_path in hook_files:
+            f = open(hook_path, "r")
+            opened.append(f)
+            procs.append(subprocess.Popen(
+                [sys.executable, str(self.SCRIPT)],
+                stdin=f, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=self.env, text=True))
+
+        results = [p.communicate(timeout=60) for p in procs]
+        returncodes = [p.returncode for p in procs]
+        for f in opened:
+            f.close()
+
+        for rc, (out, err) in zip(returncodes, results):
+            self.assertEqual(rc, 0, f"stdout={out!r} stderr={err!r}")
+
+        self.assertEqual(self.count_events(), self.NPROCS)
+        self.assertFalse((self.db.parent / "error.log").exists())
 
 
 if __name__ == "__main__":
