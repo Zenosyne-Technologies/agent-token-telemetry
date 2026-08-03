@@ -108,7 +108,17 @@ def connect(path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=5)
-    conn.execute("PRAGMA journal_mode=WAL")
+    # The WAL switch needs momentary exclusive access; under a fresh-DB
+    # stampede it can raise "database is locked" despite the busy timeout.
+    # WAL is persistent per-database, so one winner is enough - retry
+    # briefly, then proceed either way (journal mode never affects
+    # correctness, only concurrency performance).
+    for _ in range(20):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            break
+        except sqlite3.OperationalError:
+            time.sleep(0.05)
     conn.executescript(SCHEMA)
     return conn
 
