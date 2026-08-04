@@ -10,6 +10,7 @@ intake_guide_url: https://zenosyne.atlassian.net/browse/AOS-11
 stack: Python 3 (stdlib only) + JSON manifests + markdown slash commands
 dev_command: none (no dev stack/ports); tests: python3 -m unittest tests.test_capture -v
 docs_location: docs/ (long-form docs, issue log, superpowers specs/plans); .docs/agents/ (kit rules cascade)
+telemetry: enabled
 kit_version: 0.11.0
 label_syntax_version: 1.2.0
 ---
