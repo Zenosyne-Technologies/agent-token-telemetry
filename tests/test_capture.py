@@ -311,6 +311,59 @@ class TestSchemaV2(unittest.TestCase):
                                 "abc123", None, None, None)])
 
 
+class TestIssueKeyRegex(unittest.TestCase):
+    def key(self, subject):
+        m = capture.ISSUE_KEY_RE.match(subject)
+        return m.group(1) if m else None
+
+    def test_matches_keys_including_single_char_projects(self):
+        self.assertEqual(self.key("A-1: single letter project"), "A-1")
+        self.assertEqual(self.key("AOS-42: multi letter project"), "AOS-42")
+        self.assertEqual(self.key("A1-2: digits in the key"), "A1-2")
+
+    def test_rejects_non_key_prefixes(self):
+        for subject in ("feat: add a thing", "WIP: stuff", "a-1: lowercase",
+                        "feat(AOS-42): scoped conventional commit",
+                        "fix AOS-42: not a prefix"):
+            self.assertIsNone(self.key(subject), subject)
+
+
+class TestStrandedMigration(unittest.TestCase):
+    """A DB stamped user_version=2 without the v2 columns (a stamp that landed
+    before the ALTERs, or a rollback) must heal on the next connect instead of
+    failing every capture forever."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = pathlib.Path(self.tmp.name) / "usage.db"
+        conn = _sqlite3.connect(self.db)
+        conn.executescript(V1_SCHEMA)
+        conn.execute("INSERT INTO projects(path) VALUES ('/proj')")
+        conn.execute("INSERT INTO models(name) VALUES ('claude-sonnet-5')")
+        conn.execute("INSERT INTO sessions(uuid, project_id) VALUES ('s1', 1)")
+        conn.execute("PRAGMA user_version=2")  # stranded: stamped, no columns
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_stranded_db_heals_on_next_connect(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+        self.assertLessEqual({"issue_key", "task_size", "note"}, cols)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        # The seed gate is re-checked too: pricing was never created before.
+        self.assertGreaterEqual(
+            conn.execute("SELECT COUNT(*) FROM pricing").fetchone()[0], 4)
+        # And capture works end to end against the healed DB.
+        capture.record(conn, "/proj", "s1", 0, None, capture.aggregate([entry()]),
+                       "/t.jsonl", 10, issue_key="AOS-12")
+        self.assertEqual(
+            conn.execute("SELECT issue_key FROM events").fetchall(), [("AOS-12",)])
+
+
 class TestMain(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -454,6 +507,21 @@ class TestMain(unittest.TestCase):
     def test_malformed_sidecar_ignored(self):
         (self.proj / ".claude" / "telemetry").touch()
         self.write_sidecar("{not json,,,")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.count_events(), 1)
+        self.assertEqual(self.event_context(), [(None, None, None)])
+        self.assertFalse((self.db.parent / "error.log").exists())
+
+    def test_oversized_sidecar_ignored(self):
+        # A sidecar this large is not agent-written context; parsing it would
+        # burn time and memory on every hook firing, so it is skipped unread.
+        (self.proj / ".claude" / "telemetry").touch()
+        self.write_sidecar(json.dumps({"issue_key": "AOS-99", "size": "m",
+                                       "summary": "x" * 70000}))
+        self.assertGreater(
+            (self.proj / ".claude" / "telemetry-context.json").stat().st_size,
+            65536)
         write_jsonl(self.transcript, [entry()])
         self.run_main()
         self.assertEqual(self.count_events(), 1)
