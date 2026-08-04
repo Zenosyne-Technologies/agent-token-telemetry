@@ -132,11 +132,20 @@ SEED_SOURCE = "seed-v0.2.0"
 V2_COLUMNS = ("issue_key", "task_size", "note")
 
 
+def event_columns(conn):
+    return {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+
+
 def migrate(conn):
     """SCHEMA is the v1 baseline; later versions are deltas applied here.
     Every statement is individually idempotent rather than wrapped in one
     transaction, so a migrating process never blocks a peer's capture."""
-    if conn.execute("PRAGMA user_version").fetchone()[0] >= 2:
+    # The version stamp alone is not proof the schema matches it: a DB stamped
+    # v2 without the v2 columns (an older build that stamped too early, a
+    # restored/edited file) would otherwise fail every capture forever. One
+    # extra PRAGMA read on the fast path buys that DB a self-heal.
+    if (conn.execute("PRAGMA user_version").fetchone()[0] >= 2
+            and set(V2_COLUMNS) <= event_columns(conn)):
         return
     for col in V2_COLUMNS:
         try:
@@ -147,7 +156,7 @@ def migrate(conn):
     # Never stamp a version the schema does not actually have: the except above
     # cannot tell "already added" from "database is locked"/"disk full", and a
     # premature stamp would strand the DB without the columns forever.
-    if not set(V2_COLUMNS) <= {r[1] for r in conn.execute("PRAGMA table_info(events)")}:
+    if not set(V2_COLUMNS) <= event_columns(conn):
         return  # next connect retries
     conn.executescript(PRICING_SCHEMA)
     # Gate on the seed rows, not the table: CREATE TABLE autocommits, so a
@@ -266,7 +275,10 @@ def git_meta(cwd):
             git(cwd, "rev-parse", "--short", "HEAD"))
 
 
-ISSUE_KEY_RE = re.compile(r"^([A-Z][A-Z0-9]+-\d+):")
+# Anchored and closed by ':' so only a leading tracker key matches - single-letter
+# project keys included ("A-1:"), while "feat:", "WIP: ...", "feat(AOS-42):" and
+# any lowercase prefix do not.
+ISSUE_KEY_RE = re.compile(r"^([A-Z][A-Z0-9]*-\d+):")
 
 
 def issue_key_from_git(cwd):
@@ -277,12 +289,20 @@ def issue_key_from_git(cwd):
     return m.group(1) if m else None
 
 
+SIDECAR_MAX_BYTES = 65536
+
+
 def read_sidecar(root):
     """`.claude/telemetry-context.json`, rewritten by the agent on task switch.
-    Any problem (absent, unreadable, malformed) is a silent None - enrichment
-    is never worth failing a capture over."""
+    Any problem (absent, unreadable, malformed, implausibly large) is a silent
+    None - enrichment is never worth failing a capture over. The size check
+    comes first: a runaway file is not agent-written context, and parsing it
+    would cost time and memory on every hook firing."""
     try:
-        with open(Path(root) / ".claude" / "telemetry-context.json") as f:
+        path = Path(root) / ".claude" / "telemetry-context.json"
+        if path.stat().st_size > SIDECAR_MAX_BYTES:
+            return None
+        with open(path) as f:
             ctx = json.load(f)
         return ctx if isinstance(ctx, dict) else None
     except Exception:
