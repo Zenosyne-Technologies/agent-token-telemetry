@@ -38,6 +38,31 @@ below and the `pricing` table; no v1 column was renamed or removed.
 `sessions(id, uuid, project_id)`, `projects(id, path)`, `models(id, name)` are stable
 lookup tables unchanged since v1.
 
+## Tier mapping
+
+Model name prefix → kit tier, mirroring the `pricing` table's own prefixes (used by
+`commands/token-stats.md`'s by-tier breakdown and the kit's own
+`docs/agents/token-economics.md`):
+
+| Model prefix | Tier |
+|---|---|
+| `claude-fable-*` | orchestrator |
+| `claude-opus-*` | heavy |
+| `claude-sonnet-*` | small |
+| `claude-haiku-*` | micro |
+
+`events.agent` + `events.kind` further distinguish main-session vs subagent work
+within a tier.
+
+## Per-issue recipe (with pre-v2 fallback)
+
+Preferred: `events.issue_key = '<KEY>'` (populated from schema v2 onward). Rows
+recorded before v2 predate the column and need the fallback instead: `commit_sha IN
+(git log --format=%h --grep='^<KEY>:')`, matched against both short and long `%h`
+lengths (git's default abbreviation length can change per-repo). A complete per-issue
+query unions both: `issue_key = '<KEY>' OR commit_sha IN (...)`. This is the same
+recipe the kit's documentation agent uses for its cost-per-issue closing comment.
+
 ## Pricing table
 
 ```
