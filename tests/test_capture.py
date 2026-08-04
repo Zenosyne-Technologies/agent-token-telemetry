@@ -182,6 +182,16 @@ CREATE TABLE cursors(transcript TEXT PRIMARY KEY,
 """
 
 
+class AlterBlockedConnection(_sqlite3.Connection):
+    """ALTER TABLE failing for a transient reason (locked DB, disk full) rather
+    than the benign duplicate-column case the migration expects to swallow."""
+
+    def execute(self, sql, *args):
+        if sql.lstrip().upper().startswith("ALTER"):
+            raise _sqlite3.OperationalError("database is locked")
+        return super().execute(sql, *args)
+
+
 class TestSchemaV2(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -212,7 +222,8 @@ class TestSchemaV2(unittest.TestCase):
             self.assertTrue(any(tier in p for p in prefixes), tier)
         for r in rows:
             self.assertEqual(r[0], "anthropic")
-            self.assertGreater(r[6], 0)
+            # Seed rates apply to all history until superseded by a dated row.
+            self.assertEqual(r[6], 0)
             self.assertEqual(r[7], "seed-v0.2.0")
 
     def test_reconnect_does_not_reseed(self):
@@ -220,6 +231,50 @@ class TestSchemaV2(unittest.TestCase):
         before = self._pricing_count()
         capture.connect(self.db).close()
         self.assertEqual(self._pricing_count(), before)
+        # Re-run the migration itself over an already-seeded table: the seed
+        # gate must key on the seed rows, not on the table's existence.
+        conn = _sqlite3.connect(self.db)
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+        conn.close()
+        migrated = capture.connect(self.db)
+        self.addCleanup(migrated.close)
+        self.assertEqual(self._pricing_count(), before)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 2)
+
+    def test_empty_pricing_table_is_seeded(self):
+        # A crash between CREATE TABLE (autocommitted) and the seed INSERT
+        # leaves an empty pricing table; the next connect must still seed it.
+        conn = _sqlite3.connect(self.db)
+        conn.executescript(V1_SCHEMA)
+        conn.executescript(capture.PRICING_SCHEMA)
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+        conn.close()
+        migrated = capture.connect(self.db)
+        self.addCleanup(migrated.close)
+        self.assertGreaterEqual(self._pricing_count(), 4)
+
+    def test_alter_failure_withholds_stamp_and_retries(self):
+        conn = _sqlite3.connect(self.db)
+        conn.executescript(V1_SCHEMA)
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+        conn.close()
+
+        blocked = _sqlite3.connect(self.db, factory=AlterBlockedConnection)
+        capture.migrate(blocked)
+        # Stamping v2 here would strand the DB: the columns are missing and no
+        # later connect would ever add them.
+        self.assertEqual(blocked.execute("PRAGMA user_version").fetchone()[0], 1)
+        self.assertNotIn("issue_key", self.columns(blocked, "events"))
+        blocked.close()
+
+        retried = capture.connect(self.db)  # transient cause gone
+        self.addCleanup(retried.close)
+        self.assertEqual(retried.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertLessEqual({"issue_key", "task_size", "note"},
+                             self.columns(retried, "events"))
 
     def _pricing_count(self):
         conn = _sqlite3.connect(self.db)
@@ -374,6 +429,27 @@ class TestMain(unittest.TestCase):
         write_jsonl(self.transcript, [entry()])
         self.run_main()
         self.assertEqual(self.event_context(), [(None, None, None)])
+
+    def test_non_scalar_sidecar_values_ignored(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        self.write_sidecar(json.dumps({
+            "issue_key": {"nested": "AOS-9"}, "size": ["m"],
+            "summary": {"text": "no"}}))
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        # Binding a dict/list raises sqlite3.ProgrammingError - that would take
+        # capture offline for as long as the bad sidecar exists.
+        self.assertEqual(self.count_events(), 1)
+        self.assertEqual(self.event_context(), [(None, None, None)])
+        self.assertFalse((self.db.parent / "error.log").exists())
+
+    def test_numeric_sidecar_values_coerced_to_text(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        self.write_sidecar(json.dumps({"issue_key": "AOS-3", "size": 2,
+                                       "summary": 1.5}))
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.event_context(), [("AOS-3", "2", "1.5")])
 
     def test_malformed_sidecar_ignored(self):
         (self.proj / ".claude" / "telemetry").touch()

@@ -120,12 +120,16 @@ CREATE TABLE IF NOT EXISTS pricing(
 
 # USD per 1M tokens: input, output, cache read, cache write. Prefixes (not full
 # model names) so a new dated release prices correctly on longest-prefix match.
+# effective_from 0: the seed applies to all history until a dated row supersedes it.
 PRICING_SEED = [
     ("anthropic", "claude-fable-", 10.0, 50.0, 1.00, 12.50),
     ("anthropic", "claude-opus-", 5.0, 25.0, 0.50, 6.25),
     ("anthropic", "claude-sonnet-", 3.0, 15.0, 0.30, 3.75),
     ("anthropic", "claude-haiku-", 1.0, 5.0, 0.10, 1.25),
 ]
+SEED_SOURCE = "seed-v0.2.0"
+
+V2_COLUMNS = ("issue_key", "task_size", "note")
 
 
 def migrate(conn):
@@ -134,24 +138,28 @@ def migrate(conn):
     transaction, so a migrating process never blocks a peer's capture."""
     if conn.execute("PRAGMA user_version").fetchone()[0] >= 2:
         return
-    for col in ("issue_key", "task_size", "note"):
+    for col in V2_COLUMNS:
         try:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError:
-            pass  # already present (peer process, or a partial earlier run)
-    fresh = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pricing'"
-    ).fetchone() is None
+            pass  # duplicate column (peer process) - or a transient failure,
+            # which the post-condition check below catches
+    # Never stamp a version the schema does not actually have: the except above
+    # cannot tell "already added" from "database is locked"/"disk full", and a
+    # premature stamp would strand the DB without the columns forever.
+    if not set(V2_COLUMNS) <= {r[1] for r in conn.execute("PRAGMA table_info(events)")}:
+        return  # next connect retries
     conn.executescript(PRICING_SCHEMA)
-    if fresh:  # seed once, at creation - never overwrite curated rates
-        # OR IGNORE: two processes migrating within the same second would
-        # otherwise collide on the UNIQUE key.
-        now = int(time.time())
+    # Gate on the seed rows, not the table: CREATE TABLE autocommits, so a
+    # failure before the INSERT can leave an empty table that must still get
+    # seeded. OR IGNORE covers two processes seeding concurrently.
+    if not conn.execute("SELECT 1 FROM pricing WHERE source=? LIMIT 1",
+                        (SEED_SOURCE,)).fetchone():
         conn.executemany(
             "INSERT OR IGNORE INTO pricing(provider, model_prefix, in_usd,"
             " out_usd, cache_r_usd, cache_w_usd, effective_from, source)"
-            " VALUES (?,?,?,?,?,?,?,'seed-v0.2.0')",
-            [(*row, now) for row in PRICING_SEED])
+            " VALUES (?,?,?,?,?,?,0,?)",
+            [(*row, SEED_SOURCE) for row in PRICING_SEED])
     # Commit the data before stamping the version: a crash in between leaves
     # user_version < 2, and the next connect simply migrates again. Also leaves
     # no open transaction for main()'s BEGIN IMMEDIATE to trip over.
@@ -281,6 +289,13 @@ def read_sidecar(root):
         return None
 
 
+def sidecar_text(value):
+    """Sidecar values are agent-written JSON and can be any type. Binding a
+    dict/list raises sqlite3.ProgrammingError, which would take capture offline
+    for as long as the bad file exists - so only scalars survive."""
+    return str(value) if isinstance(value, (str, int, float)) else None
+
+
 def log_error():
     try:
         log = db_path().parent / "error.log"
@@ -314,7 +329,7 @@ def main():
         branch, sha = git_meta(cwd)
         root = find_project_root(cwd)
         ctx = read_sidecar(root) or {}
-        issue_key = ctx.get("issue_key") or issue_key_from_git(cwd)
+        issue_key = sidecar_text(ctx.get("issue_key")) or issue_key_from_git(cwd)
         conn = connect(db_path())
         try:
             # Take the write lock up front so concurrent hook firings on the
@@ -334,7 +349,8 @@ def main():
             record(conn, str(root),
                    hook.get("session_id") or "unknown", kind_hint, agent,
                    groups, transcript, new_offset, branch, sha,
-                   issue_key, ctx.get("size"), ctx.get("summary"))
+                   issue_key, sidecar_text(ctx.get("size")),
+                   sidecar_text(ctx.get("summary")))
         finally:
             conn.close()
     except Exception:
