@@ -6,7 +6,7 @@ pm_tool: jira
 tracker_coordinates: site zenosyne.atlassian.net, project AgentOS (key AOS)
 project_key: AOS
 hierarchy_levels: 3/4 (virtual milestones — epics carry a milestone:<slug> label)
-intake_guide_url: {{TRACKER_GUIDE_URL}}
+intake_guide_url: https://zenosyne.atlassian.net/browse/AOS-11
 stack: Python 3 (stdlib only) + JSON manifests + markdown slash commands
 dev_command: none (no dev stack/ports); tests: python3 -m unittest tests.test_capture -v
 docs_location: docs/ (long-form docs, issue log, superpowers specs/plans); .docs/agents/ (kit rules cascade)
