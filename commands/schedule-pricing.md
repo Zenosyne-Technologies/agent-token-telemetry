@@ -1,6 +1,5 @@
 ---
 description: Register weekly automatic pricing refresh, where the host supports it
-allowed-tools: Bash(sqlite3:*)
 ---
 
 Register `/token-telemetry:pricing-update` to run weekly as a background scheduled
