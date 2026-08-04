@@ -31,6 +31,7 @@ Keep context lean: load a reference ONLY when performing that activity, and cite
 - Planning milestones/epics or mapping severity to native fields → `.docs/agents/tracker-config.md` (levels, virtual-milestone rule, mappings)
 - Planning a `size:l`/`size:xl` task → `.docs/agents/planning-research.md` (plan-validation + solution research, tier-routed by size)
 - Producing any report (digest / close-out / stakeholder) → `.docs/agents/reporting.md` (snapshot first, render second)
+- Token/cost reporting, and starting or switching tracker-issue work with telemetry enabled (write the context sidecar) → `.docs/agents/token-economics.md`
 - Any task touching auth, input boundaries, data exposure, secrets, or dependencies → `.docs/agents/security.md`
 - Micro-tasks → `.docs/agents/ponytail.md`
 
