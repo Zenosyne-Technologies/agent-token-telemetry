@@ -1,0 +1,78 @@
+{
+  "stats_schema": 2,
+  "generated": "2026-08-04T14:42:53Z",
+  "scope": "project",
+  "pm_tool": "jira",
+  "project_key": "AOS",
+  "issues_scanned": 11,
+  "by_type": {
+    "bug": 1,
+    "change-request": 1,
+    "feature": 1,
+    "investigation": 1,
+    "tech-debt": 1
+  },
+  "by_area": {
+    "collection": 1,
+    "docs": 1,
+    "infra": 1,
+    "reporting": 1,
+    "storage": 1
+  },
+  "by_origin": {
+    "agent-dev": 1,
+    "agent-qa": 2,
+    "architect-request": 1,
+    "roadmap": 1,
+    "user-request": 1
+  },
+  "by_size": {
+    "l": 1,
+    "m": 1,
+    "s": 1,
+    "xl": 1,
+    "xs": 1
+  },
+  "sev_open": {
+    "sev1-critical": 1,
+    "sev2-high": 1,
+    "sev3-medium": 1,
+    "sev4-low": 1
+  },
+  "sev_closed": {},
+  "defects_by_area": {
+    "collection": 1,
+    "docs": 1,
+    "infra": 1,
+    "reporting": 1,
+    "storage": 1
+  },
+  "milestones": {},
+  "period": {
+    "created": 11,
+    "closed": 5,
+    "days": 30
+  },
+  "oldest_open_sev1_or_sev2": "AOS-11",
+  "tokens": {
+    "in": 4250,
+    "out": 1460,
+    "cache_r": 1450,
+    "cache_w": 2400,
+    "cache_hit_pct": 25.44,
+    "by_tier": {
+      "heavy": { "out": 820, "est_cost_usd": 0.03775 },
+      "small": { "out": 640, "est_cost_usd": 0.021435 }
+    },
+    "by_model": {
+      "claude-opus-4-8": { "in": 2300, "out": 820, "cache_r": 250, "cache_w": 900, "est_cost_usd": 0.03775 },
+      "claude-sonnet-5": { "in": 1950, "out": 640, "cache_r": 1200, "cache_w": 1500, "est_cost_usd": 0.021435 }
+    },
+    "main_vs_subagent": {
+      "main": { "out": 640, "est_cost_usd": 0.021435 },
+      "subagent": { "out": 820, "est_cost_usd": 0.03775 }
+    },
+    "est_cost_usd": 0.059185,
+    "events": 2
+  }
+}
