@@ -6,6 +6,7 @@ central SQLite DB. Must never break a session: always exits 0.
 """
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -103,6 +104,60 @@ CREATE TABLE IF NOT EXISTS cursors(transcript TEXT PRIMARY KEY,
   offset INTEGER NOT NULL, session_id INTEGER NOT NULL);
 """
 
+PRICING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pricing(
+  provider       TEXT NOT NULL,
+  model_prefix   TEXT NOT NULL,
+  model_version  TEXT NOT NULL DEFAULT '',
+  in_usd         REAL,
+  out_usd        REAL,
+  cache_r_usd    REAL,
+  cache_w_usd    REAL,
+  effective_from INTEGER NOT NULL,
+  source         TEXT,
+  UNIQUE(provider, model_prefix, model_version, effective_from));
+"""
+
+# USD per 1M tokens: input, output, cache read, cache write. Prefixes (not full
+# model names) so a new dated release prices correctly on longest-prefix match.
+PRICING_SEED = [
+    ("anthropic", "claude-fable-", 10.0, 50.0, 1.00, 12.50),
+    ("anthropic", "claude-opus-", 5.0, 25.0, 0.50, 6.25),
+    ("anthropic", "claude-sonnet-", 3.0, 15.0, 0.30, 3.75),
+    ("anthropic", "claude-haiku-", 1.0, 5.0, 0.10, 1.25),
+]
+
+
+def migrate(conn):
+    """SCHEMA is the v1 baseline; later versions are deltas applied here.
+    Every statement is individually idempotent rather than wrapped in one
+    transaction, so a migrating process never blocks a peer's capture."""
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 2:
+        return
+    for col in ("issue_key", "task_size", "note"):
+        try:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass  # already present (peer process, or a partial earlier run)
+    fresh = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pricing'"
+    ).fetchone() is None
+    conn.executescript(PRICING_SCHEMA)
+    if fresh:  # seed once, at creation - never overwrite curated rates
+        # OR IGNORE: two processes migrating within the same second would
+        # otherwise collide on the UNIQUE key.
+        now = int(time.time())
+        conn.executemany(
+            "INSERT OR IGNORE INTO pricing(provider, model_prefix, in_usd,"
+            " out_usd, cache_r_usd, cache_w_usd, effective_from, source)"
+            " VALUES (?,?,?,?,?,?,?,'seed-v0.2.0')",
+            [(*row, now) for row in PRICING_SEED])
+    # Commit the data before stamping the version: a crash in between leaves
+    # user_version < 2, and the next connect simply migrates again. Also leaves
+    # no open transaction for main()'s BEGIN IMMEDIATE to trip over.
+    conn.commit()
+    conn.execute("PRAGMA user_version=2")
+
 
 def connect(path):
     path = Path(path)
@@ -120,6 +175,7 @@ def connect(path):
         except sqlite3.OperationalError:
             time.sleep(0.05)
     conn.executescript(SCHEMA)
+    migrate(conn)
     return conn
 
 
@@ -139,7 +195,8 @@ def get_offset(conn, transcript):
 
 
 def record(conn, project, session_uuid, kind_hint, agent, groups,
-           transcript, new_offset, branch=None, commit_sha=None):
+           transcript, new_offset, branch=None, commit_sha=None,
+           issue_key=None, task_size=None, note=None):
     with conn:
         project_id = get_or_create(conn, "projects", "path", project)
         row = conn.execute(
@@ -155,10 +212,12 @@ def record(conn, project, session_uuid, kind_hint, agent, groups,
             ts = int(g["last"]) if g["last"] is not None else int(time.time())
             conn.execute(
                 "INSERT INTO events(ts, session_id, kind, agent, model_id,"
-                " in_tok, out_tok, cache_r, cache_w, dur_ms, branch, commit_sha)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                " in_tok, out_tok, cache_r, cache_w, dur_ms, branch, commit_sha,"
+                " issue_key, task_size, note)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ts, session_id, kind, agent, model_id,
-                 g["in"], g["out"], g["cr"], g["cw"], dur, branch, commit_sha))
+                 g["in"], g["out"], g["cr"], g["cw"], dur, branch, commit_sha,
+                 issue_key, task_size, note))
         conn.execute(
             "INSERT INTO cursors(transcript, offset, session_id) VALUES (?,?,?)"
             " ON CONFLICT(transcript) DO UPDATE SET offset=excluded.offset",
@@ -179,21 +238,47 @@ def is_enabled(cwd):
             or (root / ".claude" / "telemetry").exists())
 
 
+def git(cwd, *args):
+    try:
+        # A hostile repo's tracked .git/config can set core.fsmonitor or
+        # core.hooksPath to run arbitrary programs when git invokes them.
+        # These -c overrides beat repo config and neutralize that; do not
+        # remove them. Every git call in this script goes through here.
+        out = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+             "-C", str(cwd), *args],
+            capture_output=True, text=True, timeout=2)
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
 def git_meta(cwd):
-    def run(*args):
-        try:
-            # A hostile repo's tracked .git/config can set core.fsmonitor or
-            # core.hooksPath to run arbitrary programs when git invokes them.
-            # These -c overrides beat repo config and neutralize that; do not
-            # remove them.
-            out = subprocess.run(
-                ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-                 "-C", str(cwd), *args],
-                capture_output=True, text=True, timeout=2)
-            return out.stdout.strip() or None
-        except Exception:
-            return None
-    return run("rev-parse", "--abbrev-ref", "HEAD"), run("rev-parse", "--short", "HEAD")
+    return (git(cwd, "rev-parse", "--abbrev-ref", "HEAD"),
+            git(cwd, "rev-parse", "--short", "HEAD"))
+
+
+ISSUE_KEY_RE = re.compile(r"^([A-Z][A-Z0-9]+-\d+):")
+
+
+def issue_key_from_git(cwd):
+    """Fallback when no sidecar is present: tracker keys lead commit subjects
+    by convention, so the last commit names the task in flight."""
+    subject = git(cwd, "log", "-1", "--format=%s")
+    m = ISSUE_KEY_RE.match(subject) if subject else None
+    return m.group(1) if m else None
+
+
+def read_sidecar(root):
+    """`.claude/telemetry-context.json`, rewritten by the agent on task switch.
+    Any problem (absent, unreadable, malformed) is a silent None - enrichment
+    is never worth failing a capture over."""
+    try:
+        with open(Path(root) / ".claude" / "telemetry-context.json") as f:
+            ctx = json.load(f)
+        return ctx if isinstance(ctx, dict) else None
+    except Exception:
+        return None
 
 
 def log_error():
@@ -221,12 +306,15 @@ def main():
         transcript = hook.get("transcript_path")
         if not transcript or not os.path.exists(transcript):
             return
-        # git_meta() shells out to git (up to ~4s across two calls) and has no
-        # dependency on cursor/DB state, so it must run before the write lock
-        # is taken below — otherwise it would hold that lock for the duration
-        # of the subprocess calls, and a peer process's own BEGIN IMMEDIATE
-        # could exceed connect()'s 5s busy-wait and drop its event.
+        # Enrichment shells out to git (up to ~2s per call) and has no
+        # dependency on cursor/DB state, so all of it must run before the write
+        # lock is taken below — otherwise it would hold that lock for the
+        # duration of the subprocess calls, and a peer process's own BEGIN
+        # IMMEDIATE could exceed connect()'s 5s busy-wait and drop its event.
         branch, sha = git_meta(cwd)
+        root = find_project_root(cwd)
+        ctx = read_sidecar(root) or {}
+        issue_key = ctx.get("issue_key") or issue_key_from_git(cwd)
         conn = connect(db_path())
         try:
             # Take the write lock up front so concurrent hook firings on the
@@ -243,9 +331,10 @@ def main():
                 return
             kind_hint = 1 if hook.get("hook_event_name") == "SubagentStop" else 0
             agent = hook.get("agent_type") or hook.get("agent_name")
-            record(conn, str(find_project_root(cwd)),
+            record(conn, str(root),
                    hook.get("session_id") or "unknown", kind_hint, agent,
-                   groups, transcript, new_offset, branch, sha)
+                   groups, transcript, new_offset, branch, sha,
+                   issue_key, ctx.get("size"), ctx.get("summary"))
         finally:
             conn.close()
     except Exception:
