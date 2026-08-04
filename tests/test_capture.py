@@ -157,6 +157,160 @@ import sqlite3 as _sqlite3
 import subprocess
 
 
+# The v0.1.0 shape, frozen here so the migration path is tested against the
+# schema real DBs in the field were created with.
+V1_SCHEMA = """
+CREATE TABLE projects(id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL);
+CREATE TABLE models  (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL);
+CREATE TABLE sessions(id INTEGER PRIMARY KEY, uuid TEXT UNIQUE NOT NULL,
+  project_id INTEGER NOT NULL REFERENCES projects(id));
+CREATE TABLE events(
+  ts         INTEGER NOT NULL,
+  session_id INTEGER NOT NULL REFERENCES sessions(id),
+  kind       INTEGER NOT NULL,
+  agent      TEXT,
+  model_id   INTEGER NOT NULL REFERENCES models(id),
+  in_tok     INTEGER NOT NULL DEFAULT 0,
+  out_tok    INTEGER NOT NULL DEFAULT 0,
+  cache_r    INTEGER NOT NULL DEFAULT 0,
+  cache_w    INTEGER NOT NULL DEFAULT 0,
+  dur_ms     INTEGER,
+  branch     TEXT,
+  commit_sha TEXT);
+CREATE TABLE cursors(transcript TEXT PRIMARY KEY,
+  offset INTEGER NOT NULL, session_id INTEGER NOT NULL);
+"""
+
+
+class AlterBlockedConnection(_sqlite3.Connection):
+    """ALTER TABLE failing for a transient reason (locked DB, disk full) rather
+    than the benign duplicate-column case the migration expects to swallow."""
+
+    def execute(self, sql, *args):
+        if sql.lstrip().upper().startswith("ALTER"):
+            raise _sqlite3.OperationalError("database is locked")
+        return super().execute(sql, *args)
+
+
+class TestSchemaV2(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = pathlib.Path(self.tmp.name) / "usage.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def columns(self, conn, table):
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    def test_fresh_db_is_user_version_2(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertLessEqual({"issue_key", "task_size", "note"},
+                             self.columns(conn, "events"))
+
+    def test_pricing_table_seeded(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        rows = conn.execute(
+            "SELECT provider, model_prefix, in_usd, out_usd, cache_r_usd,"
+            " cache_w_usd, effective_from, source FROM pricing").fetchall()
+        self.assertGreaterEqual(len(rows), 4)
+        prefixes = {r[1] for r in rows}
+        for tier in ("fable", "opus", "sonnet", "haiku"):
+            self.assertTrue(any(tier in p for p in prefixes), tier)
+        for r in rows:
+            self.assertEqual(r[0], "anthropic")
+            # Seed rates apply to all history until superseded by a dated row.
+            self.assertEqual(r[6], 0)
+            self.assertEqual(r[7], "seed-v0.2.0")
+
+    def test_reconnect_does_not_reseed(self):
+        capture.connect(self.db).close()
+        before = self._pricing_count()
+        capture.connect(self.db).close()
+        self.assertEqual(self._pricing_count(), before)
+        # Re-run the migration itself over an already-seeded table: the seed
+        # gate must key on the seed rows, not on the table's existence.
+        conn = _sqlite3.connect(self.db)
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+        conn.close()
+        migrated = capture.connect(self.db)
+        self.addCleanup(migrated.close)
+        self.assertEqual(self._pricing_count(), before)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 2)
+
+    def test_empty_pricing_table_is_seeded(self):
+        # A crash between CREATE TABLE (autocommitted) and the seed INSERT
+        # leaves an empty pricing table; the next connect must still seed it.
+        conn = _sqlite3.connect(self.db)
+        conn.executescript(V1_SCHEMA)
+        conn.executescript(capture.PRICING_SCHEMA)
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+        conn.close()
+        migrated = capture.connect(self.db)
+        self.addCleanup(migrated.close)
+        self.assertGreaterEqual(self._pricing_count(), 4)
+
+    def test_alter_failure_withholds_stamp_and_retries(self):
+        conn = _sqlite3.connect(self.db)
+        conn.executescript(V1_SCHEMA)
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+        conn.close()
+
+        blocked = _sqlite3.connect(self.db, factory=AlterBlockedConnection)
+        capture.migrate(blocked)
+        # Stamping v2 here would strand the DB: the columns are missing and no
+        # later connect would ever add them.
+        self.assertEqual(blocked.execute("PRAGMA user_version").fetchone()[0], 1)
+        self.assertNotIn("issue_key", self.columns(blocked, "events"))
+        blocked.close()
+
+        retried = capture.connect(self.db)  # transient cause gone
+        self.addCleanup(retried.close)
+        self.assertEqual(retried.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertLessEqual({"issue_key", "task_size", "note"},
+                             self.columns(retried, "events"))
+
+    def _pricing_count(self):
+        conn = _sqlite3.connect(self.db)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM pricing").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_migrates_v1_db_without_touching_rows(self):
+        conn = _sqlite3.connect(self.db)
+        conn.executescript(V1_SCHEMA)
+        conn.execute("INSERT INTO projects(path) VALUES ('/proj')")
+        conn.execute("INSERT INTO models(name) VALUES ('claude-sonnet-5')")
+        conn.execute("INSERT INTO sessions(uuid, project_id) VALUES ('s1', 1)")
+        conn.execute(
+            "INSERT INTO events(ts, session_id, kind, agent, model_id, in_tok,"
+            " out_tok, cache_r, cache_w, dur_ms, branch, commit_sha)"
+            " VALUES (99, 1, 0, 'legacy', 1, 11, 22, 33, 44, 55, 'main', 'abc123')")
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+        conn.close()
+
+        migrated = capture.connect(self.db)
+        self.addCleanup(migrated.close)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertLessEqual({"issue_key", "task_size", "note"},
+                             self.columns(migrated, "events"))
+        self.assertGreaterEqual(migrated.execute(
+            "SELECT COUNT(*) FROM pricing").fetchone()[0], 4)
+        row = migrated.execute(
+            "SELECT ts, agent, in_tok, out_tok, cache_r, cache_w, dur_ms,"
+            " branch, commit_sha, issue_key, task_size, note FROM events").fetchall()
+        self.assertEqual(row, [(99, "legacy", 11, 22, 33, 44, 55, "main",
+                                "abc123", None, None, None)])
+
+
 class TestMain(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -233,6 +387,78 @@ class TestMain(unittest.TestCase):
         }))
         capture.main()  # must not raise
         self.assertEqual(self.count_events(), 0)
+
+    def write_sidecar(self, text):
+        (self.proj / ".claude" / "telemetry-context.json").write_text(text)
+
+    def init_git_repo(self, subject):
+        git = ["git", "-c", "user.email=t@example.com", "-c", "user.name=t",
+               "-C", str(self.proj)]
+        subprocess.run(git + ["init", "-q"], check=True, capture_output=True)
+        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", subject],
+                       check=True, capture_output=True)
+
+    def event_context(self):
+        conn = _sqlite3.connect(self.db)
+        try:
+            return conn.execute(
+                "SELECT issue_key, task_size, note FROM events").fetchall()
+        finally:
+            conn.close()
+
+    def test_sidecar_fields_recorded(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        self.write_sidecar(json.dumps({
+            "issue_key": "AOS-42", "project": "p", "size": "m",
+            "summary": "Wire the sidecar"}))
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.event_context(),
+                         [("AOS-42", "m", "Wire the sidecar")])
+
+    def test_issue_key_falls_back_to_commit_subject(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        self.init_git_repo("AOS-7: teach capture the fallback")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.event_context(), [("AOS-7", None, None)])
+
+    def test_issue_key_null_without_sidecar_or_key_prefix(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        self.init_git_repo("no key in this subject")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.event_context(), [(None, None, None)])
+
+    def test_non_scalar_sidecar_values_ignored(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        self.write_sidecar(json.dumps({
+            "issue_key": {"nested": "AOS-9"}, "size": ["m"],
+            "summary": {"text": "no"}}))
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        # Binding a dict/list raises sqlite3.ProgrammingError - that would take
+        # capture offline for as long as the bad sidecar exists.
+        self.assertEqual(self.count_events(), 1)
+        self.assertEqual(self.event_context(), [(None, None, None)])
+        self.assertFalse((self.db.parent / "error.log").exists())
+
+    def test_numeric_sidecar_values_coerced_to_text(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        self.write_sidecar(json.dumps({"issue_key": "AOS-3", "size": 2,
+                                       "summary": 1.5}))
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.event_context(), [("AOS-3", "2", "1.5")])
+
+    def test_malformed_sidecar_ignored(self):
+        (self.proj / ".claude" / "telemetry").touch()
+        self.write_sidecar("{not json,,,")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.count_events(), 1)
+        self.assertEqual(self.event_context(), [(None, None, None)])
+        self.assertFalse((self.db.parent / "error.log").exists())
 
     def test_error_after_optin_still_logged(self):
         (self.proj / ".claude" / "telemetry").touch()
