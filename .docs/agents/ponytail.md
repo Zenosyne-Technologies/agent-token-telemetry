@@ -15,4 +15,4 @@ Do: <numbered mechanical steps, incl. list-before-create idempotency>.
 FINAL MESSAGE: <exact format>. Nothing else.
 ```
 
-If the agent would need to ask a question, the task was mis-tiered — pull it back to the default worker.
+If the agent would need to ask a question, the task was mis-tiered — pull it back to the small worker.
