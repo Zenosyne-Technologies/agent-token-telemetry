@@ -1071,5 +1071,242 @@ class TestMirrorConcurrency(TestConcurrency):
         self.assertEqual(self.count_mirror_events(), self.count_events())
 
 
+# --- storage maintenance (/storage-separate, /storage-delete) ----------------
+#
+# Those two commands are agentic markdown and own the SQL; the helpers below
+# mirror it statement for statement so the prescribed sequence is pinned by
+# tests. Change the command doc and this block together.
+
+EVENT_COLUMNS = ("ts, session_id, kind, agent, model_id, in_tok, out_tok,"
+                 " cache_r, cache_w, dur_ms, branch, commit_sha, issue_key,"
+                 " task_size, note")
+PRICING_COLUMNS = ("provider, model_prefix, model_version, in_usd, out_usd,"
+                   " cache_r_usd, cache_w_usd, effective_from, source")
+PROJECT_ID = "(SELECT id FROM {p}projects WHERE path = ?)"
+
+
+def export_project(central, export_path, project):
+    """Carve one project out into a self-contained DB: its projects row, its
+    sessions, their events, its transcripts' cursors - plus the full models and
+    pricing reference tables, without which the export cannot price itself."""
+    conn = capture.connect(export_path)  # same connect/migrate as capture: v3
+    try:
+        conn.execute("ATTACH DATABASE ? AS src", (str(central),))
+        pid = PROJECT_ID.format(p="src.")
+        sessions = f"(SELECT id FROM src.sessions WHERE project_id = {pid})"
+        with conn:
+            conn.execute("INSERT OR IGNORE INTO models(id, name)"
+                         " SELECT id, name FROM src.models")
+            conn.execute(
+                f"INSERT OR IGNORE INTO pricing({PRICING_COLUMNS})"
+                f" SELECT {PRICING_COLUMNS} FROM src.pricing")
+            conn.execute(
+                "INSERT INTO projects(id, path, mirror_path, mirror_last_at)"
+                " SELECT id, path, mirror_path, mirror_last_at"
+                " FROM src.projects WHERE path = ?", (project,))
+            conn.execute(
+                "INSERT INTO sessions(id, uuid, project_id)"
+                f" SELECT id, uuid, project_id FROM src.sessions"
+                f" WHERE project_id = {pid}", (project,))
+            conn.execute(
+                f"INSERT INTO events({EVENT_COLUMNS})"
+                f" SELECT {EVENT_COLUMNS} FROM src.events"
+                f" WHERE session_id IN {sessions}", (project,))
+            conn.execute(
+                "INSERT INTO cursors(transcript, offset, session_id)"
+                " SELECT transcript, offset, session_id FROM src.cursors"
+                f" WHERE session_id IN {sessions}", (project,))
+        conn.execute("DETACH DATABASE src")
+    finally:
+        conn.close()
+
+
+def audit(conn, action, project, detail):
+    conn.execute(
+        "INSERT INTO audit_log(ts, action, project, detail)"
+        " VALUES (strftime('%s','now'), ?, ?, ?)", (action, project, detail))
+
+
+def delete_project(central, project, action, detail):
+    """events -> cursors -> sessions -> projects row, in one transaction that
+    also carries the audit row."""
+    conn = _sqlite3.connect(central)
+    try:
+        pid = PROJECT_ID.format(p="")
+        sessions = f"(SELECT id FROM sessions WHERE project_id = {pid})"
+        with conn:
+            conn.execute(
+                f"DELETE FROM events WHERE session_id IN {sessions}", (project,))
+            conn.execute(
+                f"DELETE FROM cursors WHERE session_id IN {sessions}", (project,))
+            conn.execute(
+                f"DELETE FROM sessions WHERE project_id = {pid}", (project,))
+            conn.execute("DELETE FROM projects WHERE path = ?", (project,))
+            audit(conn, action, project, detail)
+    finally:
+        conn.close()
+
+
+def project_counts(db, project):
+    conn = _sqlite3.connect(db)
+    try:
+        pid = PROJECT_ID.format(p="")
+        sessions = f"(SELECT id FROM sessions WHERE project_id = {pid})"
+        return (
+            conn.execute(f"SELECT COUNT(*) FROM events WHERE session_id IN"
+                         f" {sessions}", (project,)).fetchone()[0],
+            conn.execute(f"SELECT COUNT(*) FROM sessions WHERE project_id ="
+                         f" {pid}", (project,)).fetchone()[0],
+        )
+    finally:
+        conn.close()
+
+
+class StorageMaintenanceCase(unittest.TestCase):
+    """A central DB holding two projects: alpha (mirrored, two sessions) and
+    beta, which must survive every operation aimed at alpha untouched."""
+
+    ALPHA = "/dev/alpha"
+    BETA = "/dev/beta"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name)
+        self.db = self.dir / "usage.db"
+        conn = capture.connect(self.db)
+        capture.record(conn, self.ALPHA, "a1", 0, None,
+                       capture.aggregate([entry()]), "/a1.jsonl", 100,
+                       "main", "sha1", "AOS-1", "m", "first",
+                       mirror_path="/dev/alpha/.claude/telemetry-usage.db")
+        capture.record(conn, self.ALPHA, "a2", 1, "explorer",
+                       capture.aggregate([entry(model="claude-haiku-4-5"),
+                                          entry(model="claude-opus-4-8")]),
+                       "/a2.jsonl", 200, "milestone/x", "sha2", "AOS-2", "s",
+                       "second",
+                       mirror_path="/dev/alpha/.claude/telemetry-usage.db")
+        capture.record(conn, self.BETA, "b1", 0, None,
+                       capture.aggregate([entry(model="claude-fable-5")]),
+                       "/b1.jsonl", 300, "main", "sha3", "AOS-3", "l", "beta")
+        conn.close()
+        self.export = self.dir / "alpha-2026-08-06.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def rows(self, db, sql, params=()):
+        conn = _sqlite3.connect(db)
+        try:
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
+    def event_tuples(self, db, project):
+        return self.rows(
+            db,
+            f"SELECT p.path, s.uuid, m.name, {EVENT_COLUMNS.replace('session_id, ', '')}"
+            " FROM events e JOIN sessions s ON s.id = e.session_id"
+            " JOIN projects p ON p.id = s.project_id"
+            " JOIN models m ON m.id = e.model_id"
+            " WHERE p.path = ? ORDER BY m.name, e.kind, e.ts", (project,))
+
+    def audit_rows(self, db=None):
+        return self.rows(db or self.db,
+                         "SELECT action, project, detail FROM audit_log"
+                         " ORDER BY rowid")
+
+
+class TestStorageSeparate(StorageMaintenanceCase):
+
+    def test_export_carries_only_the_target_project(self):
+        export_project(self.db, self.export, self.ALPHA)
+        self.assertEqual(self.rows(self.export, "SELECT path FROM projects"),
+                         [(self.ALPHA,)])
+        self.assertEqual(
+            {r[0] for r in self.rows(self.export, "SELECT uuid FROM sessions")},
+            {"a1", "a2"})
+        self.assertEqual(
+            {r[0] for r in self.rows(self.export, "SELECT transcript FROM cursors")},
+            {"/a1.jsonl", "/a2.jsonl"})
+
+    def test_export_event_and_session_counts_match_central(self):
+        export_project(self.db, self.export, self.ALPHA)
+        self.assertEqual(project_counts(self.export, self.ALPHA),
+                         project_counts(self.db, self.ALPHA))
+        self.assertEqual(project_counts(self.export, self.ALPHA), (3, 2))
+
+    def test_export_rows_are_identical_to_central(self):
+        export_project(self.db, self.export, self.ALPHA)
+        self.assertEqual(self.event_tuples(self.export, self.ALPHA),
+                         self.event_tuples(self.db, self.ALPHA))
+        # mirror metadata travels with the projects row
+        self.assertEqual(
+            self.rows(self.export,
+                      "SELECT mirror_path, mirror_last_at FROM projects"),
+            self.rows(self.db, "SELECT mirror_path, mirror_last_at"
+                               " FROM projects WHERE path = ?", (self.ALPHA,)))
+
+    def test_export_carries_full_reference_tables_and_schema_v3(self):
+        export_project(self.db, self.export, self.ALPHA)
+        # models must be complete, not just alpha's: the export is meant to be
+        # readable on its own, and pricing resolution joins through models.
+        self.assertEqual(
+            {r[0] for r in self.rows(self.export, "SELECT name FROM models")},
+            {r[0] for r in self.rows(self.db, "SELECT name FROM models")})
+        self.assertEqual(
+            self.rows(self.export, "SELECT COUNT(*) FROM pricing"),
+            self.rows(self.db, "SELECT COUNT(*) FROM pricing"))
+        self.assertEqual(
+            self.rows(self.export, "PRAGMA user_version")[0][0],
+            capture.SCHEMA_VERSION)
+
+    def test_export_is_self_contained_after_the_central_db_is_gone(self):
+        export_project(self.db, self.export, self.ALPHA)
+        os.remove(self.db)
+        self.assertEqual(project_counts(self.export, self.ALPHA), (3, 2))
+
+    def test_export_writes_an_audit_row(self):
+        export_project(self.db, self.export, self.ALPHA)
+        events, sessions = project_counts(self.export, self.ALPHA)
+        detail = f"{self.export.name}; {events} events, {sessions} sessions"
+        conn = _sqlite3.connect(self.db)
+        with conn:
+            audit(conn, "export", self.ALPHA, detail)
+        conn.close()
+        self.assertEqual(self.audit_rows(), [("export", self.ALPHA, detail)])
+
+    def test_delete_after_export_removes_exactly_the_target(self):
+        export_project(self.db, self.export, self.ALPHA)
+        conn = _sqlite3.connect(self.db)
+        with conn:
+            audit(conn, "export", self.ALPHA, f"{self.export.name}; 3 events")
+        conn.close()
+        beta_before = self.event_tuples(self.db, self.BETA)
+
+        delete_project(self.db, self.ALPHA, "delete-after-export",
+                       f"{self.export.name}; 3 events, 2 sessions")
+
+        self.assertEqual(project_counts(self.db, self.ALPHA), (0, 0))
+        self.assertEqual(self.rows(self.db, "SELECT path FROM projects"),
+                         [(self.BETA,)])
+        self.assertEqual(self.event_tuples(self.db, self.BETA), beta_before)
+        self.assertEqual(
+            {r[0] for r in self.rows(self.db, "SELECT transcript FROM cursors")},
+            {"/b1.jsonl"})
+        # the export is untouched by the deletion
+        self.assertEqual(project_counts(self.export, self.ALPHA), (3, 2))
+        self.assertEqual([r[0] for r in self.audit_rows()],
+                         ["export", "delete-after-export"])
+
+    def test_reference_tables_survive_the_deletion(self):
+        # models/pricing are shared reference data - deleting one project must
+        # never strip the rows other projects (and past exports) price against.
+        export_project(self.db, self.export, self.ALPHA)
+        before = self.rows(self.db, "SELECT COUNT(*) FROM models")
+        delete_project(self.db, self.ALPHA, "delete-after-export", "x")
+        self.assertEqual(self.rows(self.db, "SELECT COUNT(*) FROM models"), before)
+        self.assertGreaterEqual(
+            self.rows(self.db, "SELECT COUNT(*) FROM pricing")[0][0], 4)
+
+
 if __name__ == "__main__":
     unittest.main()
