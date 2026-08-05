@@ -68,7 +68,14 @@ consumer must therefore never read `mirror_last_at` as "the mirror is current"; 
 evidence of a landed write is the mirror file itself. A recent `mirror_last_at` with a
 missing or stale file at `mirror_path` means mirror writes are failing — see
 `error.log`. Mirror DBs never stamp mirror metadata of their own (`mirror_path` stays
-NULL inside a mirror). Central-mode projects never get it stamped at all.
+NULL inside a mirror). Central-mode projects never get it stamped at all, and a turn that
+records no events (cursor advance only) stamps nothing — there is no event timestamp to
+record. Both columns are cleared (`UPDATE … SET mirror_path = NULL, mirror_last_at =
+NULL`) when a project switches back to central mode via `/token-telemetry:enable` or opts
+out via `/token-telemetry:disable`, so they describe current configuration rather than
+history; the mirror *file* is never deleted by either command. That clearing is
+best-effort housekeeping done by the commands, not by capture: consumers must tolerate a
+stale `mirror_path` on a project whose marker was edited or deleted by hand.
 
 ### `audit_log` (v0.4.0, schema v3)
 
