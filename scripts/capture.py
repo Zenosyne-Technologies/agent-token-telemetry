@@ -528,8 +528,14 @@ def main():
                           kind_hint, agent, groups)
             meta = (branch, sha, issue_key, sidecar_text(ctx.get("size")),
                     sidecar_text(ctx.get("summary")))
+            # Gated on `groups` for the same reason the mirror write below is:
+            # a turn with no usage entries mirrors nothing, so there is no event
+            # timestamp to stamp - `latest_event_ts` would fall back to `now`
+            # and record a mirror that was never written for an event that does
+            # not exist.
             record(conn, *event_args, transcript, new_offset, *meta,
-                   mirror_path=mirror_db_path(root) if project_mode else None)
+                   mirror_path=(mirror_db_path(root)
+                                if project_mode and groups else None))
             if groups:
                 mirror_args = (*event_args, *meta)
         finally:

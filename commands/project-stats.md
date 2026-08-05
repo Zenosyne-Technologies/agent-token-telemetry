@@ -51,6 +51,8 @@ SELECT project,
        CASE WHEN MAX(rate_from) IS NULL THEN 'unpriced'
             WHEN MAX(rate_from) = 0 THEN 'seed rates (undated)'
             ELSE date(MAX(rate_from), 'unixepoch') END AS rates_as_of,
+       SUM(CASE WHEN ts IS NOT NULL AND rate_from IS NULL THEN 1 ELSE 0 END)
+         AS unpriced_events,
        date(MIN(ts), 'unixepoch') AS first_seen,
        date(MAX(ts), 'unixepoch') AS last_activity
 FROM priced GROUP BY project ORDER BY est_cost_usd DESC, output DESC;
@@ -62,6 +64,7 @@ Render **one** markdown table, rows in the query's order:
 | project | sessions | events | input | output | est. cost | first seen | last activity |
 |---|---|---:|---:|---:|---:|---|---|
 | `/Users/me/dev/foo` | 41 | 512 | 1,204,331 | 88,204 | $12.4412 (seed rates) | 2026-06-02 | 2026-08-06 (today) |
+| `/Users/me/dev/bar` | 8 | 96 | 210,004 | 12,880 | $1.9902 (seed rates, 14 of 96 events unpriced) | 2026-07-30 | 2026-08-04 (2 days ago) |
 ```
 
 - Thousands separators on token counts; humanize the two dates with a relative age in
@@ -71,8 +74,16 @@ Render **one** markdown table, rows in the query's order:
   render the cost as `unpriced`, never `$0` — it means no `pricing` prefix matched that
   project's models, not that the work was free. **`effective_from = 0` is the seed
   marker; never render it as a date (1970-01-01).**
-- A project with events but no matching rates, and a project with no events yet (zeros,
-  empty dates), are both normal rows — say nothing more about them.
+- **`unpriced_events` makes a partial estimate visible.** `rates_as_of` reports only the
+  latest rate that *did* apply, so a project mixing priced and unpriced models would
+  otherwise look fully priced while its cost silently omitted those events. Whenever
+  `unpriced_events` is above 0 and below `events`, append `, N of M events unpriced` to
+  the cost cell — the number is understated by exactly that much. Equal to `events` → the
+  cost cell is `unpriced`; 0 → say nothing.
+- A project with events but no matching rates, and a project with no events yet, are both
+  normal rows — say nothing more about them. The no-events row carries zeros, empty dates
+  and a `—` cost cell (its `rates_as_of` reads `unpriced` only because there is nothing
+  to price).
 
 Close with one line only: if any row shows `seed rates`, note that
 `/token-telemetry:pricing-update` replaces the seed with dated published rates. No other

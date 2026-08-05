@@ -949,6 +949,18 @@ class TestMirrorWrite(unittest.TestCase):
         self.assertEqual(self.project_meta(self.db)[0][2],
                          int(capture.parse_ts("2026-07-17T11:30:00.000Z")))
 
+    def test_event_less_turn_does_not_stamp_mirror_meta(self):
+        # A turn that only advances the cursor (no usage entries) mirrors
+        # nothing, so there is no event timestamp to record - stamping one would
+        # invent `now` as an event ts and claim a mirror write that never
+        # happened. Gated exactly like the mirror write itself.
+        self.enable("project\n")
+        write_jsonl(self.transcript, [entry(typ="user")])
+        self.run_main()
+        self.assertEqual(len(self.event_rows(self.db)), 0)
+        self.assertEqual(self.project_meta(self.db),
+                         [(str(self.proj), None, None)])
+
     def test_mirror_meta_is_configured_state_not_a_write_receipt(self):
         # The mirror write fails (its path is a directory) - the central DB must
         # still record that a project-level copy is configured, or a later

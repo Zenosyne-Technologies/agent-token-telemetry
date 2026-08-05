@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .claude/telemetry-context.json
 .claude/telemetry-usage.db*
+.DS_Store
