@@ -211,34 +211,74 @@ def get_offset(conn, transcript):
     return row[0] if row else 0
 
 
+def insert_events(conn, project, session_uuid, kind_hint, agent, groups,
+                  branch=None, commit_sha=None, issue_key=None,
+                  task_size=None, note=None):
+    """One event row per (model, sidechain) group. Caller owns the transaction.
+    Returns the session id (the cursor row, written only in the central DB,
+    needs it)."""
+    project_id = get_or_create(conn, "projects", "path", project)
+    row = conn.execute(
+        "SELECT id FROM sessions WHERE uuid=?", (session_uuid,)).fetchone()
+    session_id = row[0] if row else conn.execute(
+        "INSERT INTO sessions(uuid, project_id) VALUES (?,?)",
+        (session_uuid, project_id)).lastrowid
+    for (model, side), g in groups.items():
+        model_id = get_or_create(conn, "models", "name", model)
+        kind = 1 if (kind_hint or side) else 0
+        dur = (int((g["last"] - g["first"]) * 1000)
+               if g["first"] is not None else None)
+        ts = int(g["last"]) if g["last"] is not None else int(time.time())
+        conn.execute(
+            "INSERT INTO events(ts, session_id, kind, agent, model_id,"
+            " in_tok, out_tok, cache_r, cache_w, dur_ms, branch, commit_sha,"
+            " issue_key, task_size, note)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ts, session_id, kind, agent, model_id,
+             g["in"], g["out"], g["cr"], g["cw"], dur, branch, commit_sha,
+             issue_key, task_size, note))
+    return session_id
+
+
 def record(conn, project, session_uuid, kind_hint, agent, groups,
            transcript, new_offset, branch=None, commit_sha=None,
            issue_key=None, task_size=None, note=None):
     with conn:
-        project_id = get_or_create(conn, "projects", "path", project)
-        row = conn.execute(
-            "SELECT id FROM sessions WHERE uuid=?", (session_uuid,)).fetchone()
-        session_id = row[0] if row else conn.execute(
-            "INSERT INTO sessions(uuid, project_id) VALUES (?,?)",
-            (session_uuid, project_id)).lastrowid
-        for (model, side), g in groups.items():
-            model_id = get_or_create(conn, "models", "name", model)
-            kind = 1 if (kind_hint or side) else 0
-            dur = (int((g["last"] - g["first"]) * 1000)
-                   if g["first"] is not None else None)
-            ts = int(g["last"]) if g["last"] is not None else int(time.time())
-            conn.execute(
-                "INSERT INTO events(ts, session_id, kind, agent, model_id,"
-                " in_tok, out_tok, cache_r, cache_w, dur_ms, branch, commit_sha,"
-                " issue_key, task_size, note)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (ts, session_id, kind, agent, model_id,
-                 g["in"], g["out"], g["cr"], g["cw"], dur, branch, commit_sha,
-                 issue_key, task_size, note))
+        session_id = insert_events(conn, project, session_uuid, kind_hint,
+                                   agent, groups, branch, commit_sha,
+                                   issue_key, task_size, note)
         conn.execute(
             "INSERT INTO cursors(transcript, offset, session_id) VALUES (?,?,?)"
             " ON CONFLICT(transcript) DO UPDATE SET offset=excluded.offset",
             (str(transcript), new_offset, session_id))
+
+
+def mirror_events(root, *args, **kwargs):
+    """Copy the rows just committed centrally into the project-local DB, so the
+    data travels with the repo. The central DB stays authoritative: it alone
+    tracks cursors, so nothing here can change what gets read from a transcript.
+    No cursor is written here - a retried capture can therefore duplicate rows in
+    the mirror; they are identical rows, so consumers dedupe on the full tuple.
+    Must be called only after the central connection is closed: this opens a
+    second DB and must never do so while holding the central write lock."""
+    path = mirror_db_path(root)
+    # The mirror path lives inside the repo, so it can arrive as a committed
+    # symlink - which would point SQLite's writes at any file on the machine.
+    # Refuse rather than resolve: nothing here is worth writing through a link.
+    if path.is_symlink():
+        raise RuntimeError(f"mirror path is a symlink - refused: {path}")
+    conn = connect(path)
+    try:
+        # Same lock discipline as the central write, for the same reason:
+        # parallel firings share this file, and a deferred transaction lets
+        # get_or_create's SELECT-then-INSERT race - the losing writer's rows are
+        # then dropped by the swallow-all-mirror-errors rule. Measured: 9/10
+        # rows landing in 2 of 3 ten-way trials without this.
+        conn.execute("BEGIN IMMEDIATE")
+        with conn:
+            insert_events(conn, *args, **kwargs)
+    finally:
+        conn.close()
 
 
 def find_project_root(cwd):
@@ -253,6 +293,30 @@ def is_enabled(cwd):
     root = find_project_root(cwd)
     return ((Path(cwd) / ".claude" / "telemetry").exists()
             or (root / ".claude" / "telemetry").exists())
+
+
+STORAGE_CENTRAL = "central"
+STORAGE_PROJECT = "project"
+MARKER_MAX_BYTES = 4096
+
+
+def read_storage_mode(root):
+    """The marker's first line selects storage: `project` adds the local mirror,
+    anything else means central-only. Central is the default in every ambiguous
+    case - absent, empty, oversized, undecodable or unrecognized content - so a
+    marker written by an older version (empty file) keeps behaving as it did,
+    and a corrupted one degrades to the mode that always works."""
+    try:
+        with open(Path(root) / ".claude" / "telemetry", "rb") as f:
+            head = f.read(MARKER_MAX_BYTES)
+        first = head.split(b"\n", 1)[0].decode("utf-8").strip().lower()
+        return STORAGE_PROJECT if first == STORAGE_PROJECT else STORAGE_CENTRAL
+    except Exception:
+        return STORAGE_CENTRAL
+
+
+def mirror_db_path(root):
+    return Path(root) / ".claude" / "telemetry-usage.db"
 
 
 def git(cwd, *args):
@@ -316,12 +380,18 @@ def sidecar_text(value):
     return str(value) if isinstance(value, (str, int, float)) else None
 
 
-def log_error():
+def log_error(context=None):
+    """Always the CENTRAL telemetry directory, whatever the storage mode - one
+    place to look. `context` names the failing step, since a swallowed mirror
+    failure is otherwise indistinguishable from a failed capture."""
     try:
         log = db_path().parent / "error.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "a") as f:
-            f.write(f"--- {datetime.now().isoformat()}\n{traceback.format_exc()}\n")
+            header = f"--- {datetime.now().isoformat()}"
+            if context:
+                header += f" {context}"
+            f.write(f"{header}\n{traceback.format_exc()}\n")
     except Exception:
         pass
 
@@ -351,6 +421,7 @@ def main():
         ctx = read_sidecar(root) or {}
         issue_key = sidecar_text(ctx.get("issue_key")) or issue_key_from_git(cwd)
         conn = connect(db_path())
+        mirror_args = None
         try:
             # Take the write lock up front so concurrent hook firings on the
             # same transcript serialize instead of racing the cursor
@@ -366,13 +437,26 @@ def main():
                 return
             kind_hint = 1 if hook.get("hook_event_name") == "SubagentStop" else 0
             agent = hook.get("agent_type") or hook.get("agent_name")
-            record(conn, str(root),
-                   hook.get("session_id") or "unknown", kind_hint, agent,
-                   groups, transcript, new_offset, branch, sha,
-                   issue_key, sidecar_text(ctx.get("size")),
-                   sidecar_text(ctx.get("summary")))
+            # Built once and shared with the mirror call below, so the two
+            # writes cannot drift into recording different rows.
+            event_args = (str(root), hook.get("session_id") or "unknown",
+                          kind_hint, agent, groups)
+            meta = (branch, sha, issue_key, sidecar_text(ctx.get("size")),
+                    sidecar_text(ctx.get("summary")))
+            record(conn, *event_args, transcript, new_offset, *meta)
+            if groups:
+                mirror_args = (*event_args, *meta)
         finally:
             conn.close()
+        # Only now, with the central transaction committed and its connection
+        # closed, is the project-local copy attempted - and any failure of it is
+        # logged and dropped: the mirror exists for retention and portability,
+        # never at the cost of the authoritative write or the session.
+        if mirror_args and read_storage_mode(root) == STORAGE_PROJECT:
+            try:
+                mirror_events(root, *mirror_args)
+            except Exception:
+                log_error(f"mirror write failed: {mirror_db_path(root)}")
     except Exception:
         if enabled:
             log_error()
