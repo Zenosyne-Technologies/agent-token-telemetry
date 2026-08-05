@@ -730,6 +730,38 @@ class TestMirrorWrite(unittest.TestCase):
         self.assertTrue(log.exists())
         self.assertIn("telemetry-usage.db", log.read_text())
 
+    def test_symlinked_mirror_path_is_refused(self):
+        # A repo-committed symlink at the mirror path would aim SQLite's writes
+        # at an arbitrary file - creating a DB there, or injecting tables into
+        # an unrelated one. Refuse before connecting; the central write stands.
+        self.enable("project\n")
+        target = self.root / "elsewhere" / "attacker.db"
+        target.parent.mkdir()
+        self.mirror.symlink_to(target)
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertFalse(target.exists(), "wrote through the symlink")
+        self.assertEqual(len(self.event_rows(self.db)), 1)
+        log = (self.db.parent / "error.log").read_text()
+        self.assertIn("symlink", log)
+        self.assertIn("refused", log)
+
+    def test_symlink_to_existing_db_is_not_written_to(self):
+        self.enable("project\n")
+        victim = self.root / "victim.db"
+        conn = _sqlite3.connect(victim)
+        conn.execute("CREATE TABLE unrelated(x)")
+        conn.commit()
+        conn.close()
+        self.mirror.symlink_to(victim)
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        conn = _sqlite3.connect(victim)
+        self.addCleanup(conn.close)
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertEqual(tables, {"unrelated"}, "injected tables into a foreign DB")
+
     def test_mirror_failure_does_not_stall_the_central_cursor(self):
         self.enable("project\n")
         self.mirror.mkdir()
@@ -806,6 +838,31 @@ class TestConcurrency(unittest.TestCase):
 
         self.assertEqual(self.count_events(), self.NPROCS)
         self.assertFalse((self.db.parent / "error.log").exists())
+
+
+class TestMirrorConcurrency(TestConcurrency):
+    """The mirror faces the same race the central DB is already hardened
+    against: parallel firings share one project-local file, and get_or_create's
+    SELECT-then-INSERT plus a deferred transaction drops rows (a losing writer
+    hits a UNIQUE violation or a lock, and the failure is swallowed by design).
+    Project mode must land every row in BOTH DBs."""
+
+    def setUp(self):
+        super().setUp()
+        (self.proj / ".claude" / "telemetry").write_text("project\n")
+        self.mirror = self.proj / ".claude" / "telemetry-usage.db"
+
+    def count_mirror_events(self):
+        conn = _sqlite3.connect(self.mirror)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_parallel_firings_mirror_every_row(self):
+        self.test_parallel_firings_no_double_count_no_drop()
+        self.assertEqual(self.count_mirror_events(), self.NPROCS)
+        self.assertEqual(self.count_mirror_events(), self.count_events())
 
 
 if __name__ == "__main__":
