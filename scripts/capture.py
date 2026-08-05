@@ -129,24 +129,58 @@ PRICING_SEED = [
 ]
 SEED_SOURCE = "seed-v0.2.0"
 
+AUDIT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS audit_log(
+  ts      INTEGER NOT NULL,
+  action  TEXT NOT NULL,
+  project TEXT NOT NULL,
+  detail  TEXT);
+"""
+
 V2_COLUMNS = ("issue_key", "task_size", "note")
+# v3: where a project-level copy of this project's events lives, and the event
+# timestamp of the last capture that was configured to write one.
+V3_PROJECT_COLUMNS = (("mirror_path", "TEXT"), ("mirror_last_at", "INTEGER"))
+MIRROR_META = {col for col, _ in V3_PROJECT_COLUMNS}
+SCHEMA_VERSION = 3
+
+
+def table_columns(conn, table):
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 
 def event_columns(conn):
-    return {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+    return table_columns(conn, "events")
+
+
+def has_table(conn, name):
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,)).fetchone() is not None
 
 
 def migrate(conn):
-    """SCHEMA is the v1 baseline; later versions are deltas applied here.
-    Every statement is individually idempotent rather than wrapped in one
-    transaction, so a migrating process never blocks a peer's capture."""
+    """SCHEMA is the v1 baseline; later versions are deltas applied here, in
+    order, each hop gated on its own post-condition. Every statement is
+    individually idempotent rather than wrapped in one transaction, so a
+    migrating process never blocks a peer's capture."""
     # The version stamp alone is not proof the schema matches it: a DB stamped
-    # v2 without the v2 columns (an older build that stamped too early, a
-    # restored/edited file) would otherwise fail every capture forever. One
-    # extra PRAGMA read on the fast path buys that DB a self-heal.
-    if (conn.execute("PRAGMA user_version").fetchone()[0] >= 2
-            and set(V2_COLUMNS) <= event_columns(conn)):
+    # for a version it does not actually have (an older build that stamped too
+    # early, a restored/edited file) would otherwise fail every capture forever.
+    # A few extra PRAGMA reads on the fast path buy that DB a self-heal.
+    if (conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION
+            and set(V2_COLUMNS) <= event_columns(conn)
+            and MIRROR_META <= table_columns(conn, "projects")
+            and has_table(conn, "audit_log")):
         return
+    # Hops run in sequence and each returns whether its shape actually landed:
+    # v3 must never be attempted - let alone stamped - on a DB that failed v2.
+    if migrate_v2(conn):
+        migrate_v3(conn)
+
+
+def migrate_v2(conn):
+    """v1 -> v2: the three kit-aware `events` columns and the `pricing` table."""
     for col in V2_COLUMNS:
         try:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
@@ -157,7 +191,7 @@ def migrate(conn):
     # cannot tell "already added" from "database is locked"/"disk full", and a
     # premature stamp would strand the DB without the columns forever.
     if not set(V2_COLUMNS) <= event_columns(conn):
-        return  # next connect retries
+        return False  # next connect retries
     conn.executescript(PRICING_SCHEMA)
     # Gate on the seed rows, not the table: CREATE TABLE autocommits, so a
     # failure before the INSERT can leave an empty table that must still get
@@ -174,6 +208,26 @@ def migrate(conn):
     # no open transaction for main()'s BEGIN IMMEDIATE to trip over.
     conn.commit()
     conn.execute("PRAGMA user_version=2")
+    return True
+
+
+def migrate_v3(conn):
+    """v2 -> v3: mirror metadata on `projects` and the `audit_log` table the
+    storage-management commands (`/storage-separate`, `/storage-delete`) append
+    to. Same discipline as v2: idempotent ALTERs, post-condition verified before
+    the version stamp."""
+    for col, coltype in V3_PROJECT_COLUMNS:
+        try:
+            conn.execute(f"ALTER TABLE projects ADD COLUMN {col} {coltype}")
+        except sqlite3.OperationalError:
+            pass  # duplicate column, or a transient failure the check catches
+    conn.executescript(AUDIT_SCHEMA)
+    if not (MIRROR_META <= table_columns(conn, "projects")
+            and has_table(conn, "audit_log")):
+        return False  # next connect retries; the stamp stays at 2
+    conn.commit()
+    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+    return True
 
 
 def connect(path):
@@ -240,13 +294,41 @@ def insert_events(conn, project, session_uuid, kind_hint, agent, groups,
     return session_id
 
 
+def latest_event_ts(groups):
+    stamps = [g["last"] for g in groups.values() if g["last"] is not None]
+    return int(max(stamps)) if stamps else int(time.time())
+
+
+def stamp_mirror_meta(conn, project, mirror_path, ts):
+    """Record on the central `projects` row that this project keeps a
+    project-level copy, and how recent the capture that expected one was.
+
+    This is **configured state, not a write receipt**: it is stamped inside the
+    central transaction, before the mirror write is even attempted, and stays
+    stamped when that write later fails. The central DB must always know a
+    project-level copy exists - a reader that inferred storage mode from a
+    successful mirror write would report project mode as central exactly when
+    the mirror is broken and needs looking at. `mirror_last_at` therefore answers
+    "when was the last capture destined for this mirror", and only
+    `/token-telemetry:storage-status`'s file check answers "did it land"."""
+    # A DB whose v3 hop has not landed yet (post-condition withheld the stamp)
+    # has no such columns; the metadata is never worth failing the capture over.
+    if MIRROR_META <= table_columns(conn, "projects"):
+        conn.execute(
+            "UPDATE projects SET mirror_path=?, mirror_last_at=? WHERE path=?",
+            (str(mirror_path), ts, str(project)))
+
+
 def record(conn, project, session_uuid, kind_hint, agent, groups,
            transcript, new_offset, branch=None, commit_sha=None,
-           issue_key=None, task_size=None, note=None):
+           issue_key=None, task_size=None, note=None, mirror_path=None):
     with conn:
         session_id = insert_events(conn, project, session_uuid, kind_hint,
                                    agent, groups, branch, commit_sha,
                                    issue_key, task_size, note)
+        if mirror_path is not None:
+            stamp_mirror_meta(conn, project, mirror_path,
+                              latest_event_ts(groups))
         conn.execute(
             "INSERT INTO cursors(transcript, offset, session_id) VALUES (?,?,?)"
             " ON CONFLICT(transcript) DO UPDATE SET offset=excluded.offset",
@@ -420,6 +502,9 @@ def main():
         root = find_project_root(cwd)
         ctx = read_sidecar(root) or {}
         issue_key = sidecar_text(ctx.get("issue_key")) or issue_key_from_git(cwd)
+        # Read once, before the write lock: the central transaction stamps the
+        # mirror metadata (below) and the same decision gates the mirror write.
+        project_mode = read_storage_mode(root) == STORAGE_PROJECT
         conn = connect(db_path())
         mirror_args = None
         try:
@@ -443,7 +528,8 @@ def main():
                           kind_hint, agent, groups)
             meta = (branch, sha, issue_key, sidecar_text(ctx.get("size")),
                     sidecar_text(ctx.get("summary")))
-            record(conn, *event_args, transcript, new_offset, *meta)
+            record(conn, *event_args, transcript, new_offset, *meta,
+                   mirror_path=mirror_db_path(root) if project_mode else None)
             if groups:
                 mirror_args = (*event_args, *meta)
         finally:
@@ -452,7 +538,7 @@ def main():
         # closed, is the project-local copy attempted - and any failure of it is
         # logged and dropped: the mirror exists for retention and portability,
         # never at the cost of the authoritative write or the session.
-        if mirror_args and read_storage_mode(root) == STORAGE_PROJECT:
+        if mirror_args and project_mode:
             try:
                 mirror_events(root, *mirror_args)
             except Exception:
