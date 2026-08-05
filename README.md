@@ -10,6 +10,14 @@ usage can be sliced by tracker issue, task size, and milestone — the seam the
 **agent-operating-kit** consumes for cost-aware reporting. Install both from the
 same marketplace for the full suite; each degrades gracefully without the other.
 
+The kit-side joins cost nothing extra to capture because they ride the kit's own
+conventions: `milestone/<slug>` branches make the by-milestone breakdown a plain
+GROUP BY on the `branch` column; `<KEY>:`-prefixed commit messages give the
+by-issue fallback when no sidecar was present; model-name prefixes map to the
+kit's dispatch tiers (orchestrator / heavy / small / micro). This repo is itself
+operated under the kit (Jira project AOS, `.docs/` cascade, issue-key commits) —
+the telemetry dogfoods the conventions it joins against.
+
 ## Install
 
 ```
@@ -44,7 +52,12 @@ with sqlite3/DuckDB/Grafana. Capture never breaks a session — capture errors g
 to `~/.claude/telemetry/error.log` only for opted-in projects; failures before
 the opt-in check exit silently. Cost is never stored — it is derived at query
 time from the `pricing` table (see `docs/TELEMETRY-CONTRACT.md` for the exact
-rate-resolution rule and the stability promise on consumed columns).
+rate-resolution rule and the stability promise on consumed columns). A fresh DB
+seeds the four tier rates at `effective_from = 0` — reports label those as
+"seed rates (undated)"; run `/token-telemetry:pricing-update` once to replace
+them with dated rows from Anthropic's published pricing. Rate changes are always
+new effective-dated rows, so historical events keep pricing at the rate that was
+in force when they happened.
 
 When a kit-managed project has telemetry enabled, the kit writes
 `.claude/telemetry-context.json` at tracker-task start/switch; capture stamps
@@ -53,8 +66,12 @@ per-milestone cost breakdowns and the kit's cost-per-issue closing comment.
 
 ## Design
 
-See `docs/superpowers/specs/2026-07-17-token-telemetry-plugin-design.md` and
-`docs/TELEMETRY-CONTRACT.md` for the v0.2.0 stability contract.
+See `docs/superpowers/specs/2026-07-17-token-telemetry-plugin-design.md` (v0.1.0
+capture design), `docs/TELEMETRY-CONTRACT.md` (the v0.2.0 stability contract:
+consumed columns, pricing table shape, sidecar spec, `PRAGMA user_version`
+discipline), and — kit side — the integration design in the agent-operating-kit
+repo: `docs/superpowers/specs/2026-08-04-cost-telemetry-integration-v0.12.0-design.md`
+with its `templates/docs/agents/token-economics.md` contract mirror.
 
 ## Tests
 
