@@ -4,4 +4,4 @@ Every page in this folder MUST be registered below with a one-line description â
 
 | Page | What it covers | Sources |
 |---|---|---|
-| [[reading-token-stats]] | What `/token-stats` shows, seed rates (undated), cache hit rate | `commands/token-stats.md` |
+| [[reading-token-stats]] | What `/token-stats` shows, the all-time per-project table from `/project-stats`, seed rates (undated), cache hit rate | `commands/token-stats.md`, `commands/project-stats.md` |

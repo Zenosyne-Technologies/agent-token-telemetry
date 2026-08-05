@@ -4,4 +4,4 @@ Every page in this folder MUST be registered below with a one-line description â
 
 | Page | What it covers | Sources |
 |---|---|---|
-| [[enabling-telemetry]] | Opting a project in/out, the marker file, where data lives, the error log | `scripts/capture.py`, `hooks/hooks.json` |
+| [[enabling-telemetry]] | Opting a project in/out, the marker file and its storage choice (central vs project folder), where data lives, the error log, and managing collected data with the storage-status / project-stats / storage-separate / storage-delete commands | `scripts/capture.py`, `hooks/hooks.json`, `commands/enable.md`, `commands/disable.md`, `commands/storage-status.md`, `commands/storage-separate.md`, `commands/storage-delete.md` |
