@@ -9,10 +9,14 @@ Enable token telemetry for this project:
    - **Central only** (default) — events go to `~/.claude/telemetry/usage.db` only.
    - **Project folder** — events go to the central DB *and* a project-local copy at
      `<root>/.claude/telemetry-usage.db`, so the data travels with the repo.
-3. Run `mkdir -p <root>/.claude`, then write the marker with the chosen mode as its
-   first line: `printf 'central\n' > <root>/.claude/telemetry` or
-   `printf 'project\n' > <root>/.claude/telemetry`. Anything else in the file (or an
-   empty file, as older versions wrote) is read as `central`.
+3. Run `mkdir -p <root>/.claude`, then write the chosen mode as the marker's **first
+   line** — `central` or `project`. Anything else in the file (or an empty file, as
+   older versions wrote) is read as `central`.
+   - Marker absent or empty → `printf 'project\n' > <root>/.claude/telemetry` (or
+     `central`).
+   - Marker already has content → **read it, replace only line 1, write it back**,
+     keeping every later line verbatim. Lines after the first are free-form notes the
+     contract promises to preserve; never truncate the file to write the mode.
 4. **Project mode only** — add `.claude/telemetry-usage.db*` to `<root>/.gitignore`
    (append it if the line is not already there; the `*` also covers the `-wal`/`-shm`
    files). Then tell the user it is git-ignored by default, and that committing it

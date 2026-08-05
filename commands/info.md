@@ -1,6 +1,6 @@
 ---
 description: Report telemetry plugin version, this project's opt-in and storage mode, and DB state
-allowed-tools: Bash(sqlite3:*), Bash(cat:*), Bash(ls:*), Bash(python3:*), Read
+allowed-tools: Bash(sqlite3:*), Bash(cat:*), Bash(ls:*), Read
 ---
 
 Report the telemetry setup. **Read-only — never create, migrate or modify a DB, a
@@ -48,18 +48,26 @@ marker or a config file here.** If something is absent, say so and move on.
    run the same `PRAGMA user_version` and event-count/date-range queries against it and
    report them beside the central numbers.
 
-   The central DB is authoritative. The mirror carries no cursors and can hold
-   duplicate rows if the central DB was ever reset or restored while the mirror was
-   kept, so a mirror count **higher** than the central count for this project is
-   expected in that case, not corruption — mention this only if you actually observe
-   it, and compare against the central count for this project's path:
+   The central DB is authoritative, so compare the mirror against the central count
+   **for this project's path** — passing the root as a parameter, or with any `'` in
+   the path doubled (`''`) if you inline it:
 
    ```sql
    SELECT COUNT(*) AS events_here FROM events e
    JOIN sessions s ON s.id = e.session_id
    JOIN projects p ON p.id = s.project_id
-   WHERE p.path = '<root>';
+   WHERE p.path = ?;   -- bind the project root; if inlined, double any apostrophe
    ```
+
+   A mirror count **higher** than that is expected, not corruption, and has two
+   causes — name whichever fits, and only if you actually observe the gap:
+   - the mirror carries no cursors, so rows were re-inserted after the central DB was
+     reset, moved or restored while the project-local file was kept;
+   - the mirror is committed to the repo and was pulled from teammates, so it carries
+     their machines' rows — visible as extra `projects.path` values inside the mirror.
+     Check with `SELECT path, COUNT(*) FROM projects p JOIN sessions s ON
+     s.project_id = p.id JOIN events e ON e.session_id = s.id GROUP BY path;` against
+     the mirror.
 
 Present it as a compact status block: plugin version, project opt-in + mode + sidecar,
 central DB line, mirror DB line. No recommendations beyond the two named above.
