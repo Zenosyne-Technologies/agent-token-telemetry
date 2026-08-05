@@ -1308,5 +1308,44 @@ class TestStorageSeparate(StorageMaintenanceCase):
             self.rows(self.db, "SELECT COUNT(*) FROM pricing")[0][0], 4)
 
 
+class TestStorageDelete(StorageMaintenanceCase):
+    """Plain delete - no export first. Same transactional scoping, its own
+    audit action."""
+
+    def test_delete_removes_only_the_target_project(self):
+        beta_before = self.event_tuples(self.db, self.BETA)
+        delete_project(self.db, self.ALPHA, "delete", "3 events, 2 sessions")
+        self.assertEqual(project_counts(self.db, self.ALPHA), (0, 0))
+        self.assertEqual(project_counts(self.db, self.BETA), (1, 1))
+        self.assertEqual(self.event_tuples(self.db, self.BETA), beta_before)
+        self.assertEqual(
+            self.rows(self.db, "SELECT COUNT(*) FROM sessions")[0][0], 1)
+        self.assertEqual(
+            self.rows(self.db, "SELECT COUNT(*) FROM cursors")[0][0], 1)
+
+    def test_delete_writes_an_audit_row_with_counts(self):
+        delete_project(self.db, self.ALPHA, "delete", "3 events, 2 sessions")
+        self.assertEqual(self.audit_rows(),
+                         [("delete", self.ALPHA, "3 events, 2 sessions")])
+
+    def test_audit_history_outlives_the_project_it_describes(self):
+        delete_project(self.db, self.ALPHA, "delete", "3 events, 2 sessions")
+        delete_project(self.db, self.BETA, "delete", "1 event, 1 session")
+        self.assertEqual([r[1] for r in self.audit_rows()],
+                         [self.ALPHA, self.BETA])
+        self.assertEqual(self.rows(self.db, "SELECT COUNT(*) FROM events"),
+                         [(0,)])
+
+    def test_deleting_an_unknown_project_changes_nothing(self):
+        before = (self.rows(self.db, "SELECT COUNT(*) FROM events"),
+                  self.rows(self.db, "SELECT COUNT(*) FROM sessions"),
+                  self.rows(self.db, "SELECT COUNT(*) FROM projects"))
+        delete_project(self.db, "/dev/never-recorded", "delete", "0 events")
+        self.assertEqual(
+            (self.rows(self.db, "SELECT COUNT(*) FROM events"),
+             self.rows(self.db, "SELECT COUNT(*) FROM sessions"),
+             self.rows(self.db, "SELECT COUNT(*) FROM projects")), before)
+
+
 if __name__ == "__main__":
     unittest.main()
