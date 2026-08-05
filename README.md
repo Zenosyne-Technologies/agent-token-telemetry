@@ -75,6 +75,9 @@ claude plugin install token-telemetry@agent-token-telemetry
 - `/token-telemetry:storage-delete` — delete one project's data; asks whether to
   export first, shows the exact counts, and requires the project's basename
   typed back before writing. Never VACUUMs for you; it tells you to
+- `/token-telemetry:project-stats` — one all-time table, a row per project:
+  sessions, events, input/output tokens, estimated cost (priced per event from
+  the `pricing` table), first seen and last activity, ordered by cost
 - `/token-telemetry:token-stats` — totals, per-project/model/agent/milestone/
   tier/issue breakdown, cache hit rate, cost estimates priced from the
   `pricing` table
