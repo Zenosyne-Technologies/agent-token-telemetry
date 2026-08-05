@@ -6,7 +6,9 @@ allowed-tools: Bash(python3:*), Bash(sqlite3:*), Bash(ls:*), Bash(cat:*), Read
 Carve **one** project out of the central telemetry DB into a self-contained file, and
 only then offer to remove it centrally. Interactive and stepwise: the user picks the
 project, sees validated counts, and confirms the deletion separately. **Nothing outside
-the chosen project is ever read into the export or deleted from the central DB.**
+the chosen project is ever read into the export or deleted from the central DB** — except
+the shared `models` and `pricing` reference tables, which are copied (never deleted) so
+the export can price itself standalone.
 
 Central DB: `~/.claude/telemetry/usage.db`, or `$TOKEN_TELEMETRY_DB` when set. If it does
 not exist, say so and stop.
@@ -42,8 +44,13 @@ pricing seed, and every value is passed as an argument, never interpolated into 
 
 ```bash
 python3 - "$CLAUDE_PLUGIN_ROOT" "<central-db>" "<export-db>" "<project-path>" <<'PY'
-import sys
+import os, sys
 plugin, central, export, project = sys.argv[1:5]
+# Hard refusal, not just the step-2 name check: connect() would happily open an
+# existing DB and add a second project's rows to it, silently turning someone
+# else's export into a two-project file.
+if os.path.exists(export):
+    sys.exit(f"export path exists, refusing: {export}")
 sys.path.insert(0, plugin + "/scripts")
 import capture
 
@@ -97,7 +104,8 @@ not offer the deletion.
 
 ### 5. Record the export
 
-Only after validation passes:
+Only after validation passes, and **against the central DB** — the audit trail of what
+left the central store lives in the central store, not in the export:
 
 ```sql
 INSERT INTO audit_log(ts, action, project, detail)
@@ -115,8 +123,9 @@ the only copy afterwards, and that this touches nothing else — no other projec
 and not the project's own `.claude/telemetry-usage.db` mirror, which is a separate file
 this command never reads or writes.
 
-On yes, run one transaction, ordered so nothing is orphaned, with the audit row inside it
-(same argv-passed style as step 3 — never interpolate the path into SQL):
+On yes, run one transaction against the central DB, children before parents, with the
+audit row inside it (same argv-passed style as step 3 — never interpolate the path into
+SQL):
 
 ```sql
 BEGIN;

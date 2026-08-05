@@ -27,9 +27,9 @@ in the table stops the command.
 
 Two options, asked before any confirmation of the deletion itself:
 
-- **Export first** (keep the data in its own file, then remove it centrally) — follow
-  `commands/storage-separate.md` from its step 2 with the project already chosen, and
-  **stop when it finishes**. That flow already validates the export, writes the `export`
+- **Export first** (keep the data in its own file, then remove it centrally) — read and
+  follow `${CLAUDE_PLUGIN_ROOT}/commands/storage-separate.md` from its step 2 with the
+  project already chosen, and **stop when it finishes**. That flow already validates the export, writes the `export`
   audit row and offers the post-export deletion; do not delete anything here as well.
 - **Plain delete** (the data is not wanted anywhere) — continue below.
 
@@ -61,7 +61,8 @@ command with nothing written.
 ### 5. Delete, transactionally, with the audit row inside the transaction
 
 Run it with the project path passed as an argument, never interpolated into SQL — the
-same `python3 - "<args>" <<'PY'` style `commands/storage-separate.md` step 3 uses:
+same `python3 - "<args>" <<'PY'` style `${CLAUDE_PLUGIN_ROOT}/commands/storage-separate.md`
+step 3 uses:
 
 ```sql
 BEGIN;
@@ -76,9 +77,12 @@ VALUES (strftime('%s','now'), 'delete', :project, :detail);
 COMMIT;
 ```
 
-`detail` carries the counts from step 3, e.g. `3 events, 2 sessions, 2 cursors`. Order
-matters: children before parents, so a failure mid-way rolls back to a consistent DB
-rather than leaving orphans. `models` and `pricing` are shared reference data — **never**
+`detail` carries the counts from step 3, e.g. `3 events, 2 sessions, 2 cursors`. Two
+separate guarantees, do not conflate them: the **order** (children before parents) means
+no statement ever leaves a row pointing at a deleted parent, so the DB is consistent at
+every step even to a concurrent reader; the **single transaction** means a failure
+part-way rolls the whole thing back, so a half-deleted project cannot survive the
+command. `models` and `pricing` are shared reference data — **never**
 delete from them. The `audit_log` row outlives the project it describes; audit history is
 never deleted here.
 
