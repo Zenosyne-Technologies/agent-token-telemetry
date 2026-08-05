@@ -4,7 +4,19 @@ Claude Code plugin that records per-turn and per-subagent token usage into a
 central SQLite database — with **zero model-token overhead** (capture runs in
 Stop/SubagentStop hooks, outside the model loop).
 
-v0.2.0 adds pricing-as-data (a versioned, effective-dated `pricing` table instead
+v0.3.0 adds a **storage choice**. `/token-telemetry:enable` now asks where the
+data should live: *central only* (the default, unchanged behavior) or *project
+folder* — which keeps writing the central DB **and** mirrors the same event rows
+into `<root>/.claude/telemetry-usage.db`, so usage history travels with the repo
+or the team share. The disclosure is deliberate and always stated at enable time:
+project mode is a **dual write**, not a redirect — a central copy is still kept
+for retention and cross-project stats. The central DB stays authoritative (it
+alone tracks transcript cursors); the mirror is best effort and any failure of it
+is logged and dropped rather than costing you the capture. `/token-telemetry:info`
+reports the whole picture: plugin version, this project's opt-in and storage mode,
+sidecar presence, and both DBs' schema version, event counts and pricing state.
+
+v0.2.0 added pricing-as-data (a versioned, effective-dated `pricing` table instead
 of a hardcoded map) and kit-aware columns (`issue_key`, `task_size`, `note`) so
 usage can be sliced by tracker issue, task size, and milestone — the seam the
 **agent-operating-kit** consumes for cost-aware reporting. Install both from the
@@ -34,9 +46,13 @@ claude plugin install token-telemetry@agent-token-telemetry
 
 ## Use
 
-- `/token-telemetry:enable` — opt this project in (creates `.claude/telemetry`
-  marker; committable for team-wide opt-in)
+- `/token-telemetry:enable` — opt this project in (writes the `.claude/telemetry`
+  marker, whose first line records the chosen storage mode — `central` or
+  `project`; committable for team-wide opt-in)
 - `/token-telemetry:disable` — opt out
+- `/token-telemetry:info` — read-only status: plugin version, opt-in + storage
+  mode + sidecar for this project, central DB (schema version, events, projects,
+  pricing rows and their as-of date) and, in project mode, the mirror DB
 - `/token-telemetry:token-stats` — totals, per-project/model/agent/milestone/
   tier/issue breakdown, cache hit rate, cost estimates priced from the
   `pricing` table
@@ -47,10 +63,15 @@ claude plugin install token-telemetry@agent-token-telemetry
   background scheduled agent where the host supports it, else prints the
   manual-cadence advice
 
-Data lives in `~/.claude/telemetry/usage.db` (SQLite, WAL). Query it directly
-with sqlite3/DuckDB/Grafana. Capture never breaks a session — capture errors go
-to `~/.claude/telemetry/error.log` only for opted-in projects; failures before
-the opt-in check exit silently. Cost is never stored — it is derived at query
+Data lives in `~/.claude/telemetry/usage.db` (SQLite, WAL) — plus
+`<root>/.claude/telemetry-usage.db` in project mode, same schema, so every
+`token-stats` query runs against either. Query them directly with
+sqlite3/DuckDB/Grafana. Capture never breaks a session — capture errors go to
+`~/.claude/telemetry/error.log` only for opted-in projects (mirror failures land
+there too, labelled); failures before the opt-in check exit silently. The mirror
+keeps no cursors, so it can hold duplicate rows if the central DB is ever reset
+while the project copy is kept — they are identical rows; see
+`docs/TELEMETRY-CONTRACT.md` for the dedupe hint. Cost is never stored — it is derived at query
 time from the `pricing` table (see `docs/TELEMETRY-CONTRACT.md` for the exact
 rate-resolution rule and the stability promise on consumed columns). A fresh DB
 seeds the four tier rates at `effective_from = 0` — reports label those as
