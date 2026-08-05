@@ -261,8 +261,20 @@ def mirror_events(root, *args, **kwargs):
     the mirror; they are identical rows, so consumers dedupe on the full tuple.
     Must be called only after the central connection is closed: this opens a
     second DB and must never do so while holding the central write lock."""
-    conn = connect(mirror_db_path(root))
+    path = mirror_db_path(root)
+    # The mirror path lives inside the repo, so it can arrive as a committed
+    # symlink - which would point SQLite's writes at any file on the machine.
+    # Refuse rather than resolve: nothing here is worth writing through a link.
+    if path.is_symlink():
+        raise RuntimeError(f"mirror path is a symlink - refused: {path}")
+    conn = connect(path)
     try:
+        # Same lock discipline as the central write, for the same reason:
+        # parallel firings share this file, and a deferred transaction lets
+        # get_or_create's SELECT-then-INSERT race - the losing writer's rows are
+        # then dropped by the swallow-all-mirror-errors rule. Measured: 9/10
+        # rows landing in 2 of 3 ten-way trials without this.
+        conn.execute("BEGIN IMMEDIATE")
         with conn:
             insert_events(conn, *args, **kwargs)
     finally:
