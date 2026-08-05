@@ -2,8 +2,8 @@
 title: Reading Token Stats
 audience: user
 module: reporting
-sources: [commands/token-stats.md]
-updated: 2026-08-05
+sources: [commands/token-stats.md, commands/project-stats.md]
+updated: 2026-08-06
 related: [[enabling-telemetry]]
 ---
 
@@ -24,6 +24,19 @@ so instead of showing empty numbers.
   published pricing. This is an estimate for visibility, not a bill.
 - **By milestone / by issue** — usage rolled up under a milestone branch or a
   tracked issue key, when that information was available at the time.
+
+## One row per project
+
+`/token-telemetry:project-stats` answers a narrower question: how much has each
+project used, in total, ever? One table, one line per project — sessions,
+events, tokens in and out, an estimated cost, and the first and last days
+anything was recorded — sorted by cost, most expensive first. Unlike the report
+above there is no seven-day window; it is the whole history.
+
+If a project's cost cell says *unpriced*, no rate is known for the models that
+project used — it does not mean the work was free. If it says something like
+"14 of 96 events unpriced", the figure shown is real but understates the total
+by those events.
 
 ## "seed rates (undated)"
 
