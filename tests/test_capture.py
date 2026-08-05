@@ -203,10 +203,11 @@ class TestSchemaV2(unittest.TestCase):
     def columns(self, conn, table):
         return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
-    def test_fresh_db_is_user_version_2(self):
+    def test_fresh_db_carries_the_v2_delta(self):
         conn = capture.connect(self.db)
         self.addCleanup(conn.close)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertGreaterEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], 2)
         self.assertLessEqual({"issue_key", "task_size", "note"},
                              self.columns(conn, "events"))
 
@@ -240,7 +241,8 @@ class TestSchemaV2(unittest.TestCase):
         migrated = capture.connect(self.db)
         self.addCleanup(migrated.close)
         self.assertEqual(self._pricing_count(), before)
-        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
 
     def test_empty_pricing_table_is_seeded(self):
         # A crash between CREATE TABLE (autocommitted) and the seed INSERT
@@ -272,7 +274,8 @@ class TestSchemaV2(unittest.TestCase):
 
         retried = capture.connect(self.db)  # transient cause gone
         self.addCleanup(retried.close)
-        self.assertEqual(retried.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(retried.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         self.assertLessEqual({"issue_key", "task_size", "note"},
                              self.columns(retried, "events"))
 
@@ -299,7 +302,8 @@ class TestSchemaV2(unittest.TestCase):
 
         migrated = capture.connect(self.db)
         self.addCleanup(migrated.close)
-        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         self.assertLessEqual({"issue_key", "task_size", "note"},
                              self.columns(migrated, "events"))
         self.assertGreaterEqual(migrated.execute(
@@ -309,6 +313,153 @@ class TestSchemaV2(unittest.TestCase):
             " branch, commit_sha, issue_key, task_size, note FROM events").fetchall()
         self.assertEqual(row, [(99, "legacy", 11, 22, 33, 44, 55, "main",
                                 "abc123", None, None, None)])
+
+
+# The v0.2.0 delta over V1_SCHEMA, frozen for the same reason: the v3 migration
+# has to be tested against the shape DBs in the field actually carry.
+V2_EVENT_COLUMNS = ("issue_key", "task_size", "note")
+
+
+def build_v2_db(path):
+    """A populated, correctly stamped v2 DB - the starting point of the v2 -> v3
+    migration."""
+    conn = _sqlite3.connect(path)
+    conn.executescript(V1_SCHEMA)
+    for col in V2_EVENT_COLUMNS:
+        conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+    conn.executescript(capture.PRICING_SCHEMA)
+    conn.executemany(
+        "INSERT OR IGNORE INTO pricing(provider, model_prefix, in_usd, out_usd,"
+        " cache_r_usd, cache_w_usd, effective_from, source) VALUES (?,?,?,?,?,?,0,?)",
+        [(*row, capture.SEED_SOURCE) for row in capture.PRICING_SEED])
+    conn.execute("INSERT INTO projects(path) VALUES ('/proj')")
+    conn.execute("INSERT INTO models(name) VALUES ('claude-sonnet-5')")
+    conn.execute("INSERT INTO sessions(uuid, project_id) VALUES ('s1', 1)")
+    conn.execute(
+        "INSERT INTO events(ts, session_id, kind, agent, model_id, in_tok,"
+        " out_tok, cache_r, cache_w, dur_ms, branch, commit_sha, issue_key,"
+        " task_size, note) VALUES (99, 1, 0, 'legacy', 1, 11, 22, 33, 44, 55,"
+        " 'main', 'abc123', 'AOS-1', 'm', 'note')")
+    conn.execute("INSERT INTO cursors(transcript, offset, session_id)"
+                 " VALUES ('/t.jsonl', 7, 1)")
+    conn.execute("PRAGMA user_version=2")
+    conn.commit()
+    conn.close()
+
+
+class AlterProjectsBlockedConnection(_sqlite3.Connection):
+    """`ALTER TABLE projects` failing transiently (locked DB, disk full) while
+    the rest of the migration proceeds."""
+
+    def execute(self, sql, *args):
+        if sql.lstrip().upper().startswith("ALTER TABLE PROJECTS"):
+            raise _sqlite3.OperationalError("database is locked")
+        return super().execute(sql, *args)
+
+
+class TestSchemaV3(unittest.TestCase):
+    """v3 adds the mirror metadata columns on `projects` and the `audit_log`
+    table the storage-management commands write to."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = pathlib.Path(self.tmp.name) / "usage.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def columns(self, conn, table):
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    def tables(self, conn):
+        return {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+
+    def test_fresh_db_is_user_version_3_with_v3_shape(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertLessEqual({"mirror_path", "mirror_last_at"},
+                             self.columns(conn, "projects"))
+        self.assertIn("audit_log", self.tables(conn))
+        self.assertLessEqual({"ts", "action", "project", "detail"},
+                             self.columns(conn, "audit_log"))
+
+    def test_audit_log_accepts_a_row(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        conn.execute("INSERT INTO audit_log(ts, action, project, detail)"
+                     " VALUES (1, 'export', '/proj', 'x.db')")
+        conn.commit()
+        self.assertEqual(
+            conn.execute("SELECT ts, action, project, detail FROM audit_log")
+            .fetchall(), [(1, "export", "/proj", "x.db")])
+
+    def test_migrates_v2_db_without_touching_rows(self):
+        build_v2_db(self.db)
+        migrated = capture.connect(self.db)
+        self.addCleanup(migrated.close)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertIn("audit_log", self.tables(migrated))
+        self.assertEqual(
+            migrated.execute(
+                "SELECT ts, agent, in_tok, out_tok, cache_r, cache_w, dur_ms,"
+                " branch, commit_sha, issue_key, task_size, note FROM events"
+            ).fetchall(),
+            [(99, "legacy", 11, 22, 33, 44, 55, "main", "abc123", "AOS-1", "m",
+              "note")])
+        self.assertEqual(
+            migrated.execute("SELECT path, mirror_path, mirror_last_at"
+                             " FROM projects").fetchall(),
+            [("/proj", None, None)])
+        self.assertEqual(migrated.execute("SELECT COUNT(*) FROM cursors")
+                         .fetchone()[0], 1)
+        self.assertGreaterEqual(migrated.execute(
+            "SELECT COUNT(*) FROM pricing").fetchone()[0], 4)
+
+    def test_alter_failure_withholds_v3_stamp_and_retries(self):
+        build_v2_db(self.db)
+        blocked = _sqlite3.connect(self.db, factory=AlterProjectsBlockedConnection)
+        capture.migrate(blocked)
+        # Stamping v3 without the columns would strand the DB: no later connect
+        # would ever add them, and every mirror-meta write would fail forever.
+        self.assertEqual(blocked.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertNotIn("mirror_path", self.columns(blocked, "projects"))
+        blocked.close()
+
+        retried = capture.connect(self.db)  # transient cause gone
+        self.addCleanup(retried.close)
+        self.assertEqual(retried.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertLessEqual({"mirror_path", "mirror_last_at"},
+                             self.columns(retried, "projects"))
+
+    def test_v1_db_chains_through_v2_to_v3(self):
+        conn = _sqlite3.connect(self.db)
+        conn.executescript(V1_SCHEMA)
+        conn.execute("INSERT INTO projects(path) VALUES ('/proj')")
+        conn.execute("INSERT INTO models(name) VALUES ('claude-sonnet-5')")
+        conn.execute("INSERT INTO sessions(uuid, project_id) VALUES ('s1', 1)")
+        conn.execute(
+            "INSERT INTO events(ts, session_id, kind, agent, model_id, in_tok,"
+            " out_tok, cache_r, cache_w, dur_ms, branch, commit_sha)"
+            " VALUES (99, 1, 0, 'legacy', 1, 11, 22, 33, 44, 55, 'main', 'abc')")
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+        conn.close()
+
+        migrated = capture.connect(self.db)
+        self.addCleanup(migrated.close)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 3)
+        # every delta of both hops applied in one connect
+        self.assertLessEqual(set(V2_EVENT_COLUMNS), self.columns(migrated, "events"))
+        self.assertLessEqual({"mirror_path", "mirror_last_at"},
+                             self.columns(migrated, "projects"))
+        self.assertIn("audit_log", self.tables(migrated))
+        self.assertGreaterEqual(migrated.execute(
+            "SELECT COUNT(*) FROM pricing").fetchone()[0], 4)
+        self.assertEqual(migrated.execute(
+            "SELECT ts, agent, in_tok, issue_key FROM events").fetchall(),
+            [(99, "legacy", 11, None)])
 
 
 class TestIssueKeyRegex(unittest.TestCase):
@@ -353,7 +504,8 @@ class TestStrandedMigration(unittest.TestCase):
         self.addCleanup(conn.close)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
         self.assertLessEqual({"issue_key", "task_size", "note"}, cols)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         # The seed gate is re-checked too: pricing was never created before.
         self.assertGreaterEqual(
             conn.execute("SELECT COUNT(*) FROM pricing").fetchone()[0], 4)
@@ -685,13 +837,14 @@ class TestMirrorWrite(unittest.TestCase):
         self.assertEqual(len(self.event_rows(self.db)), 1)
         self.assertFalse(self.mirror.exists())
 
-    def test_mirror_db_gets_schema_v2_and_pricing_seed(self):
+    def test_mirror_db_gets_current_schema_and_pricing_seed(self):
         self.enable("project\n")
         write_jsonl(self.transcript, [entry()])
         self.run_main()
         conn = _sqlite3.connect(self.mirror)
         self.addCleanup(conn.close)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         self.assertLessEqual(
             {"issue_key", "task_size", "note"},
             {r[1] for r in conn.execute("PRAGMA table_info(events)")})
@@ -761,6 +914,71 @@ class TestMirrorWrite(unittest.TestCase):
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertEqual(tables, {"unrelated"}, "injected tables into a foreign DB")
+
+    def project_meta(self, db):
+        conn = _sqlite3.connect(db)
+        try:
+            return conn.execute(
+                "SELECT path, mirror_path, mirror_last_at FROM projects").fetchall()
+        finally:
+            conn.close()
+
+    def test_project_mode_stamps_mirror_meta_centrally(self):
+        self.enable("project\n")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(
+            self.project_meta(self.db),
+            [(str(self.proj), str(self.mirror),
+              int(capture.parse_ts("2026-07-17T10:00:00.000Z")))])
+
+    def test_central_mode_leaves_mirror_meta_null(self):
+        self.enable("central\n")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.project_meta(self.db),
+                         [(str(self.proj), None, None)])
+
+    def test_mirror_meta_advances_with_later_events(self):
+        self.enable("project\n")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        with open(self.transcript, "ab") as f:
+            f.write(json.dumps(entry(ts="2026-07-17T11:30:00.000Z")).encode() + b"\n")
+        self.run_main()
+        self.assertEqual(self.project_meta(self.db)[0][2],
+                         int(capture.parse_ts("2026-07-17T11:30:00.000Z")))
+
+    def test_event_less_turn_does_not_stamp_mirror_meta(self):
+        # A turn that only advances the cursor (no usage entries) mirrors
+        # nothing, so there is no event timestamp to record - stamping one would
+        # invent `now` as an event ts and claim a mirror write that never
+        # happened. Gated exactly like the mirror write itself.
+        self.enable("project\n")
+        write_jsonl(self.transcript, [entry(typ="user")])
+        self.run_main()
+        self.assertEqual(len(self.event_rows(self.db)), 0)
+        self.assertEqual(self.project_meta(self.db),
+                         [(str(self.proj), None, None)])
+
+    def test_mirror_meta_is_configured_state_not_a_write_receipt(self):
+        # The mirror write fails (its path is a directory) - the central DB must
+        # still record that a project-level copy is configured, or a later
+        # inspection would report project mode as central.
+        self.enable("project\n")
+        self.mirror.mkdir()
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.project_meta(self.db)[0][1], str(self.mirror))
+
+    def test_mirror_db_carries_no_mirror_meta_of_its_own(self):
+        # The mirror is not itself mirrored: only the central DB tracks where
+        # project-level copies live.
+        self.enable("project\n")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.project_meta(self.mirror),
+                         [(str(self.proj), None, None)])
 
     def test_mirror_failure_does_not_stall_the_central_cursor(self):
         self.enable("project\n")
@@ -863,6 +1081,282 @@ class TestMirrorConcurrency(TestConcurrency):
         self.test_parallel_firings_no_double_count_no_drop()
         self.assertEqual(self.count_mirror_events(), self.NPROCS)
         self.assertEqual(self.count_mirror_events(), self.count_events())
+
+
+# --- storage maintenance (/storage-separate, /storage-delete) ----------------
+#
+# Those two commands are agentic markdown and own the SQL; the helpers below
+# mirror it statement for statement so the prescribed sequence is pinned by
+# tests. Change the command doc and this block together.
+
+EVENT_COLUMNS = ("ts, session_id, kind, agent, model_id, in_tok, out_tok,"
+                 " cache_r, cache_w, dur_ms, branch, commit_sha, issue_key,"
+                 " task_size, note")
+PRICING_COLUMNS = ("provider, model_prefix, model_version, in_usd, out_usd,"
+                   " cache_r_usd, cache_w_usd, effective_from, source")
+PROJECT_ID = "(SELECT id FROM {p}projects WHERE path = ?)"
+
+
+def export_project(central, export_path, project):
+    """Carve one project out into a self-contained DB: its projects row, its
+    sessions, their events, its transcripts' cursors - plus the full models and
+    pricing reference tables, without which the export cannot price itself."""
+    conn = capture.connect(export_path)  # same connect/migrate as capture: v3
+    try:
+        conn.execute("ATTACH DATABASE ? AS src", (str(central),))
+        pid = PROJECT_ID.format(p="src.")
+        sessions = f"(SELECT id FROM src.sessions WHERE project_id = {pid})"
+        with conn:
+            conn.execute("INSERT OR IGNORE INTO models(id, name)"
+                         " SELECT id, name FROM src.models")
+            conn.execute(
+                f"INSERT OR IGNORE INTO pricing({PRICING_COLUMNS})"
+                f" SELECT {PRICING_COLUMNS} FROM src.pricing")
+            conn.execute(
+                "INSERT INTO projects(id, path, mirror_path, mirror_last_at)"
+                " SELECT id, path, mirror_path, mirror_last_at"
+                " FROM src.projects WHERE path = ?", (project,))
+            conn.execute(
+                "INSERT INTO sessions(id, uuid, project_id)"
+                f" SELECT id, uuid, project_id FROM src.sessions"
+                f" WHERE project_id = {pid}", (project,))
+            conn.execute(
+                f"INSERT INTO events({EVENT_COLUMNS})"
+                f" SELECT {EVENT_COLUMNS} FROM src.events"
+                f" WHERE session_id IN {sessions}", (project,))
+            conn.execute(
+                "INSERT INTO cursors(transcript, offset, session_id)"
+                " SELECT transcript, offset, session_id FROM src.cursors"
+                f" WHERE session_id IN {sessions}", (project,))
+        conn.execute("DETACH DATABASE src")
+    finally:
+        conn.close()
+
+
+def audit(conn, action, project, detail):
+    conn.execute(
+        "INSERT INTO audit_log(ts, action, project, detail)"
+        " VALUES (strftime('%s','now'), ?, ?, ?)", (action, project, detail))
+
+
+def delete_project(central, project, action, detail):
+    """events -> cursors -> sessions -> projects row, in one transaction that
+    also carries the audit row."""
+    conn = _sqlite3.connect(central)
+    try:
+        pid = PROJECT_ID.format(p="")
+        sessions = f"(SELECT id FROM sessions WHERE project_id = {pid})"
+        with conn:
+            conn.execute(
+                f"DELETE FROM events WHERE session_id IN {sessions}", (project,))
+            conn.execute(
+                f"DELETE FROM cursors WHERE session_id IN {sessions}", (project,))
+            conn.execute(
+                f"DELETE FROM sessions WHERE project_id = {pid}", (project,))
+            conn.execute("DELETE FROM projects WHERE path = ?", (project,))
+            audit(conn, action, project, detail)
+    finally:
+        conn.close()
+
+
+def project_counts(db, project):
+    conn = _sqlite3.connect(db)
+    try:
+        pid = PROJECT_ID.format(p="")
+        sessions = f"(SELECT id FROM sessions WHERE project_id = {pid})"
+        return (
+            conn.execute(f"SELECT COUNT(*) FROM events WHERE session_id IN"
+                         f" {sessions}", (project,)).fetchone()[0],
+            conn.execute(f"SELECT COUNT(*) FROM sessions WHERE project_id ="
+                         f" {pid}", (project,)).fetchone()[0],
+        )
+    finally:
+        conn.close()
+
+
+class StorageMaintenanceCase(unittest.TestCase):
+    """A central DB holding two projects: alpha (mirrored, two sessions) and
+    beta, which must survive every operation aimed at alpha untouched."""
+
+    ALPHA = "/dev/alpha"
+    BETA = "/dev/beta"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name)
+        self.db = self.dir / "usage.db"
+        conn = capture.connect(self.db)
+        capture.record(conn, self.ALPHA, "a1", 0, None,
+                       capture.aggregate([entry()]), "/a1.jsonl", 100,
+                       "main", "sha1", "AOS-1", "m", "first",
+                       mirror_path="/dev/alpha/.claude/telemetry-usage.db")
+        capture.record(conn, self.ALPHA, "a2", 1, "explorer",
+                       capture.aggregate([entry(model="claude-haiku-4-5"),
+                                          entry(model="claude-opus-4-8")]),
+                       "/a2.jsonl", 200, "milestone/x", "sha2", "AOS-2", "s",
+                       "second",
+                       mirror_path="/dev/alpha/.claude/telemetry-usage.db")
+        capture.record(conn, self.BETA, "b1", 0, None,
+                       capture.aggregate([entry(model="claude-fable-5")]),
+                       "/b1.jsonl", 300, "main", "sha3", "AOS-3", "l", "beta")
+        conn.close()
+        self.export = self.dir / "alpha-2026-08-06.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def rows(self, db, sql, params=()):
+        conn = _sqlite3.connect(db)
+        try:
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
+    def event_tuples(self, db, project):
+        return self.rows(
+            db,
+            f"SELECT p.path, s.uuid, m.name, {EVENT_COLUMNS.replace('session_id, ', '')}"
+            " FROM events e JOIN sessions s ON s.id = e.session_id"
+            " JOIN projects p ON p.id = s.project_id"
+            " JOIN models m ON m.id = e.model_id"
+            " WHERE p.path = ? ORDER BY m.name, e.kind, e.ts", (project,))
+
+    def audit_rows(self, db=None):
+        return self.rows(db or self.db,
+                         "SELECT action, project, detail FROM audit_log"
+                         " ORDER BY rowid")
+
+
+class TestStorageSeparate(StorageMaintenanceCase):
+
+    def test_export_carries_only_the_target_project(self):
+        export_project(self.db, self.export, self.ALPHA)
+        self.assertEqual(self.rows(self.export, "SELECT path FROM projects"),
+                         [(self.ALPHA,)])
+        self.assertEqual(
+            {r[0] for r in self.rows(self.export, "SELECT uuid FROM sessions")},
+            {"a1", "a2"})
+        self.assertEqual(
+            {r[0] for r in self.rows(self.export, "SELECT transcript FROM cursors")},
+            {"/a1.jsonl", "/a2.jsonl"})
+
+    def test_export_event_and_session_counts_match_central(self):
+        export_project(self.db, self.export, self.ALPHA)
+        self.assertEqual(project_counts(self.export, self.ALPHA),
+                         project_counts(self.db, self.ALPHA))
+        self.assertEqual(project_counts(self.export, self.ALPHA), (3, 2))
+
+    def test_export_rows_are_identical_to_central(self):
+        export_project(self.db, self.export, self.ALPHA)
+        self.assertEqual(self.event_tuples(self.export, self.ALPHA),
+                         self.event_tuples(self.db, self.ALPHA))
+        # mirror metadata travels with the projects row
+        self.assertEqual(
+            self.rows(self.export,
+                      "SELECT mirror_path, mirror_last_at FROM projects"),
+            self.rows(self.db, "SELECT mirror_path, mirror_last_at"
+                               " FROM projects WHERE path = ?", (self.ALPHA,)))
+
+    def test_export_carries_full_reference_tables_and_schema_v3(self):
+        export_project(self.db, self.export, self.ALPHA)
+        # models must be complete, not just alpha's: the export is meant to be
+        # readable on its own, and pricing resolution joins through models.
+        self.assertEqual(
+            {r[0] for r in self.rows(self.export, "SELECT name FROM models")},
+            {r[0] for r in self.rows(self.db, "SELECT name FROM models")})
+        self.assertEqual(
+            self.rows(self.export, "SELECT COUNT(*) FROM pricing"),
+            self.rows(self.db, "SELECT COUNT(*) FROM pricing"))
+        self.assertEqual(
+            self.rows(self.export, "PRAGMA user_version")[0][0],
+            capture.SCHEMA_VERSION)
+
+    def test_export_is_self_contained_after_the_central_db_is_gone(self):
+        export_project(self.db, self.export, self.ALPHA)
+        os.remove(self.db)
+        self.assertEqual(project_counts(self.export, self.ALPHA), (3, 2))
+
+    def test_export_writes_an_audit_row(self):
+        export_project(self.db, self.export, self.ALPHA)
+        events, sessions = project_counts(self.export, self.ALPHA)
+        detail = f"{self.export.name}; {events} events, {sessions} sessions"
+        conn = _sqlite3.connect(self.db)
+        with conn:
+            audit(conn, "export", self.ALPHA, detail)
+        conn.close()
+        self.assertEqual(self.audit_rows(), [("export", self.ALPHA, detail)])
+
+    def test_delete_after_export_removes_exactly_the_target(self):
+        export_project(self.db, self.export, self.ALPHA)
+        conn = _sqlite3.connect(self.db)
+        with conn:
+            audit(conn, "export", self.ALPHA, f"{self.export.name}; 3 events")
+        conn.close()
+        beta_before = self.event_tuples(self.db, self.BETA)
+
+        delete_project(self.db, self.ALPHA, "delete-after-export",
+                       f"{self.export.name}; 3 events, 2 sessions")
+
+        self.assertEqual(project_counts(self.db, self.ALPHA), (0, 0))
+        self.assertEqual(self.rows(self.db, "SELECT path FROM projects"),
+                         [(self.BETA,)])
+        self.assertEqual(self.event_tuples(self.db, self.BETA), beta_before)
+        self.assertEqual(
+            {r[0] for r in self.rows(self.db, "SELECT transcript FROM cursors")},
+            {"/b1.jsonl"})
+        # the export is untouched by the deletion
+        self.assertEqual(project_counts(self.export, self.ALPHA), (3, 2))
+        self.assertEqual([r[0] for r in self.audit_rows()],
+                         ["export", "delete-after-export"])
+
+    def test_reference_tables_survive_the_deletion(self):
+        # models/pricing are shared reference data - deleting one project must
+        # never strip the rows other projects (and past exports) price against.
+        export_project(self.db, self.export, self.ALPHA)
+        before = self.rows(self.db, "SELECT COUNT(*) FROM models")
+        delete_project(self.db, self.ALPHA, "delete-after-export", "x")
+        self.assertEqual(self.rows(self.db, "SELECT COUNT(*) FROM models"), before)
+        self.assertGreaterEqual(
+            self.rows(self.db, "SELECT COUNT(*) FROM pricing")[0][0], 4)
+
+
+class TestStorageDelete(StorageMaintenanceCase):
+    """Plain delete - no export first. Same transactional scoping, its own
+    audit action."""
+
+    def test_delete_removes_only_the_target_project(self):
+        beta_before = self.event_tuples(self.db, self.BETA)
+        delete_project(self.db, self.ALPHA, "delete", "3 events, 2 sessions")
+        self.assertEqual(project_counts(self.db, self.ALPHA), (0, 0))
+        self.assertEqual(project_counts(self.db, self.BETA), (1, 1))
+        self.assertEqual(self.event_tuples(self.db, self.BETA), beta_before)
+        self.assertEqual(
+            self.rows(self.db, "SELECT COUNT(*) FROM sessions")[0][0], 1)
+        self.assertEqual(
+            self.rows(self.db, "SELECT COUNT(*) FROM cursors")[0][0], 1)
+
+    def test_delete_writes_an_audit_row_with_counts(self):
+        delete_project(self.db, self.ALPHA, "delete", "3 events, 2 sessions")
+        self.assertEqual(self.audit_rows(),
+                         [("delete", self.ALPHA, "3 events, 2 sessions")])
+
+    def test_audit_history_outlives_the_project_it_describes(self):
+        delete_project(self.db, self.ALPHA, "delete", "3 events, 2 sessions")
+        delete_project(self.db, self.BETA, "delete", "1 event, 1 session")
+        self.assertEqual([r[1] for r in self.audit_rows()],
+                         [self.ALPHA, self.BETA])
+        self.assertEqual(self.rows(self.db, "SELECT COUNT(*) FROM events"),
+                         [(0,)])
+
+    def test_deleting_an_unknown_project_changes_nothing(self):
+        before = (self.rows(self.db, "SELECT COUNT(*) FROM events"),
+                  self.rows(self.db, "SELECT COUNT(*) FROM sessions"),
+                  self.rows(self.db, "SELECT COUNT(*) FROM projects"))
+        delete_project(self.db, "/dev/never-recorded", "delete", "0 events")
+        self.assertEqual(
+            (self.rows(self.db, "SELECT COUNT(*) FROM events"),
+             self.rows(self.db, "SELECT COUNT(*) FROM sessions"),
+             self.rows(self.db, "SELECT COUNT(*) FROM projects")), before)
 
 
 if __name__ == "__main__":

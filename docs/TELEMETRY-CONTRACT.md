@@ -51,6 +51,46 @@ In project mode capture writes **both** DBs on every captured turn:
   the machine. The mirror is skipped for that capture and the refusal is logged;
   central capture continues normally.
 
+### Mirror metadata (v0.4.0, schema v3)
+
+The central `projects` row records where a project's mirror lives:
+
+| column | type | meaning |
+|---|---|---|
+| `mirror_path` | TEXT | the project-local DB path this project is configured to mirror into; NULL = central-only storage |
+| `mirror_last_at` | INTEGER | unix seconds — the event timestamp of the last captured turn that was configured to write a mirror |
+
+Both are stamped **inside the central transaction, before the mirror write is
+attempted** — they are **configured state, not a write receipt**. They stay stamped when
+that mirror write then fails, and that is deliberate: the central DB must always know a
+project-level copy is configured, precisely in the case where the mirror is broken. A
+consumer must therefore never read `mirror_last_at` as "the mirror is current"; the only
+evidence of a landed write is the mirror file itself. A recent `mirror_last_at` with a
+missing or stale file at `mirror_path` means mirror writes are failing — see
+`error.log`. Mirror DBs never stamp mirror metadata of their own (`mirror_path` stays
+NULL inside a mirror). Central-mode projects never get it stamped at all, and a turn that
+records no events (cursor advance only) stamps nothing — there is no event timestamp to
+record. Both columns are cleared (`UPDATE … SET mirror_path = NULL, mirror_last_at =
+NULL`) when a project switches back to central mode via `/token-telemetry:enable` or opts
+out via `/token-telemetry:disable`, so they describe current configuration rather than
+history; the mirror *file* is never deleted by either command. That clearing is
+best-effort housekeeping done by the commands, not by capture: consumers must tolerate a
+stale `mirror_path` on a project whose marker was edited or deleted by hand.
+
+### `audit_log` (v0.4.0, schema v3)
+
+```
+audit_log(ts INTEGER NOT NULL, action TEXT NOT NULL, project TEXT NOT NULL, detail TEXT)
+```
+
+Append-only history of storage-management operations, written by the commands, never by
+capture. Actions in use: `export` (`/storage-separate` wrote a validated export),
+`delete-after-export` and `delete` (rows removed from the central DB, by
+`/storage-separate` and `/storage-delete` respectively). `detail` is free text — the
+export filename and/or the removed counts. Audit rows **outlive the project they
+describe** and are never deleted by these commands. Consumers may read it; nothing in the
+capture path depends on it.
+
 **Duplicates are possible in the mirror, never in the central DB.** Because the mirror
 keeps no cursor, replaying a transcript — the central DB being reset, moved or restored
 from an older copy while the project-local file is kept — re-inserts rows that the
@@ -66,12 +106,22 @@ The mirror exists for retention and reuse — it travels with the repo or the te
 
 ## Schema version
 
-Current: `PRAGMA user_version = 2`. Migrations are additive deltas applied in
+Current: `PRAGMA user_version = 3`. Migrations are additive deltas applied in
 `capture.py`'s `migrate()`, run from `connect()`, and are idempotent — safe to run
-concurrently from multiple hook invocations. v1 → v2 added the three `events` columns
-below and the `pricing` table; no v1 column was renamed or removed. v0.3.0 changed no
-schema at all — it added storage modes (above), so `user_version` stays 2, and a
-project-local mirror is byte-for-byte the same schema as the central DB.
+concurrently from multiple hook invocations. Hops run in order and each is gated on its
+own post-condition: a version is stamped only once the shape it promises is verifiably
+present, so a failed hop simply retries on the next connect rather than stranding the DB,
+and v3 is never attempted on a DB whose v2 hop failed. The fast path re-checks the actual
+shape rather than trusting the stamp, so a DB stamped for a version it does not have
+heals itself.
+
+- **v1 → v2** — the three `events` columns below and the `pricing` table.
+- **v2 → v3** (v0.4.0) — `projects.mirror_path` and `projects.mirror_last_at`, plus the
+  `audit_log` table (both documented above).
+
+No column has ever been renamed or removed. v0.3.0 changed no schema at all — it added
+storage modes. A project-local mirror is byte-for-byte the same schema as the central DB;
+so is a `/storage-separate` export, which is built through the same `connect()`.
 
 ## Consumed columns — `events`
 
@@ -89,8 +139,11 @@ project-local mirror is byte-for-byte the same schema as the central DB.
 | `task_size` | TEXT | **v2.** From the sidecar's `size`, else null |
 | `note` | TEXT | **v2.** From the sidecar's `summary`, else null |
 
-`sessions(id, uuid, project_id)`, `projects(id, path)`, `models(id, name)` are stable
-lookup tables unchanged since v1.
+`sessions(id, uuid, project_id)` and `models(id, name)` are stable lookup tables
+unchanged since v1; `projects(id, path)` gained the two nullable `mirror_*` columns in
+v3 (above) and is otherwise unchanged. A row's absence is meaningful: storage-management
+commands delete a project's `projects`/`sessions`/`events`/`cursors` rows outright, so a
+consumer must treat "no project row" as "no data", never as an error.
 
 ## Tier mapping
 

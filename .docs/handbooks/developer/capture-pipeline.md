@@ -2,8 +2,8 @@
 title: Capture Pipeline
 audience: developer
 module: capture
-sources: [scripts/capture.py, hooks/hooks.json]
-updated: 2026-08-05
+sources: [scripts/capture.py, hooks/hooks.json, docs/TELEMETRY-CONTRACT.md]
+updated: 2026-08-06
 related: [[pricing-and-cost]]
 ---
 
@@ -58,19 +58,74 @@ read/aggregate/insert cycle into a double-count or a dropped event.
 ## Migration post-condition rule
 
 `migrate(conn)` never trusts `PRAGMA user_version` alone as proof the schema
-matches. A DB stamped v2 without the v2 columns — an older build that stamped
-too early, or a hand-edited/restored file — would otherwise fail every future
-capture forever, since the fast-path check would keep skipping migration. The
-fix is a post-condition, not a version check: after attempting the `ALTER
-TABLE` statements (each individually idempotent, not wrapped in one shared
-transaction, so a migrating process never blocks a peer's capture), the code
-re-reads `event_columns(conn)` and only stamps `user_version=2` if the columns
-are actually present. If they aren't, the function returns without stamping —
-the next connect() just retries the migration. The same logic applies to
-seeding the `pricing` table: `CREATE TABLE` autocommits, so a crash between
-table creation and the seed `INSERT` can leave an empty table that must still
-get seeded on the next attempt; the code gates on the presence of seed rows
-(`SELECT 1 FROM pricing WHERE source=?`), not on the table's existence.
+matches. A DB stamped for a version it doesn't actually have — an older build
+that stamped too early, or a hand-edited/restored file — would otherwise fail
+every future capture forever, since the fast-path check would keep skipping
+migration. The fix is a post-condition, not a version check: after attempting
+the `ALTER TABLE` statements (each individually idempotent, not wrapped in one
+shared transaction, so a migrating process never blocks a peer's capture), the
+code re-reads the actual column set and only stamps the version if the columns
+are really present. If they aren't, the function returns without stamping — the
+next connect() just retries the migration. The same logic applies to seeding the
+`pricing` table: `CREATE TABLE` autocommits, so a crash between table creation
+and the seed `INSERT` can leave an empty table that must still get seeded on the
+next attempt; the code gates on the presence of seed rows (`SELECT 1 FROM
+pricing WHERE source=?`), not on the table's existence.
+
+Versions are applied as a **chain of hops**, each returning whether its own
+shape landed: `migrate_v2()` (the kit-aware `events` columns + `pricing`) then
+`migrate_v3()` (mirror metadata on `projects` + `audit_log`). `migrate_v3` runs
+only if `migrate_v2` reported success — attempting v3 on a DB whose v2 hop just
+failed would either fail again or, worse, stamp past a gap. A v1 DB therefore
+walks the whole chain in a single `connect()`, and a DB that fails halfway
+simply retries from where it stopped on the next hook firing. The fast path
+checks the shape of *every* hop (v2 columns, mirror columns, `audit_log`), not
+just the newest, which is what lets a DB stranded at any version heal itself.
+
+## Storage modes: two DBs, one authority
+
+The `.claude/telemetry` marker gained content in v0.3.0 — its **first line**
+selects storage (`project` adds a project-local mirror; anything else, including
+the empty file older versions wrote, means central-only). Every ambiguous case
+(absent, oversized, undecodable, unrecognized) resolves to central, so a marker
+written by an older version keeps its exact old behavior and a corrupted one
+degrades to the mode that always works.
+
+In project mode capture dual-writes, and the asymmetry is deliberate: the
+central DB is authoritative because it alone owns `cursors`, so nothing about
+the mirror can change what gets read from a transcript. `mirror_events()` runs
+only *after* the central transaction has committed **and its connection is
+closed** — opening a second DB while holding the central write lock is how one
+slow mirror write would stall every peer capture on the machine. Mirror failures
+are swallowed to `error.log` with a labelled context line; the mirror exists for
+retention and portability and is never worth the authoritative write or the
+session. It takes `BEGIN IMMEDIATE` for the same reason the central write does:
+parallel firings share that one file, and a deferred transaction lets
+`get_or_create`'s SELECT-then-INSERT race, with the loser's rows silently
+dropped by the swallow-all rule. A **symlink at the mirror path is refused, not
+resolved** — the path sits inside the repo and can therefore arrive committed,
+which would aim SQLite's writes at any file on the machine.
+
+## Mirror metadata is configured state, not a write receipt
+
+v3's `projects.mirror_path` / `mirror_last_at` are stamped inside the **central**
+transaction, before the mirror write is attempted, and stay stamped when it
+fails. That is the point: a reader that inferred storage mode from a successful
+mirror write would report project mode as central exactly when the mirror is
+broken and needs attention. So the pair answers "a project-level copy is
+configured, and this is the last captured event that was destined for it" —
+never "the mirror is current". Only the file at `mirror_path` answers that, which
+is why `/token-telemetry:storage-status` checks it separately.
+
+Two gates follow from the same reasoning. The stamp is skipped on a turn with no
+usage entries (`groups` empty, cursor-advance only) — there is no event
+timestamp, and `latest_event_ts()` would otherwise invent `now()` for an event
+that doesn't exist. And `stamp_mirror_meta()` no-ops when the v3 columns are
+missing, i.e. on a DB whose v3 hop hasn't landed yet: metadata is never worth
+failing a capture over. Mirror DBs never carry mirror metadata of their own —
+the mirror is not itself mirrored. Clearing the pair when a project switches
+back to central or opts out is command-side housekeeping (`enable`/`disable`),
+not capture's job, so a hand-edited marker can leave a stale value behind.
 
 ## Sidecar enrichment: last-declared-task attribution
 
