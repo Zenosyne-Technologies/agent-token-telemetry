@@ -538,6 +538,241 @@ class TestMain(unittest.TestCase):
         self.assertTrue((self.db.parent / "error.log").exists())
 
 
+class TestStorageMode(unittest.TestCase):
+    """The `.claude/telemetry` marker's first line selects storage. Empty,
+    absent or unparseable content means central — the pre-v0.3.0 behavior."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        (self.root / ".claude").mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_marker(self, content, mode="w"):
+        path = self.root / ".claude" / "telemetry"
+        if mode == "wb":
+            path.write_bytes(content)
+        else:
+            path.write_text(content)
+
+    def test_missing_marker_is_central(self):
+        self.assertEqual(capture.read_storage_mode(self.root), "central")
+
+    def test_empty_marker_is_central(self):
+        self.write_marker("")
+        self.assertEqual(capture.read_storage_mode(self.root), "central")
+
+    def test_central_marker_is_central(self):
+        self.write_marker("central\n")
+        self.assertEqual(capture.read_storage_mode(self.root), "central")
+
+    def test_project_marker_selects_project(self):
+        for content in ("project", "project\n", "  PROJECT  \n", "project\nnotes\n"):
+            self.write_marker(content)
+            self.assertEqual(capture.read_storage_mode(self.root), "project", content)
+
+    def test_garbage_marker_is_central(self):
+        for content in ("wat", "projekt\n", "1", "{}", "  \n project\n"):
+            self.write_marker(content)
+            self.assertEqual(capture.read_storage_mode(self.root), "central", content)
+
+    def test_undecodable_marker_is_central(self):
+        self.write_marker(b"\xff\xfe\x00binary", mode="wb")
+        self.assertEqual(capture.read_storage_mode(self.root), "central")
+
+    def test_marker_that_is_a_directory_is_central(self):
+        (self.root / ".claude" / "telemetry").mkdir()
+        self.assertEqual(capture.read_storage_mode(self.root), "central")
+
+    def test_mirror_path_is_project_local(self):
+        self.assertEqual(capture.mirror_db_path(self.root),
+                         self.root / ".claude" / "telemetry-usage.db")
+
+
+class TestMirrorWrite(unittest.TestCase):
+    """Project mode dual-writes: the central DB exactly as before, plus a
+    best-effort copy of the same event rows into the project-local DB."""
+
+    SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "capture.py"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.proj = self.root / "proj"
+        (self.proj / ".claude").mkdir(parents=True)
+        self.transcript = self.root / "sess.jsonl"
+        self.db = self.root / "telemetry" / "usage.db"
+        self.mirror = self.proj / ".claude" / "telemetry-usage.db"
+        os.environ["TOKEN_TELEMETRY_DB"] = str(self.db)
+        self._stdin = sys.stdin
+
+    def tearDown(self):
+        sys.stdin = self._stdin
+        os.environ.pop("TOKEN_TELEMETRY_DB", None)
+        self.tmp.cleanup()
+
+    def enable(self, content):
+        (self.proj / ".claude" / "telemetry").write_text(content)
+
+    def hook_json(self, session_id="sess-1", event="Stop"):
+        return json.dumps({
+            "session_id": session_id,
+            "transcript_path": str(self.transcript),
+            "cwd": str(self.proj),
+            "hook_event_name": event,
+        })
+
+    def run_main(self, **kw):
+        sys.stdin = io.StringIO(self.hook_json(**kw))
+        capture.main()
+
+    def run_subprocess(self, **kw):
+        hook_path = self.root / "hook.json"
+        hook_path.write_text(self.hook_json(**kw))
+        env = dict(os.environ)
+        env["TOKEN_TELEMETRY_DB"] = str(self.db)
+        with open(hook_path) as f:
+            return subprocess.run([sys.executable, str(self.SCRIPT)], stdin=f,
+                                  capture_output=True, text=True, env=env)
+
+    def event_rows(self, db):
+        conn = _sqlite3.connect(db)
+        try:
+            return conn.execute(
+                "SELECT p.path, s.uuid, m.name, e.ts, e.kind, e.agent, e.in_tok,"
+                " e.out_tok, e.cache_r, e.cache_w, e.dur_ms, e.branch,"
+                " e.commit_sha, e.issue_key, e.task_size, e.note"
+                " FROM events e JOIN sessions s ON s.id = e.session_id"
+                " JOIN projects p ON p.id = s.project_id"
+                " JOIN models m ON m.id = e.model_id"
+                " ORDER BY m.name, e.kind").fetchall()
+        finally:
+            conn.close()
+
+    def test_project_mode_writes_both_dbs_with_identical_rows(self):
+        self.enable("project\n")
+        (self.proj / ".claude" / "telemetry-context.json").write_text(json.dumps(
+            {"issue_key": "AOS-30", "size": "m", "summary": "dual write"}))
+        write_jsonl(self.transcript, [entry(), entry(model="claude-haiku-4-5",
+                                                    side=True)])
+        self.run_main()
+        central = self.event_rows(self.db)
+        self.assertEqual(len(central), 2)
+        self.assertTrue(self.mirror.exists())
+        self.assertEqual(self.event_rows(self.mirror), central)
+        self.assertEqual(central[0][13], "AOS-30")  # enrichment mirrored too
+
+    def test_central_mode_writes_only_central(self):
+        self.enable("central\n")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(len(self.event_rows(self.db)), 1)
+        self.assertFalse(self.mirror.exists())
+
+    def test_empty_marker_writes_only_central(self):
+        self.enable("")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(len(self.event_rows(self.db)), 1)
+        self.assertFalse(self.mirror.exists())
+
+    def test_garbage_marker_writes_only_central(self):
+        self.enable("¯\\_(ツ)_/¯\n")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(len(self.event_rows(self.db)), 1)
+        self.assertFalse(self.mirror.exists())
+
+    def test_mirror_db_gets_schema_v2_and_pricing_seed(self):
+        self.enable("project\n")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        conn = _sqlite3.connect(self.mirror)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertLessEqual(
+            {"issue_key", "task_size", "note"},
+            {r[1] for r in conn.execute("PRAGMA table_info(events)")})
+        self.assertGreaterEqual(
+            conn.execute("SELECT COUNT(*) FROM pricing WHERE source='seed-v0.2.0'"
+                         ).fetchone()[0], 4)
+
+    def test_mirror_keeps_no_cursors(self):
+        # The central DB is authoritative: its cursor alone decides what is read
+        # from the transcript. A cursor in the mirror could only diverge.
+        self.enable("project\n")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        conn = _sqlite3.connect(self.mirror)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM cursors").fetchone()[0], 0)
+
+    def test_refire_is_noop_in_both_dbs(self):
+        self.enable("project\n")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.run_main()  # nothing new appended - central cursor gates the read
+        self.assertEqual(len(self.event_rows(self.db)), 1)
+        self.assertEqual(len(self.event_rows(self.mirror)), 1)
+
+    def test_mirror_failure_keeps_central_rows_and_logs(self):
+        # Mirror writes are best effort: an unwritable project-local DB path
+        # must cost an error.log line and nothing else.
+        self.enable("project\n")
+        self.mirror.mkdir()  # sqlite3.connect() on a directory raises
+        write_jsonl(self.transcript, [entry()])
+        proc = self.run_subprocess()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.event_rows(self.db)), 1)
+        log = self.db.parent / "error.log"
+        self.assertTrue(log.exists())
+        self.assertIn("telemetry-usage.db", log.read_text())
+
+    def test_symlinked_mirror_path_is_refused(self):
+        # A repo-committed symlink at the mirror path would aim SQLite's writes
+        # at an arbitrary file - creating a DB there, or injecting tables into
+        # an unrelated one. Refuse before connecting; the central write stands.
+        self.enable("project\n")
+        target = self.root / "elsewhere" / "attacker.db"
+        target.parent.mkdir()
+        self.mirror.symlink_to(target)
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertFalse(target.exists(), "wrote through the symlink")
+        self.assertEqual(len(self.event_rows(self.db)), 1)
+        log = (self.db.parent / "error.log").read_text()
+        self.assertIn("symlink", log)
+        self.assertIn("refused", log)
+
+    def test_symlink_to_existing_db_is_not_written_to(self):
+        self.enable("project\n")
+        victim = self.root / "victim.db"
+        conn = _sqlite3.connect(victim)
+        conn.execute("CREATE TABLE unrelated(x)")
+        conn.commit()
+        conn.close()
+        self.mirror.symlink_to(victim)
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        conn = _sqlite3.connect(victim)
+        self.addCleanup(conn.close)
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertEqual(tables, {"unrelated"}, "injected tables into a foreign DB")
+
+    def test_mirror_failure_does_not_stall_the_central_cursor(self):
+        self.enable("project\n")
+        self.mirror.mkdir()
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        with open(self.transcript, "ab") as f:
+            f.write(json.dumps(entry(inp=1)).encode() + b"\n")
+        self.run_main()
+        self.assertEqual(len(self.event_rows(self.db)), 2)
+
+
 class TestConcurrency(unittest.TestCase):
     """Regression test for the get_offset/get_or_create race: parallel hook
     firings against the same DB must neither double-count nor drop events."""
@@ -603,6 +838,31 @@ class TestConcurrency(unittest.TestCase):
 
         self.assertEqual(self.count_events(), self.NPROCS)
         self.assertFalse((self.db.parent / "error.log").exists())
+
+
+class TestMirrorConcurrency(TestConcurrency):
+    """The mirror faces the same race the central DB is already hardened
+    against: parallel firings share one project-local file, and get_or_create's
+    SELECT-then-INSERT plus a deferred transaction drops rows (a losing writer
+    hits a UNIQUE violation or a lock, and the failure is swallowed by design).
+    Project mode must land every row in BOTH DBs."""
+
+    def setUp(self):
+        super().setUp()
+        (self.proj / ".claude" / "telemetry").write_text("project\n")
+        self.mirror = self.proj / ".claude" / "telemetry-usage.db"
+
+    def count_mirror_events(self):
+        conn = _sqlite3.connect(self.mirror)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_parallel_firings_mirror_every_row(self):
+        self.test_parallel_firings_no_double_count_no_drop()
+        self.assertEqual(self.count_mirror_events(), self.NPROCS)
+        self.assertEqual(self.count_mirror_events(), self.count_events())
 
 
 if __name__ == "__main__":
