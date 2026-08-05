@@ -8,16 +8,66 @@ together, in the same commit.
 ## Source
 
 SQLite DB at `~/.claude/telemetry/usage.db` (override: `$TOKEN_TELEMETRY_DB`), WAL
-mode. Availability check for any consumer: the file exists AND a `projects` row's
-`path` matches the consumer's own project root. Absent → the consumer omits its token
-output silently; nothing fails, nothing warns.
+mode. This is the **authoritative** store in every storage mode. Availability check for
+any consumer: the file exists AND a `projects` row's `path` matches the consumer's own
+project root. Absent → the consumer omits its token output silently; nothing fails,
+nothing warns.
+
+## Storage modes (v0.3.0)
+
+The opt-in marker `.claude/telemetry` gained content. Its **first line** selects
+storage; the file is read from the project root (the nearest ancestor containing
+`.git`, the same resolution the sidecar uses):
+
+| First line | Mode | Effect |
+|---|---|---|
+| `central`, empty, absent-content | central (default) | central DB only — identical to v0.2.0 |
+| `project` | project | central DB **plus** a project-local mirror |
+
+Matching is case-insensitive and whitespace-trimmed; lines after the first are ignored
+(free-form notes are safe there). **Every ambiguous case resolves to central** —
+unreadable, oversized (>4 KiB read window), undecodable, or unrecognized content — so a
+marker written by v0.1.0/v0.2.0 (an empty `touch`ed file) keeps its exact old behavior.
+
+### Dual-write semantics
+
+In project mode capture writes **both** DBs on every captured turn:
+
+- **Central DB — authoritative.** Its `cursors` table alone drives what is read from a
+  transcript, exactly as before. Nothing about the mirror can change what is captured.
+- **Mirror DB — best effort**, at `<project-root>/.claude/telemetry-usage.db`. Written
+  only *after* the central transaction commits and the central connection is closed, so
+  it never holds the central write lock. It is created through the same
+  `connect()`/`migrate()` path, so it carries the same schema version and the same
+  pricing seed and every query in `commands/token-stats.md` runs against it unchanged.
+- **Failures are swallowed.** Any mirror error (unwritable path, locked file, full disk)
+  is appended to the central `~/.claude/telemetry/error.log` with a
+  `mirror write failed: <path>` label and otherwise ignored — the central write and the
+  session are never affected.
+- **No cursors in the mirror.** The mirror's `cursors` table exists (same schema) but
+  stays empty by design.
+
+**Duplicates are possible in the mirror, never in the central DB.** Because the mirror
+keeps no cursor, replaying a transcript — the central DB being reset, moved or restored
+from an older copy while the project-local file is kept — re-inserts rows that the
+mirror already has. The re-inserted rows are **identical** across every column, so the
+dedupe hint is the full row tuple: `SELECT DISTINCT ts, session_id, kind, agent,
+model_id, in_tok, out_tok, cache_r, cache_w, dur_ms, branch, commit_sha, issue_key,
+task_size, note FROM events` (or `GROUP BY` those columns). Consumers that need exact
+totals should read the central DB.
+
+The mirror exists for retention and reuse — it travels with the repo or the team share
+— not as a second source of truth. `/token-telemetry:enable` git-ignores it by default
+(`.claude/telemetry-usage.db*`) while noting that committing it is a valid team choice.
 
 ## Schema version
 
 Current: `PRAGMA user_version = 2`. Migrations are additive deltas applied in
 `capture.py`'s `migrate()`, run from `connect()`, and are idempotent — safe to run
 concurrently from multiple hook invocations. v1 → v2 added the three `events` columns
-below and the `pricing` table; no v1 column was renamed or removed.
+below and the `pricing` table; no v1 column was renamed or removed. v0.3.0 changed no
+schema at all — it added storage modes (below), so `user_version` stays 2, and a
+project-local mirror is byte-for-byte the same schema as the central DB.
 
 ## Consumed columns — `events`
 
