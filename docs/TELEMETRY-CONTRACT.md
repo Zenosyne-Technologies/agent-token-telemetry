@@ -21,7 +21,7 @@ storage; the file is read from the project root (the nearest ancestor containing
 
 | First line | Mode | Effect |
 |---|---|---|
-| `central`, empty, absent-content | central (default) | central DB only — identical to v0.2.0 |
+| `central`, or an empty/contentless file | central (default) | central DB only — identical to v0.2.0 |
 | `project` | project | central DB **plus** a project-local mirror |
 
 Matching is case-insensitive and whitespace-trimmed; lines after the first are ignored
@@ -46,6 +46,10 @@ In project mode capture writes **both** DBs on every captured turn:
   session are never affected.
 - **No cursors in the mirror.** The mirror's `cursors` table exists (same schema) but
   stays empty by design.
+- **A symlink at the mirror path is refused**, not followed — it sits inside the repo
+  and can therefore arrive committed, which would aim SQLite's writes at any file on
+  the machine. The mirror is skipped for that capture and the refusal is logged;
+  central capture continues normally.
 
 **Duplicates are possible in the mirror, never in the central DB.** Because the mirror
 keeps no cursor, replaying a transcript — the central DB being reset, moved or restored
@@ -66,7 +70,7 @@ Current: `PRAGMA user_version = 2`. Migrations are additive deltas applied in
 `capture.py`'s `migrate()`, run from `connect()`, and are idempotent — safe to run
 concurrently from multiple hook invocations. v1 → v2 added the three `events` columns
 below and the `pricing` table; no v1 column was renamed or removed. v0.3.0 changed no
-schema at all — it added storage modes (below), so `user_version` stays 2, and a
+schema at all — it added storage modes (above), so `user_version` stays 2, and a
 project-local mirror is byte-for-byte the same schema as the central DB.
 
 ## Consumed columns — `events`
