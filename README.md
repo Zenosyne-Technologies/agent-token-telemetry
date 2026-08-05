@@ -64,9 +64,9 @@ claude plugin install token-telemetry@agent-token-telemetry
   manual-cadence advice
 
 Data lives in `~/.claude/telemetry/usage.db` (SQLite, WAL) — plus
-`<root>/.claude/telemetry-usage.db` in project mode, same schema, so every
-`token-stats` query runs against either. Query them directly with
-sqlite3/DuckDB/Grafana. Capture never breaks a session — capture errors go to
+`<root>/.claude/telemetry-usage.db` in project mode. `/token-telemetry:token-stats`
+always reads the central DB; the mirror carries the same schema, so the same
+queries run against it when you open it directly with sqlite3/DuckDB/Grafana. Capture never breaks a session — capture errors go to
 `~/.claude/telemetry/error.log` only for opted-in projects (mirror failures land
 there too, labelled); failures before the opt-in check exit silently. The mirror
 keeps no cursors, so it can hold duplicate rows if the central DB is ever reset
