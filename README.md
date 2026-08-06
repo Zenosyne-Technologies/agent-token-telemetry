@@ -4,6 +4,15 @@ Claude Code plugin that records per-turn and per-subagent token usage into a
 central SQLite database — with **zero model-token overhead** (capture runs in
 Stop/SubagentStop hooks, outside the model loop).
 
+v0.6.0 makes the deterministic reports **script-generated**: `/token-telemetry:info`,
+`/token-telemetry:project-stats` and `/token-telemetry:pricing-update` now just run
+`scripts/report.py` / `scripts/pricing_update.py` and echo the finished markdown —
+near-zero model tokens, sub-second runtime, and read-only report access (`mode=ro`).
+The pricing update fetches and parses the official pricing page itself (LLM flow
+remains only as fallback if the page layout changes). Fetch/render are split behind
+a single backend seam (`open_ro()` / `capture.connect()`) so future server-hosted
+databases plug in without touching queries or formatting.
+
 v0.5.0 (schema v4) prices **5-minute and 1-hour cache writes separately** — they
 bill at 1.25× and 2× the input rate respectively, so 1h-heavy sessions were
 under-costed. `events.cache_w` stays the TTL-agnostic total (every existing
