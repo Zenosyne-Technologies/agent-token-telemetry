@@ -818,6 +818,60 @@ class TestSubagentSweep(unittest.TestCase):
                                   groups)
         self.assertEqual(self.events(), [(1, "Explore", 50)])
 
+    def notes(self):
+        return [r[0] for r in self.conn.execute(
+            "SELECT note FROM events ORDER BY rowid")]
+
+    def test_first_capture_long_span_marked_as_backlog(self):
+        groups = capture.aggregate([
+            entry(mid="m1", ts="2026-07-01T10:00:00.000Z"),
+            entry(mid="m2", ts="2026-07-04T10:00:00.000Z"),  # 3-day span
+        ])
+        with self.conn:
+            capture.insert_events(self.conn, "/proj", "s1", 0, None, groups,
+                                  first_capture=True)
+        self.assertEqual(self.notes(), ["backlog-capture"])
+
+    def test_short_span_first_capture_not_marked(self):
+        groups = capture.aggregate([
+            entry(mid="m1", ts="2026-07-01T10:00:00.000Z"),
+            entry(mid="m2", ts="2026-07-01T12:00:00.000Z"),  # 2h span
+        ])
+        with self.conn:
+            capture.insert_events(self.conn, "/proj", "s1", 0, None, groups,
+                                  first_capture=True)
+        self.assertEqual(self.notes(), [None])
+
+    def test_long_span_without_first_capture_not_marked(self):
+        groups = capture.aggregate([
+            entry(mid="m1", ts="2026-07-01T10:00:00.000Z"),
+            entry(mid="m2", ts="2026-07-04T10:00:00.000Z"),
+        ])
+        with self.conn:
+            capture.insert_events(self.conn, "/proj", "s1", 0, None, groups)
+        self.assertEqual(self.notes(), [None])
+
+    def test_sidecar_note_always_wins_over_backlog_mark(self):
+        groups = capture.aggregate([
+            entry(mid="m1", ts="2026-07-01T10:00:00.000Z"),
+            entry(mid="m2", ts="2026-07-04T10:00:00.000Z"),
+        ])
+        with self.conn:
+            capture.insert_events(self.conn, "/proj", "s1", 0, None, groups,
+                                  note="real sidecar note",
+                                  first_capture=True)
+        self.assertEqual(self.notes(), ["real sidecar note"])
+
+    def test_sweep_first_capture_marks_long_span_agent_file(self):
+        f = self.subdir / "agent-old.jsonl"
+        write_jsonl(f, [
+            entry(mid="a", side=True, ts="2026-07-01T10:00:00.000Z"),
+            entry(mid="b", side=True, ts="2026-07-04T10:00:00.000Z"),
+        ])
+        swept = self.sweep()
+        self.assertEqual([fc for _, fc in swept], [True])
+        self.assertEqual(self.notes(), ["backlog-capture"])
+
 
 class TestIssueKeyRegex(unittest.TestCase):
     def key(self, subject):
