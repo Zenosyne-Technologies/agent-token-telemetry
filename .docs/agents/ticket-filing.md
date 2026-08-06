@@ -1,6 +1,6 @@
 # Filing tracker issues
 
-Authoritative rules live in the tracker document **"Issue Intake & Triage Guide"** (https://zenosyne.atlassian.net/browse/AOS-11). Every brief that has an agent create or update issues MUST tell the agent to fetch and follow that document — and to label per `label-syntax.md`.
+Authoritative rules live in the repo document **`.docs/project-management/intake-guide.md`** (the "Issue Intake & Triage Guide" — formerly the description of tracker issue AOS-11, which now just points here). Every brief that has an agent create or update issues MUST tell the agent to read and follow that document — and to label per `label-syntax.md`.
 
 Non-negotiables (mirror of the guide — the guide wins on filing workflow; `label-syntax.md` wins on labels):
 - Jira: site zenosyne.atlassian.net, project AgentOS (key AOS); new issues → To Do (this workflow has no Backlog status).

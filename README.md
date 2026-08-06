@@ -4,6 +4,14 @@ Claude Code plugin that records per-turn and per-subagent token usage into a
 central SQLite database — with **zero model-token overhead** (capture runs in
 Stop/SubagentStop hooks, outside the model loop).
 
+v0.7.2 completes the **permission-hardening pass** (AOS-10): no command grants
+`Bash(sqlite3:*)` or bare `Bash(python3:*)` any more. Write-side bookkeeping
+(export, delete, audit, mirror-meta, name registration) moved into
+`scripts/manage.py` (argv-passed values, never interpolated into SQL; table
+copies introspect common columns so exports survive schema growth), and
+`storage-status` joined the read-only script reports. Every command's grant now
+pins to its exact script invocation.
+
 v0.7.0 (schema v5) adds **project names and a richer project table**:
 `projects.name` is stamped by capture from the kit's `.docs/PROJECT-INFO.md`
 (`project:` frontmatter key) or asked for at enable time; reports fall back to

@@ -1355,78 +1355,38 @@ class TestMirrorConcurrency(TestConcurrency):
 
 # --- storage maintenance (/storage-separate, /storage-delete) ----------------
 #
-# Those two commands are agentic markdown and own the SQL; the helpers below
-# mirror it statement for statement so the prescribed sequence is pinned by
-# tests. Change the command doc and this block together.
+# The commands and these tests both run scripts/manage.py — the SQL lives in
+# exactly one place, so what the tests pin is what the commands execute.
+
+import contextlib as _contextlib
+import io as _io
+
+import manage
 
 EVENT_COLUMNS = ("ts, session_id, kind, agent, model_id, in_tok, out_tok,"
                  " cache_r, cache_w, dur_ms, branch, commit_sha, issue_key,"
                  " task_size, note")
-PRICING_COLUMNS = ("provider, model_prefix, model_version, in_usd, out_usd,"
-                   " cache_r_usd, cache_w_usd, effective_from, source")
 PROJECT_ID = "(SELECT id FROM {p}projects WHERE path = ?)"
 
 
+def _quiet(fn, *args):
+    out = _io.StringIO()
+    with _contextlib.redirect_stdout(out), _contextlib.redirect_stderr(out):
+        rc = fn(*args)
+    if rc:
+        raise AssertionError(f"manage call failed: {out.getvalue()}")
+
+
 def export_project(central, export_path, project):
-    """Carve one project out into a self-contained DB: its projects row, its
-    sessions, their events, its transcripts' cursors - plus the full models and
-    pricing reference tables, without which the export cannot price itself."""
-    conn = capture.connect(export_path)  # same connect/migrate as capture: v3
-    try:
-        conn.execute("ATTACH DATABASE ? AS src", (str(central),))
-        pid = PROJECT_ID.format(p="src.")
-        sessions = f"(SELECT id FROM src.sessions WHERE project_id = {pid})"
-        with conn:
-            conn.execute("INSERT OR IGNORE INTO models(id, name)"
-                         " SELECT id, name FROM src.models")
-            conn.execute(
-                f"INSERT OR IGNORE INTO pricing({PRICING_COLUMNS})"
-                f" SELECT {PRICING_COLUMNS} FROM src.pricing")
-            conn.execute(
-                "INSERT INTO projects(id, path, mirror_path, mirror_last_at)"
-                " SELECT id, path, mirror_path, mirror_last_at"
-                " FROM src.projects WHERE path = ?", (project,))
-            conn.execute(
-                "INSERT INTO sessions(id, uuid, project_id)"
-                f" SELECT id, uuid, project_id FROM src.sessions"
-                f" WHERE project_id = {pid}", (project,))
-            conn.execute(
-                f"INSERT INTO events({EVENT_COLUMNS})"
-                f" SELECT {EVENT_COLUMNS} FROM src.events"
-                f" WHERE session_id IN {sessions}", (project,))
-            conn.execute(
-                "INSERT INTO cursors(transcript, offset, session_id)"
-                " SELECT transcript, offset, session_id FROM src.cursors"
-                f" WHERE session_id IN {sessions}", (project,))
-        conn.execute("DETACH DATABASE src")
-    finally:
-        conn.close()
+    _quiet(manage.export, str(central), project, str(export_path))
 
 
 def audit(conn, action, project, detail):
-    conn.execute(
-        "INSERT INTO audit_log(ts, action, project, detail)"
-        " VALUES (strftime('%s','now'), ?, ?, ?)", (action, project, detail))
+    manage.audit_row(conn, action, project, detail)
 
 
 def delete_project(central, project, action, detail):
-    """events -> cursors -> sessions -> projects row, in one transaction that
-    also carries the audit row."""
-    conn = _sqlite3.connect(central)
-    try:
-        pid = PROJECT_ID.format(p="")
-        sessions = f"(SELECT id FROM sessions WHERE project_id = {pid})"
-        with conn:
-            conn.execute(
-                f"DELETE FROM events WHERE session_id IN {sessions}", (project,))
-            conn.execute(
-                f"DELETE FROM cursors WHERE session_id IN {sessions}", (project,))
-            conn.execute(
-                f"DELETE FROM sessions WHERE project_id = {pid}", (project,))
-            conn.execute("DELETE FROM projects WHERE path = ?", (project,))
-            audit(conn, action, project, detail)
-    finally:
-        conn.close()
+    _quiet(manage.delete, str(central), project, action, detail)
 
 
 def project_counts(db, project):
