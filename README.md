@@ -4,6 +4,14 @@ Claude Code plugin that records per-turn and per-subagent token usage into a
 central SQLite database — with **zero model-token overhead** (capture runs in
 Stop/SubagentStop hooks, outside the model loop).
 
+v0.7.0 (schema v5) adds **project names and a richer project table**:
+`projects.name` is stamped by capture from the kit's `.docs/PROJECT-INFO.md`
+(`project:` frontmatter key) or asked for at enable time; reports fall back to
+the path basename. `/token-telemetry:project-stats` now shows cache read/write
+counters and splits the (bold) estimated cost into classic and cached price
+columns, each formatted `total (input / output)`. `/token-telemetry:token-stats`
+joins the script-generated family in `scripts/report.py`.
+
 v0.6.0 makes the deterministic reports **script-generated**: `/token-telemetry:info`,
 `/token-telemetry:project-stats` and `/token-telemetry:pricing-update` now just run
 `scripts/report.py` / `scripts/pricing_update.py` and echo the finished markdown —
