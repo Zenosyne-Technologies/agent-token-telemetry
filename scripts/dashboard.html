@@ -154,6 +154,9 @@
 
   /* ============ FILTER BAR ============ */
   .filters{padding:14px 16px;margin-bottom:20px;display:flex;flex-direction:column;gap:12px;}
+  /* window + measure: the two scope controls sit together, on one row when
+     there is room, in their own card above the value filters */
+  .filters.scope{margin-bottom:12px;flex-direction:row;flex-wrap:wrap;gap:12px 34px;align-items:center;}
   .frow{display:flex;flex-wrap:wrap;align-items:center;gap:8px;}
   .flabel{font-family:var(--font-mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);margin-right:4px;min-width:64px;}
   .chip{font:inherit;font-size:12.5px;color:var(--ink-2);background:var(--panel-2);border:1px solid var(--panel-brd);border-radius:999px;padding:5px 12px 5px 10px;cursor:pointer;display:inline-flex;align-items:center;gap:7px;transition:color .15s,border-color .15s,background .15s;white-space:nowrap;}
@@ -165,8 +168,10 @@
   .seg{display:inline-flex;flex-wrap:wrap;padding:3px;border-radius:11px;background:var(--panel-2);border:1px solid var(--panel-brd);gap:2px;}
   .seg button{font:inherit;font-size:12.5px;color:var(--ink-2);background:none;border:0;padding:6px 13px;border-radius:8px;cursor:pointer;}
   .seg button[aria-pressed="true"]{background:var(--panel-hi);color:var(--ink);box-shadow:inset 0 1px 0 var(--panel-hi);font-weight:600;}
-  .reset{margin-left:auto;font:inherit;font-size:12px;color:var(--ink-3);background:none;border:0;cursor:pointer;text-decoration:underline;text-underline-offset:3px;}
-  .reset:hover{color:var(--accent);}
+  /* a real (quiet) button, not near-invisible underlined text */
+  .reset{margin-left:auto;font:inherit;font-size:12px;font-weight:500;color:var(--ink);background:var(--panel-2);border:1px solid var(--panel-brd);border-radius:999px;padding:5px 12px;cursor:pointer;transition:color .15s,border-color .15s,background .15s;}
+  .reset:hover{color:var(--accent);border-color:var(--accent);background:var(--panel-hi);}
+  .reset:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
 
   /* ============ KPI ROW ============ */
   .kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px;margin-bottom:20px;}
@@ -349,8 +354,8 @@
       </div>
     </header>
 
-    <section class="filters glass" aria-label="Filters">
-      <div class="frow" style="margin-bottom:2px">
+    <section class="filters scope glass" aria-label="Window and measure">
+      <div class="frow">
         <span class="flabel">Period</span>
         <div class="seg" id="period" role="group" aria-label="Period">
           <button data-p="day" aria-pressed="false">Day</button>
@@ -359,11 +364,7 @@
           <button data-p="year" aria-pressed="false">Year</button>
         </div>
       </div>
-      <div class="frow"><span class="flabel">Model</span><div id="f-model" class="frow" style="gap:8px"></div></div>
-      <div class="frow"><span class="flabel">Agent</span><div id="f-agent" class="frow" style="gap:8px"></div>
-        <button class="reset" id="reset">reset all</button>
-      </div>
-      <div class="frow" style="margin-top:2px">
+      <div class="frow">
         <span class="flabel">Measure</span>
         <div class="seg" id="metric" role="group" aria-label="Measure">
           <button data-m="cost" aria-pressed="true">Est. cost</button>
@@ -371,6 +372,13 @@
           <button data-m="consumed" aria-pressed="false">Consumed tokens</button>
           <button data-m="cache" aria-pressed="false">Cache tokens</button>
         </div>
+      </div>
+    </section>
+
+    <section class="filters glass" aria-label="Filters">
+      <div class="frow"><span class="flabel">Model</span><div id="f-model" class="frow" style="gap:8px"></div></div>
+      <div class="frow"><span class="flabel">Agent</span><div id="f-agent" class="frow" style="gap:8px"></div>
+        <button class="reset" id="reset">reset all</button>
       </div>
     </section>
 
@@ -406,18 +414,18 @@
       </section>
 
       <section class="card glass wide tbl-card" aria-labelledby="h-proj">
-        <div class="card-hd"><h2 id="h-proj">Projects</h2><div class="miniseg" id="pview" role="group" aria-label="Projects table detail"><button data-v="split" aria-pressed="true">Detailed</button><button data-v="sum" aria-pressed="false">Summary</button></div><span class="cap" id="proj-filter"></span></div>
+        <div class="card-hd"><h2 id="h-proj">Projects</h2><div class="miniseg" id="pview" role="group" aria-label="Projects table detail"><button data-v="sum" aria-pressed="false">Summary</button><button data-v="split" aria-pressed="true">Detailed</button></div><span class="cap" id="proj-filter"></span></div>
         <div class="tbl-scroll"><table id="ptbl">
           <thead><tr>
-            <th data-k="pj">Project<span class="ar">&#8597;</span></th>
-            <th data-k="n" class="num">Events<span class="ar">&#8597;</span></th>
-            <th data-k="total" class="num" title="all tokens">Total tok<span class="ar">&#8597;</span></th>
-            <th data-k="cost" class="num" title="total estimated cost">Total cost<span class="ar">&#8597;</span></th>
-            <th data-k="consumed" class="num" title="input + output tokens">Consumed<span class="ar">&#8597;</span></th>
-            <th data-k="cachetok" class="num" title="cache read + write tokens">Cache<span class="ar">&#8597;</span></th>
-            <th data-k="costConsumed" class="num" title="cost of input + output">Consumed $<span class="ar">&#8597;</span></th>
-            <th data-k="costCache" class="num" title="cost of cache read + write">Cache $<span class="ar">&#8597;</span></th>
-            <th class="noSort">Cost share</th>
+            <th data-k="pj" title="Project name (from the kit's PROJECT-INFO, else the folder name). Click a row to filter the whole dashboard to it.">Project<span class="ar">&#8597;</span></th>
+            <th data-k="n" class="num" title="Events recorded in the selected period.">Events<span class="ar">&#8597;</span></th>
+            <th data-k="total" class="num" title="All tokens. Detailed: total (ingested / generated) — ingested = uncached input + cache read + cache write.">Total tok<span class="ar">&#8597;</span></th>
+            <th data-k="cost" class="num" title="Estimated cost of everything. Detailed: total (ingested / generated output).">Total cost<span class="ar">&#8597;</span></th>
+            <th data-k="consumed" class="num" title="Uncached tokens only. Detailed: total (input / output).">Consumed<span class="ar">&#8597;</span></th>
+            <th data-k="cachetok" class="num" title="Cache tokens only. Detailed: total (read / write).">Cache<span class="ar">&#8597;</span></th>
+            <th data-k="costConsumed" class="num" title="Cost of the uncached tokens. Detailed: total (input / output).">Consumed $<span class="ar">&#8597;</span></th>
+            <th data-k="costCache" class="num" title="Cost of the cache tokens. Detailed: total (read / write).">Cache $<span class="ar">&#8597;</span></th>
+            <th class="noSort" title="This project's share of the period's estimated cost.">Cost share</th>
           </tr></thead>
           <tbody id="pbody"></tbody>
         </table></div>
@@ -425,22 +433,22 @@
     </div>
 
     <section class="card glass wide tbl-card" aria-labelledby="h-tbl">
-      <div class="card-hd"><h2 id="h-tbl">Events</h2><div class="miniseg" id="eview" role="group" aria-label="Events table detail"><button data-v="split" aria-pressed="true">Detailed</button><button data-v="sum" aria-pressed="false">Summary</button></div><span class="cap">Click a column to sort. Reflects the active filters.</span></div>
+      <div class="card-hd"><h2 id="h-tbl">Events</h2><div class="miniseg" id="eview" role="group" aria-label="Events table detail"><button data-v="sum" aria-pressed="false">Summary</button><button data-v="split" aria-pressed="true">Detailed</button></div><span class="cap">Click a column to sort. Reflects the active filters.</span></div>
       <div class="tbl-scroll"><table id="tbl">
         <thead><tr>
-          <th data-k="ts">Time<span class="ar">&#8597;</span></th>
-          <th data-k="project">Project<span class="ar">&#8597;</span></th>
-          <th data-k="model">Model<span class="ar">&#8597;</span></th>
-          <th data-k="agent">Agent<span class="ar">&#8597;</span></th>
-          <th data-k="kind">Type<span class="ar">&#8597;</span></th>
-          <th data-k="calls" class="num" title="API calls in this slice (per-agent or per-turn)">Calls<span class="ar">&#8597;</span></th>
-          <th data-k="ctx" class="num" title="context size when the slice ended — input side of its last API call (matches Claude Code's own token gauge)">Context<span class="ar">&#8597;</span></th>
-          <th data-k="total" class="num" title="input + output + cache read + cache write">Total tok<span class="ar">&#8597;</span></th>
-          <th data-k="cost" class="num" title="total estimated cost">Total cost<span class="ar">&#8597;</span></th>
-          <th data-k="consumed" class="num" title="input + output tokens">Consumed<span class="ar">&#8597;</span></th>
-          <th data-k="cachetok" class="num" title="cache read + cache write tokens">Cache<span class="ar">&#8597;</span></th>
-          <th data-k="costConsumed" class="num" title="cost of input + output">Consumed $<span class="ar">&#8597;</span></th>
-          <th data-k="costCache" class="num" title="cost of cache read + write">Cache $<span class="ar">&#8597;</span></th>
+          <th data-k="ts" title="When this slice was captured. Day/week windows show the clock time; on month/year windows Detailed adds it beside the date.">Time<span class="ar">&#8597;</span></th>
+          <th data-k="project" title="Project the slice belongs to.">Project<span class="ar">&#8597;</span></th>
+          <th data-k="model" title="Model that served the calls in this slice.">Model<span class="ar">&#8597;</span></th>
+          <th data-k="agent" title="Sub-agent persona (e.g. marvin:developer), or 'main' for orchestrator turns.">Agent<span class="ar">&#8597;</span></th>
+          <th data-k="kind" title="Turn = a main-session slice; Sub-agent = one sub-agent's own transcript.">Type<span class="ar">&#8597;</span></th>
+          <th data-k="calls" class="num" title="API calls in this slice, counted once per message id.">Calls<span class="ar">&#8597;</span></th>
+          <th data-k="ctx" class="num" title="Context size when the slice ended — its last call's input + cache read + cache write. This is the number Claude Code's own token gauge shows; the token columns are cumulative billing across every call.">Context<span class="ar">&#8597;</span></th>
+          <th data-k="total" class="num" title="All tokens. Detailed: total (ingested / generated) — ingested = uncached input + cache read + cache write.">Total tok<span class="ar">&#8597;</span></th>
+          <th data-k="cost" class="num" title="Estimated cost of everything. Detailed: total (ingested / generated output).">Total cost<span class="ar">&#8597;</span></th>
+          <th data-k="consumed" class="num" title="Uncached tokens only. Detailed: total (input / output).">Consumed<span class="ar">&#8597;</span></th>
+          <th data-k="cachetok" class="num" title="Cache tokens only. Detailed: total (read / write).">Cache<span class="ar">&#8597;</span></th>
+          <th data-k="costConsumed" class="num" title="Cost of the uncached tokens. Detailed: total (input / output).">Consumed $<span class="ar">&#8597;</span></th>
+          <th data-k="costCache" class="num" title="Cost of the cache tokens. Detailed: total (read / write).">Cache $<span class="ar">&#8597;</span></th>
         </tr></thead>
         <tbody id="tbody"></tbody>
       </table></div>
@@ -524,6 +532,10 @@
   const pad=n=>(n<10?"0":"")+n;
   const longWindow=()=> state.period==="month"||state.period==="year";
   function fmtTime(ts){ const d=new Date(ts*1000); return longWindow()? (pad(d.getMonth()+1)+"/"+pad(d.getDate())) : (pad(d.getHours())+":"+pad(d.getMinutes())); }
+  // Events table: Detailed adds the clock time to a date-only long window, so a
+  // day's worth of rows can be told apart without hovering.
+  function fmtEventTime(ts){ const d=new Date(ts*1000), hm=pad(d.getHours())+":"+pad(d.getMinutes());
+    return (state.eview==="split" && longWindow()) ? `${pad(d.getMonth()+1)}/${pad(d.getDate())} <span class="tsplit">${hm}</span>` : fmtTime(ts); }
 
   // ---- tooltip ----
   const tip=$("tip");
@@ -686,7 +698,7 @@
   // ---- events table (server-paginated + server-sorted) ----
   function renderTable(ev){
     $("tbody").innerHTML=ev.rows.map(e=>{ const sub=e.kind===1;
-      return `<tr><td class="num">${fmtTime(e.ts)}</td><td>${esc(e.project)}</td><td><span class="mdl"><span class="sw" style="background:${colorFor("model",e.model)}"></span>${esc(e.modelName)}</span></td><td>${esc(e.agent)}</td><td><span class="pill${sub?" sub":""}">${sub?"Sub-agent":"Turn"}</span></td><td class="num">${e.calls==null?"—":fmtInt(e.calls)}</td><td class="num">${e.ctx==null?"—":fmtTok(e.ctx)}</td><td class="num">${state.eview==="split"?tokSplit(e.total, e["in"]+e.cache_r+e.cache_w, e.out, fmtInt):fmtInt(e.total)}</td><td class="num">${state.eview==="split"?usdSplit(e.cost, e.cost-e.costOut, e.costOut):fmtUSD(e.cost)}</td><td class="num">${state.eview==="split"?tokSplit(e.consumed, e["in"], e.out, fmtInt):fmtInt(e.consumed)}</td><td class="num">${state.eview==="split"?tokSplit(e.cachetok, e.cache_r, e.cache_w, fmtInt):fmtInt(e.cachetok)}</td><td class="num">${state.eview==="split"?usdSplit(e.costConsumed, e.costIn, e.costOut):fmtUSD(e.costConsumed)}</td><td class="num">${state.eview==="split"?usdSplit(e.costCache, e.costCacheR, e.costCacheW):fmtUSD(e.costCache)}</td></tr>`;
+      return `<tr><td class="num">${fmtEventTime(e.ts)}</td><td>${esc(e.project)}</td><td><span class="mdl"><span class="sw" style="background:${colorFor("model",e.model)}"></span>${esc(e.modelName)}</span></td><td>${esc(e.agent)}</td><td><span class="pill${sub?" sub":""}">${sub?"Sub-agent":"Turn"}</span></td><td class="num">${e.calls==null?"—":fmtInt(e.calls)}</td><td class="num">${e.ctx==null?"—":fmtTok(e.ctx)}</td><td class="num">${state.eview==="split"?tokSplit(e.total, e["in"]+e.cache_r+e.cache_w, e.out, fmtInt):fmtInt(e.total)}</td><td class="num">${state.eview==="split"?usdSplit(e.cost, e.cost-e.costOut, e.costOut):fmtUSD(e.cost)}</td><td class="num">${state.eview==="split"?tokSplit(e.consumed, e["in"], e.out, fmtInt):fmtInt(e.consumed)}</td><td class="num">${state.eview==="split"?tokSplit(e.cachetok, e.cache_r, e.cache_w, fmtInt):fmtInt(e.cachetok)}</td><td class="num">${state.eview==="split"?usdSplit(e.costConsumed, e.costIn, e.costOut):fmtUSD(e.costConsumed)}</td><td class="num">${state.eview==="split"?usdSplit(e.costCache, e.costCacheR, e.costCacheW):fmtUSD(e.costCache)}</td></tr>`;
     }).join("") || `<tr><td colspan="13" class="empty">No events match the filters.</td></tr>`;
     [...document.querySelectorAll("#tbl thead th")].forEach(th=>{ const on=th.dataset.k===state.sort.k; th.toggleAttribute("data-sorted",on); const ar=th.querySelector(".ar"); if(ar)ar.textContent=on?(state.sort.dir==="desc"?"\u2193":"\u2191"):"\u2195"; });
     const total=ev.total, pages=Math.max(1,Math.ceil(total/ev.pageSize)), from=total?ev.start+1:0, to=Math.min(ev.start+ev.pageSize,total);
