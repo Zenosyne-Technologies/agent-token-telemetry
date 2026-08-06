@@ -106,7 +106,7 @@ The mirror exists for retention and reuse — it travels with the repo or the te
 
 ## Schema version
 
-Current: `PRAGMA user_version = 4`. Migrations are additive deltas applied in
+Current: `PRAGMA user_version = 5`. Migrations are additive deltas applied in
 `capture.py`'s `migrate()`, run from `connect()`, and are idempotent — safe to run
 concurrently from multiple hook invocations. Hops run in order and each is gated on its
 own post-condition: a version is stamped only once the shape it promises is verifiably
@@ -123,6 +123,11 @@ heals itself.
   working and the 5m portion is `cache_w - cache_w_1h`) and `pricing.cache_w_1h_usd`
   (the 1h write rate, 2× input vs 1.25× for 5m; NULL = unknown — cost queries must fall
   back to `cache_w_usd`, which reproduces the pre-v4 estimate).
+- **v4 → v5** (v0.7.0) — `projects.name`: the human project name. Capture stamps it
+  every turn from the kit's `.docs/PROJECT-INFO.md` frontmatter (`project:` key —
+  the kit document wins over any other source); `/token-telemetry:enable` registers a
+  user-supplied name when no kit document exists. NULL = unknown; reports fall back
+  to the path basename.
 
 No column has ever been renamed or removed. v0.3.0 changed no schema at all — it added
 storage modes. A project-local mirror is byte-for-byte the same schema as the central DB;
@@ -147,7 +152,7 @@ so is a `/storage-separate` export, which is built through the same `connect()`.
 
 `sessions(id, uuid, project_id)` and `models(id, name)` are stable lookup tables
 unchanged since v1; `projects(id, path)` gained the two nullable `mirror_*` columns in
-v3 (above) and is otherwise unchanged. A row's absence is meaningful: storage-management
+v3 and the nullable `name` column in v5 (both above) and is otherwise unchanged. A row's absence is meaningful: storage-management
 commands delete a project's `projects`/`sessions`/`events`/`cursors` rows outright, so a
 consumer must treat "no project row" as "no data", never as an error.
 

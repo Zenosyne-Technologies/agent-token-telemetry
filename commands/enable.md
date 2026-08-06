@@ -36,7 +36,25 @@ Enable token telemetry for this project:
    UPDATE projects SET mirror_path = NULL, mirror_last_at = NULL WHERE path = :root;
    ```
 
-7. Tell the user: telemetry is enabled for this project. **Restart warning — always state it**: capture hooks load at Claude Code session start, so if the token-telemetry plugin was installed during THIS session (or this is the first enable after installing), nothing is recorded until Claude Code restarts — restart now to start capturing. Every completed turn and
+7. **Project name** — reports show a human name per project (schema v5,
+   `projects.name`). Determine it in this order:
+   - `<root>/.docs/PROJECT-INFO.md` frontmatter `project:` key (the
+     agent-operating-kit document) — if present and not an unresolved
+     `{{PLACEHOLDER}}`, use it WITHOUT asking; capture also keeps this synced
+     on every turn, so nothing more is needed — skip the registration below.
+   - Otherwise ask the user for a short project name (AskUserQuestion, free
+     text via Other; offer the directory basename as the default option) and
+     register it — create the row if this project has never captured
+     (skip silently only if the DB does not exist yet; capture will not
+     overwrite a registered name unless a kit document appears):
+
+   ```sql
+   INSERT INTO projects(path) SELECT :root
+     WHERE NOT EXISTS (SELECT 1 FROM projects WHERE path = :root);
+   UPDATE projects SET name = :name WHERE path = :root;
+   ```
+
+8. Tell the user: telemetry is enabled for this project. **Restart warning — always state it**: capture hooks load at Claude Code session start, so if the token-telemetry plugin was installed during THIS session (or this is the first enable after installing), nothing is recorded until Claude Code restarts — restart now to start capturing. Every completed turn and
    subagent is recorded (no tokens are consumed by capture). The marker file can be
    committed to enable it for the whole team. Use `/token-telemetry:info` to check
    status and `/token-telemetry:disable` to turn it off.

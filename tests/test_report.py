@@ -54,19 +54,62 @@ class TestReportScript(unittest.TestCase):
         rc, out = run(["project-stats", "--db", str(self.db)])
         self.assertEqual(rc, 0)
         self.assertIn("| project | sessions | events |", out)
-        self.assertIn("`/proj`", out)
-        self.assertIn("1,000", out)   # thousands separator
+        self.assertIn("| proj |", out)   # basename fallback, no name stamped
+        self.assertIn("1,000", out)      # thousands separator
         self.assertIn("(today)", out)
         # fresh DB prices at the seed -> the closing hint must appear
-        self.assertIn("seed rates", out)
+        self.assertIn("undated seed", out)
         self.assertIn("pricing-update", out)
+
+    def test_project_stats_shows_registered_name(self):
+        self.seed_db()
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE projects SET name='My Project' WHERE path='/proj'")
+        conn.commit()
+        conn.close()
+        _, out = run(["project-stats", "--db", str(self.db)])
+        self.assertIn("| My Project |", out)
 
     def test_project_stats_prices_1h_writes_at_1h_rate(self):
         self.seed_db()
         _, out = run(["project-stats", "--db", str(self.db)])
         # sonnet seed: in 3, out 15, cr 0.3, cw1h 6 per MTok; all writes are 1h
         expected = (1000 * 3.0 + 500 * 15.0 + 100 * 0.30 + 50 * 6.0) / 1e6
-        self.assertIn(f"${expected:.4f}", out)
+        self.assertIn(f"**${expected:.4f}**", out)   # est. cost total is bold
+
+    def test_project_stats_cost_split_adds_up(self):
+        self.seed_db()
+        _, out = run(["project-stats", "--db", str(self.db)])
+        classic = (1000 * 3.0 + 500 * 15.0) / 1e6
+        cached = (100 * 0.30 + 50 * 6.0) / 1e6
+        # classic and cached columns carry their own totals with (l / r) splits
+        self.assertIn(f"${classic:.4f} (${1000 * 3.0 / 1e6:.4f} /"
+                      f" ${500 * 15.0 / 1e6:.4f})", out)
+        self.assertIn(f"${cached:.4f} (${100 * 0.30 / 1e6:.4f} /"
+                      f" ${50 * 6.0 / 1e6:.4f})", out)
+        # cache token counters are columns now
+        self.assertIn("| cache read | cache write |", out.splitlines()[0])
+        # rates dates no longer appear in the cost cells
+        self.assertNotIn("(rates ", out)
+
+    def test_token_stats_renders_sections(self):
+        self.seed_db()
+        rc, out = run(["token-stats", "--db", str(self.db)])
+        self.assertEqual(rc, 0)
+        self.assertIn("**Today:", out)
+        self.assertIn("**By project (7 days)**", out)
+        self.assertIn("**By model (7 days)**", out)
+        self.assertIn("**By tier (7 days)**", out)
+        self.assertIn("claude-sonnet-5", out)
+        self.assertIn("small", out)          # tier mapping
+        self.assertIn("No milestone-branch", out)
+        self.assertIn("No issue-tagged", out)
+
+    def test_token_stats_missing_db(self):
+        rc, out = run(["token-stats", "--db", str(self.db)])
+        self.assertEqual(rc, 0)
+        self.assertIn("No telemetry has been recorded yet", out)
+        self.assertFalse(self.db.exists())
 
     def test_info_reports_off_project_and_missing_db(self):
         rc, out = run(["info", "--db", str(self.db), "--cwd", str(self.dir)])
