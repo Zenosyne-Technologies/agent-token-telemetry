@@ -1,6 +1,6 @@
 ---
 description: Enable token telemetry capture for the current project
-allowed-tools: Bash(mkdir:*), Bash(printf:*), Bash(sqlite3:*), Bash(cat:*), Bash(ls:*), Read, Write, Edit, AskUserQuestion
+allowed-tools: Bash(mkdir:*), Bash(printf:*), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/manage.py":*), Bash(cat:*), Bash(ls:*), Read, Write, Edit, AskUserQuestion
 ---
 
 Enable token telemetry for this project:
@@ -29,11 +29,10 @@ Enable token telemetry for this project:
 6. **Central mode only** — clear any stale mirror metadata on the central `projects` row,
    so `/token-telemetry:storage-status` stops reporting a project-level copy this project
    no longer writes (the mirror *file* is left alone — it is the user's data to keep or
-   remove). Skip silently if the DB does not exist or predates schema 3; this is
-   bookkeeping, never a reason to fail the command:
+   remove; the script itself skips silently when the DB is absent or predates schema 3):
 
-   ```sql
-   UPDATE projects SET mirror_path = NULL, mirror_last_at = NULL WHERE path = :root;
+   ```
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/manage.py" clear-mirror-meta --project "<root>"
    ```
 
 7. **Project name** — reports show a human name per project (schema v5,
@@ -44,14 +43,12 @@ Enable token telemetry for this project:
      on every turn, so nothing more is needed — skip the registration below.
    - Otherwise ask the user for a short project name (AskUserQuestion, free
      text via Other; offer the directory basename as the default option) and
-     register it — create the row if this project has never captured
-     (skip silently only if the DB does not exist yet; capture will not
-     overwrite a registered name unless a kit document appears):
+     register it — the script creates the projects row if this project has
+     never captured (capture will not overwrite a registered name unless a
+     kit document appears):
 
-   ```sql
-   INSERT INTO projects(path) SELECT :root
-     WHERE NOT EXISTS (SELECT 1 FROM projects WHERE path = :root);
-   UPDATE projects SET name = :name WHERE path = :root;
+   ```
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/manage.py" register-name --project "<root>" --name "<name>"
    ```
 
 8. Tell the user: telemetry is enabled for this project. **Restart warning — always state it**: capture hooks load at Claude Code session start, so if the token-telemetry plugin was installed during THIS session (or this is the first enable after installing), nothing is recorded until Claude Code restarts — restart now to start capturing. Every completed turn and
