@@ -1,6 +1,6 @@
 ---
 description: Show token usage and cost statistics from the telemetry DB
-allowed-tools: Bash(python3:*)
+allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/report.py":*)
 ---
 
 Run this single command and output its stdout **verbatim** — it is already

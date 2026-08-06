@@ -1,6 +1,6 @@
 ---
 description: Refresh the pricing table from Anthropic's currently published rates
-allowed-tools: Bash(python3:*), WebFetch
+allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py":*), WebFetch
 ---
 
 Run this single command and output its stdout **verbatim** — it fetches the

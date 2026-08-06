@@ -110,6 +110,26 @@ class TestReportScript(unittest.TestCase):
         self.assertIn("No milestone-branch", out)
         self.assertIn("No issue-tagged", out)
 
+    def test_storage_status_renders_tables(self):
+        self.seed_db()
+        rc, out = run(["storage-status", "--db", str(self.db)])
+        self.assertEqual(rc, 0)
+        self.assertIn("### Central DB", out)
+        self.assertIn("### Projects", out)
+        self.assertIn("`/proj`", out)
+        self.assertIn("| no | — | — |", out)   # no mirror configured
+
+    def test_storage_status_shows_configured_mirror(self):
+        self.seed_db()
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE projects SET mirror_path='/nowhere/m.db',"
+                     " mirror_last_at=strftime('%s','now') WHERE path='/proj'")
+        conn.commit()
+        conn.close()
+        _, out = run(["storage-status", "--db", str(self.db)])
+        self.assertIn("not accessible on this machine", out)
+        self.assertIn("configured state, not a write receipt", out)
+
     def test_token_stats_missing_db(self):
         rc, out = run(["token-stats", "--db", str(self.db)])
         self.assertEqual(rc, 0)
