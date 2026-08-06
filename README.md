@@ -14,9 +14,12 @@ to filter the whole page; the events table is sortable and paginated; four
 token/cost measures; a live auto-refresh every 5 minutes. The server is
 read-only (`mode=ro`, every filter a bound SQL parameter), localhost-only,
 backgrounded by `open`, reattaches instead of duplicating, and self-terminates
-after ~11 minutes idle so nothing lingers once the last tab closes. Every event
-prices at the rate in force at its own timestamp — the same resolution
-`report.py` uses, so the dashboard matches `/token-stats`.
+after ~11 minutes idle so nothing lingers once the last tab closes. If the
+server does stop, the page shows a connection-lost overlay that reconnects on
+its own; `/token-telemetry:dashboard-restart` brings the server back in place
+(same port, no second tab) and `/token-telemetry:dashboard-stop` ends it
+deliberately. Every event prices at the rate in force at its own timestamp —
+the same resolution `report.py` uses, so the dashboard matches `/token-stats`.
 
 v0.7.2 completes the **permission-hardening pass** (AOS-10): no command grants
 `Bash(sqlite3:*)` or bare `Bash(python3:*)` any more. Write-side bookkeeping
