@@ -732,6 +732,93 @@ class TestProjectName(unittest.TestCase):
             "Kit Name")
 
 
+class TestSubagentSweep(unittest.TestCase):
+    """The harness writes sub-agent transcripts to
+    <dir>/<session>/subagents/agent-*.jsonl; SubagentStop only carries the
+    main transcript path, so capture sweeps the directory itself."""
+
+    META = (None, None, None, None, None)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.db = self.root / "usage.db"
+        self.main = self.root / "sess.jsonl"
+        write_jsonl(self.main, [entry(mid="m0")])
+        self.subdir = self.root / "sess" / "subagents"
+        self.subdir.mkdir(parents=True)
+        self.conn = capture.connect(self.db)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def add_agent(self, agent_id, agent_type=None, **kw):
+        f = self.subdir / f"agent-{agent_id}.jsonl"
+        write_jsonl(f, [entry(mid=f"m-{agent_id}", side=True, **kw)])
+        if agent_type:
+            (self.subdir / f"agent-{agent_id}.meta.json").write_text(
+                json.dumps({"agentType": agent_type}))
+        return f
+
+    def sweep(self):
+        return capture.sweep_subagents(self.conn, "/proj", "s1",
+                                       str(self.main), self.META, "hook-agent")
+
+    def events(self):
+        return self.conn.execute(
+            "SELECT kind, agent, out_tok FROM events ORDER BY rowid").fetchall()
+
+    def test_agent_file_recorded_with_meta_label(self):
+        self.add_agent("a1", "marvin:developer", out=77)
+        swept = self.sweep()
+        self.assertEqual(len(swept), 1)
+        self.assertEqual(self.events(), [(1, "marvin:developer", 77)])
+
+    def test_missing_meta_falls_back_to_hook_agent(self):
+        self.add_agent("a1", agent_type=None)
+        self.sweep()
+        self.assertEqual(self.events()[0][1], "hook-agent")
+
+    def test_refire_is_noop(self):
+        self.add_agent("a1", "marvin:ponytail")
+        self.sweep()
+        self.assertEqual(self.sweep(), [])
+        self.assertEqual(len(self.events()), 1)
+
+    def test_batch_cap_defers_remainder_to_next_firing(self):
+        n = capture.SUBAGENT_BATCH + 3
+        for i in range(n):
+            self.add_agent(f"a{i:03d}", "marvin:developer")
+        first = self.sweep()
+        self.assertEqual(len(first), capture.SUBAGENT_BATCH)
+        second = self.sweep()
+        self.assertEqual(len(second), 3)
+        self.assertEqual(len(self.events()), n)
+
+    def test_no_subagents_dir_is_silent(self):
+        other = self.root / "other.jsonl"
+        write_jsonl(other, [entry()])
+        self.assertEqual(capture.sweep_subagents(
+            self.conn, "/proj", "s1", str(other), self.META, None), [])
+
+    def test_main_transcript_rows_never_wear_the_agent_label(self):
+        # The SubagentStop payload names an agent, but the main transcript it
+        # points at holds orchestrator work — kind 0, agent NULL.
+        groups = capture.aggregate([entry(mid="m1")])  # no sidechain flag
+        with self.conn:
+            capture.insert_events(self.conn, "/proj", "s1", 0, "Explore",
+                                  groups)
+        self.assertEqual(self.events(), [(0, None, 50)])
+
+    def test_old_harness_sidechain_lines_still_label_kind_1(self):
+        groups = capture.aggregate([entry(mid="m1", side=True)])
+        with self.conn:
+            capture.insert_events(self.conn, "/proj", "s1", 0, "Explore",
+                                  groups)
+        self.assertEqual(self.events(), [(1, "Explore", 50)])
+
+
 class TestIssueKeyRegex(unittest.TestCase):
     def key(self, subject):
         m = capture.ISSUE_KEY_RE.match(subject)
