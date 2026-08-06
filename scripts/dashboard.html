@@ -25,6 +25,7 @@
   }
   @media (prefers-color-scheme: dark){
     :root{
+      color-scheme: dark;   /* match UA system colours (CanvasText, form controls, tables) to the dark theme */
       --bg-0:#07081a; --bg-1:#0a0b1e; --bg-2:#0e1030;
       --ink:#eef1ff; --ink-2:#aab0d6; --ink-3:#7b81ab;
       --panel:rgba(255,255,255,0.055);
@@ -229,7 +230,8 @@
   .tbl-card .card-hd{padding:0 12px;}
   .tbl-scroll{overflow-x:auto;margin-top:12px;}
   table{border-collapse:collapse;width:100%;font-size:12.5px;}
-  th,td{text-align:left;padding:9px 12px;white-space:nowrap;}
+  table{color:var(--ink);}   /* tables don't reliably inherit color across color-scheme; pin it */
+  th,td{text-align:left;padding:9px 12px;white-space:nowrap;color:var(--ink);}
   thead th{font-family:var(--font-mono);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--panel-brd);cursor:pointer;user-select:none;position:sticky;top:0;}
   thead th:hover{color:var(--ink);}
   thead th .ar{opacity:.4;margin-left:3px;}
@@ -266,7 +268,11 @@
   .conn-card h2{margin:2px 0 0;font-size:21px;font-weight:700;letter-spacing:-.01em;color:var(--ink);}
   .conn-msg{margin:3px 0 4px;font-size:13.5px;line-height:1.5;color:var(--ink-2);max-width:36ch;}
   .conn-msg code{font-family:var(--font-mono);font-size:12px;background:var(--track);padding:1px 6px;border-radius:6px;color:var(--ink);}
-  .conn-actions{display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;justify-content:center;}
+  .conn-ways{display:flex;flex-direction:column;gap:9px;margin:12px 0 2px;width:100%;}
+  .conn-way{display:flex;flex-direction:column;gap:4px;align-items:center;}
+  .conn-way .k{text-transform:uppercase;letter-spacing:.09em;font-family:var(--font-mono);font-size:9.5px;color:var(--ink-3);}
+  .conn-way code{font-family:var(--font-mono);font-size:12.5px;background:var(--track);padding:4px 11px;border-radius:8px;color:var(--ink);border:1px solid var(--panel-brd);}
+  .conn-actions{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;justify-content:center;}
   .conn-btn{font:inherit;font-size:13px;padding:9px 16px;border-radius:11px;border:1px solid var(--panel-brd);background:var(--panel-2);color:var(--ink);cursor:pointer;transition:border-color .15s,transform .05s;}
   .conn-btn:hover{border-color:var(--accent);}
   .conn-btn:active{transform:translateY(1px);}
@@ -461,12 +467,15 @@
       </svg>
     </div>
     <h2 id="conn-title">Connection lost</h2>
-    <p class="conn-msg" id="conn-msg">The dashboard server stopped responding. Close this window and restart the dashboard from Claude &mdash; <code>/token-telemetry:dashboard</code>.</p>
+    <p class="conn-msg" id="conn-msg">The dashboard server isn&rsquo;t responding. It reconnects on its own the moment the server is back &mdash; you don&rsquo;t need to do anything. To bring it back now, in Claude either:</p>
+    <div class="conn-ways">
+      <div class="conn-way"><span class="k">restart just the server</span><code>/token-telemetry:dashboard-restart</code></div>
+      <div class="conn-way"><span class="k">or reopen the dashboard</span><code>/token-telemetry:dashboard</code></div>
+    </div>
     <div class="conn-actions">
-      <button class="conn-btn primary" id="conn-retry" type="button">Try reconnect</button>
       <button class="conn-btn" id="conn-close" type="button">Close dashboard</button>
     </div>
-    <div class="conn-hint" id="conn-hint">Auto-retrying every few seconds&hellip;</div>
+    <div class="conn-hint" id="conn-hint">Reconnecting automatically&hellip;</div>
   </div>
 </div>
 
@@ -541,7 +550,7 @@
     const m=$("conn-modal");
     if(!m.classList.contains("show")){
       m.classList.add("show"); m.setAttribute("aria-hidden","false");
-      const h=$("conn-hint"); h.className="conn-hint"; h.textContent="Auto-retrying every few seconds\u2026";
+      const h=$("conn-hint"); h.className="conn-hint"; h.textContent="Reconnecting automatically\u2026";
     }
     if(!connRetryTimer) connRetryTimer=setInterval(load,3000);   // recover the moment the server is back
   }
@@ -706,8 +715,7 @@
   $("th-auto").addEventListener("click",()=>setTheme("auto")); $("th-light").addEventListener("click",()=>setTheme("light")); $("th-dark").addEventListener("click",()=>setTheme("dark"));
   $("rf-off").addEventListener("click",()=>setRefresh(0)); $("rf-1").addEventListener("click",()=>setRefresh(60000)); $("rf-5").addEventListener("click",()=>setRefresh(300000));
 
-  // connection-lost modal actions
-  $("conn-retry").addEventListener("click",()=>{ const h=$("conn-hint"); h.className="conn-hint"; h.textContent="Reconnecting\u2026"; load(); });
+  // connection-lost modal action (reconnect is automatic; only Close is offered)
   $("conn-close").addEventListener("click",()=>{
     window.open("","_self"); window.close();   // only works for script-opened tabs
     setTimeout(()=>{ const h=$("conn-hint"); h.className="conn-hint err"; h.textContent="Couldn't auto-close \u2014 please close this tab manually."; },300);
