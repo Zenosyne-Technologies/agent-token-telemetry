@@ -591,10 +591,11 @@ class TestSchemaV4(unittest.TestCase):
     def columns(self, conn, table):
         return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
-    def test_fresh_db_is_user_version_4_with_v4_shape(self):
+    def test_fresh_db_carries_the_v4_shape(self):
         conn = capture.connect(self.db)
         self.addCleanup(conn.close)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertGreaterEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], 4)
         self.assertIn("cache_w_1h", self.columns(conn, "events"))
         self.assertIn("cache_w_1h_usd", self.columns(conn, "pricing"))
 
@@ -610,7 +611,8 @@ class TestSchemaV4(unittest.TestCase):
         build_v3_db(self.db)
         migrated = capture.connect(self.db)
         self.addCleanup(migrated.close)
-        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         # pre-v4 events read back unchanged, the new column defaulting to 0
         self.assertEqual(migrated.execute(
             "SELECT ts, agent, cache_w, cache_w_1h FROM events").fetchall(),
@@ -642,8 +644,92 @@ class TestSchemaV4(unittest.TestCase):
 
         retried = capture.connect(self.db)  # transient cause gone
         self.addCleanup(retried.close)
-        self.assertEqual(retried.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(retried.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         self.assertIn("cache_w_1h_usd", self.columns(retried, "pricing"))
+
+
+def build_v4_db(path):
+    """A populated, correctly stamped v4 DB - the starting point of the v4 -> v5
+    migration. Frozen v4 shape: cache-TTL split, no projects.name."""
+    build_v3_db(path)
+    conn = _sqlite3.connect(path)
+    conn.execute("ALTER TABLE events ADD COLUMN cache_w_1h INTEGER"
+                 " NOT NULL DEFAULT 0")
+    conn.execute("ALTER TABLE pricing ADD COLUMN cache_w_1h_usd REAL")
+    conn.execute("PRAGMA user_version=4")
+    conn.commit()
+    conn.close()
+
+
+class TestSchemaV5(unittest.TestCase):
+    """v5 adds `projects.name` — the human project name."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = pathlib.Path(self.tmp.name) / "usage.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def columns(self, conn, table):
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    def test_fresh_db_is_user_version_5_with_name_column(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+        self.assertIn("name", self.columns(conn, "projects"))
+
+    def test_migrates_v4_db_without_touching_rows(self):
+        build_v4_db(self.db)
+        migrated = capture.connect(self.db)
+        self.addCleanup(migrated.close)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 5)
+        self.assertEqual(migrated.execute(
+            "SELECT path, name FROM projects").fetchall(), [("/proj", None)])
+
+
+class TestProjectName(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.db = self.root / "usage.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_info(self, name_line):
+        (self.root / ".docs").mkdir(exist_ok=True)
+        (self.root / ".docs" / "PROJECT-INFO.md").write_text(
+            f"---\nproject: {name_line}\npm_tool: jira\n---\n# body\n")
+
+    def test_name_read_from_kit_frontmatter(self):
+        self.write_info("Calsye Portal")
+        self.assertEqual(capture.project_name_from_kit(self.root),
+                         "Calsye Portal")
+
+    def test_unresolved_placeholder_rejected(self):
+        self.write_info("{{PROJECT_NAME}}")
+        self.assertIsNone(capture.project_name_from_kit(self.root))
+
+    def test_missing_kit_doc_is_none(self):
+        self.assertIsNone(capture.project_name_from_kit(self.root))
+
+    def test_stamp_sets_and_kit_wins_over_registered_name(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        conn.execute("INSERT INTO projects(path, name) VALUES ('/p', 'manual')")
+        conn.commit()
+        capture.stamp_project_name(conn, "/p", "Kit Name")
+        self.assertEqual(conn.execute(
+            "SELECT name FROM projects WHERE path='/p'").fetchone()[0],
+            "Kit Name")
+        # None (no kit doc) never clears an existing name
+        capture.stamp_project_name(conn, "/p", None)
+        self.assertEqual(conn.execute(
+            "SELECT name FROM projects WHERE path='/p'").fetchone()[0],
+            "Kit Name")
 
 
 class TestIssueKeyRegex(unittest.TestCase):
