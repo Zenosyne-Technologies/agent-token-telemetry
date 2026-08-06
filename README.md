@@ -4,6 +4,13 @@ Claude Code plugin that records per-turn and per-subagent token usage into a
 central SQLite database — with **zero model-token overhead** (capture runs in
 Stop/SubagentStop hooks, outside the model loop).
 
+v0.10.0 (schema v6) records **per-event agent metrics** — `api_calls` (how many
+API calls a turn or sub-agent slice contained) and `ctx_tokens` (context size
+when it ended: the last call's input side, i.e. the number Claude Code's own
+token gauge shows) — and the dashboard grows Calls and Context columns in the
+Events table, `total (input/output)` splits on the COST columns too, and a
+Detailed/Summary toggle on each of the Projects and Events tables.
+
 v0.9.0 marks **backlog roll-ups** and gives the dashboard its face: the first
 capture of an already-running session distills days of history into one event
 dated "today" — capture now stamps such events (`note = 'backlog-capture'`
