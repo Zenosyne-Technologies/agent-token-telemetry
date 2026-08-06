@@ -36,7 +36,7 @@ Enable token telemetry for this project:
    UPDATE projects SET mirror_path = NULL, mirror_last_at = NULL WHERE path = :root;
    ```
 
-7. Tell the user: telemetry is enabled for this project. Every completed turn and
+7. Tell the user: telemetry is enabled for this project. **Restart warning — always state it**: capture hooks load at Claude Code session start, so if the token-telemetry plugin was installed during THIS session (or this is the first enable after installing), nothing is recorded until Claude Code restarts — restart now to start capturing. Every completed turn and
    subagent is recorded (no tokens are consumed by capture). The marker file can be
    committed to enable it for the whole team. Use `/token-telemetry:info` to check
    status and `/token-telemetry:disable` to turn it off.
