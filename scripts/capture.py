@@ -86,7 +86,13 @@ def aggregate(entries):
             if g["last"] is None or t > g["last"]:
                 g["last"] = t
     for g in groups.values():
-        for usage in list(g.pop("_by_id").values()) + g.pop("_no_id"):
+        usages = list(g.pop("_by_id").values()) + g.pop("_no_id")
+        # Per-slice agent metrics: one usage snapshot per API call after the
+        # message.id dedupe, and the LAST call's input side is the context
+        # size when the slice ended (what Claude Code's own token gauge shows).
+        g["calls"] = len(usages)
+        g["ctx"] = 0
+        for usage in usages:
             g["in"] += usage.get("input_tokens") or 0
             g["out"] += usage.get("output_tokens") or 0
             g["cr"] += usage.get("cache_read_input_tokens") or 0
@@ -99,6 +105,9 @@ def aggregate(entries):
                       + (cc.get("ephemeral_1h_input_tokens") or 0))
             g["cw"] += cw or 0
             g["cw1h"] += cc.get("ephemeral_1h_input_tokens") or 0
+            g["ctx"] = ((usage.get("input_tokens") or 0)
+                        + (usage.get("cache_read_input_tokens") or 0)
+                        + (cw or 0))
     return groups
 
 
@@ -175,7 +184,12 @@ V4_COLUMNS = (("events", "cache_w_1h", "INTEGER NOT NULL DEFAULT 0"),
 # .docs/PROJECT-INFO.md (`project:` frontmatter key) or registered at enable
 # time; NULL means unknown and reports fall back to the path basename.
 V5_COLUMNS = (("projects", "name", "TEXT"),)
-SCHEMA_VERSION = 5
+# v6: per-event agent metrics — how many API calls the slice contains and the
+# context size (input side of the LAST call: input + cache read + cache write)
+# when it ended. NULL on pre-v6 rows = unknown, never backfilled.
+V6_COLUMNS = (("events", "api_calls", "INTEGER"),
+              ("events", "ctx_tokens", "INTEGER"))
+SCHEMA_VERSION = 6
 
 
 def table_columns(conn, table):
@@ -206,12 +220,14 @@ def migrate(conn):
             and MIRROR_META | {"name"} <= table_columns(conn, "projects")
             and has_table(conn, "audit_log")
             and "cache_w_1h" in event_columns(conn)
-            and "cache_w_1h_usd" in table_columns(conn, "pricing")):
+            and "cache_w_1h_usd" in table_columns(conn, "pricing")
+            and {"api_calls", "ctx_tokens"} <= event_columns(conn)):
         return
     # Hops run in sequence and each returns whether its shape actually landed:
     # v3 must never be attempted - let alone stamped - on a DB that failed v2.
-    if migrate_v2(conn) and migrate_v3(conn) and migrate_v4(conn):
-        migrate_v5(conn)
+    if (migrate_v2(conn) and migrate_v3(conn) and migrate_v4(conn)
+            and migrate_v5(conn)):
+        migrate_v6(conn)
 
 
 def migrate_v2(conn):
@@ -299,6 +315,21 @@ def migrate_v5(conn):
     if "name" not in table_columns(conn, "projects"):
         return False  # next connect retries; the stamp stays at 4
     conn.commit()
+    conn.execute("PRAGMA user_version=5")
+    return True
+
+
+def migrate_v6(conn):
+    """v5 -> v6: per-event agent metrics — `events.api_calls` and
+    `events.ctx_tokens` (NULL = unknown on pre-v6 rows). Same discipline."""
+    for table, col, coltype in V6_COLUMNS:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+        except sqlite3.OperationalError:
+            pass  # duplicate column, or a transient failure the check catches
+    if not {"api_calls", "ctx_tokens"} <= event_columns(conn):
+        return False  # next connect retries; the stamp stays at 5
+    conn.commit()
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     return True
 
@@ -377,11 +408,12 @@ def insert_events(conn, project, session_uuid, kind_hint, agent, groups,
         conn.execute(
             "INSERT INTO events(ts, session_id, kind, agent, model_id,"
             " in_tok, out_tok, cache_r, cache_w, cache_w_1h, dur_ms, branch,"
-            " commit_sha, issue_key, task_size, note)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " commit_sha, issue_key, task_size, note, api_calls, ctx_tokens)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ts, session_id, kind, row_agent, model_id,
              g["in"], g["out"], g["cr"], g["cw"], g.get("cw1h", 0), dur,
-             branch, commit_sha, issue_key, task_size, row_note))
+             branch, commit_sha, issue_key, task_size, row_note,
+             g.get("calls"), g.get("ctx")))
     return session_id
 
 

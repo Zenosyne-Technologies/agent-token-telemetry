@@ -406,7 +406,7 @@
       </section>
 
       <section class="card glass wide tbl-card" aria-labelledby="h-proj">
-        <div class="card-hd"><h2 id="h-proj">Projects</h2><span class="cap" id="proj-filter"></span></div>
+        <div class="card-hd"><h2 id="h-proj">Projects</h2><div class="miniseg" id="pview" role="group" aria-label="Projects table detail"><button data-v="split" aria-pressed="true">Detailed</button><button data-v="sum" aria-pressed="false">Summary</button></div><span class="cap" id="proj-filter"></span></div>
         <div class="tbl-scroll"><table id="ptbl">
           <thead><tr>
             <th data-k="pj">Project<span class="ar">&#8597;</span></th>
@@ -425,7 +425,7 @@
     </div>
 
     <section class="card glass wide tbl-card" aria-labelledby="h-tbl">
-      <div class="card-hd"><h2 id="h-tbl">Events</h2><span class="cap">Click a column to sort. Reflects the active filters.</span></div>
+      <div class="card-hd"><h2 id="h-tbl">Events</h2><div class="miniseg" id="eview" role="group" aria-label="Events table detail"><button data-v="split" aria-pressed="true">Detailed</button><button data-v="sum" aria-pressed="false">Summary</button></div><span class="cap">Click a column to sort. Reflects the active filters.</span></div>
       <div class="tbl-scroll"><table id="tbl">
         <thead><tr>
           <th data-k="ts">Time<span class="ar">&#8597;</span></th>
@@ -433,6 +433,8 @@
           <th data-k="model">Model<span class="ar">&#8597;</span></th>
           <th data-k="agent">Agent<span class="ar">&#8597;</span></th>
           <th data-k="kind">Type<span class="ar">&#8597;</span></th>
+          <th data-k="calls" class="num" title="API calls in this slice (per-agent or per-turn)">Calls<span class="ar">&#8597;</span></th>
+          <th data-k="ctx" class="num" title="context size when the slice ended — input side of its last API call (matches Claude Code's own token gauge)">Context<span class="ar">&#8597;</span></th>
           <th data-k="total" class="num" title="input + output + cache read + cache write">Total tok<span class="ar">&#8597;</span></th>
           <th data-k="cost" class="num" title="total estimated cost">Total cost<span class="ar">&#8597;</span></th>
           <th data-k="consumed" class="num" title="input + output tokens">Consumed<span class="ar">&#8597;</span></th>
@@ -495,6 +497,7 @@
     period:"week", metric:"cost", comp:"tokens",
     models:null, agents:null, project:null,            // null = all
     sort:{k:"ts",dir:"desc"}, projSort:{k:"cost",dir:"desc"},
+    pview:"split", eview:"split",                      // detailed vs summary tables
     page:0, pageSize:12, refreshMs:300000
   };
 
@@ -509,6 +512,7 @@
   // token cells render as "total (input/output)" — input side is everything
   // ingested for that measure, right side what came back or was written
   const tokSplit=(t,l,r,f)=>{ f=f||fmtTok; return `${f(t)} <span class="tsplit">(${fmtTok(l)}/${fmtTok(r)})</span>`; };
+  const usdSplit=(t,l,r)=>`${fmtUSD(t)} <span class="tsplit">(${fmtUSD(l)}/${fmtUSD(r)})</span>`;
   function fmtTok(n){ n=Math.round(n);
     if(n>=1e9)return (n/1e9).toFixed(2)+"B";
     if(n>=1e6)return (n/1e6).toFixed(2)+"M";
@@ -666,7 +670,7 @@
     const grand=groups.reduce((s,g)=>s+g.cost,0)||1e-9;
     const rows=groups.slice().sort((a,b)=> k==="pj"? a.name.localeCompare(b.name)*sgn : (a[k]-b[k])*sgn);
     $("pbody").innerHTML=rows.map(r=>{ const sel=state.project===r.key, share=r.cost/grand*100;
-      return `<tr class="prow${sel?" sel":""}${r.n===0?" zero":""}" data-k="${encodeURIComponent(r.key)}" tabindex="0" role="button" aria-pressed="${sel}"><td><span class="pjname">${sel?'<span class="pin">\u25cf</span>':""}${esc(r.name)}</span></td><td class="num">${r.n}</td><td class="num">${tokSplit(r.total, r["in"]+r.cache_r+r.cache_w, r.out)}</td><td class="num">${fmtUSD(r.cost)}</td><td class="num">${tokSplit(r.consumed, r["in"], r.out)}</td><td class="num">${tokSplit(r.cachetok, r.cache_r, r.cache_w)}</td><td class="num">${fmtUSD(r.costConsumed)}</td><td class="num">${fmtUSD(r.costCache)}</td><td class="sharecell"><div class="sharewrap"><div class="sharebar"><i style="width:${share.toFixed(1)}%"></i></div><span class="sharepct">${share.toFixed(1)}%</span></div></td></tr>`;
+      return `<tr class="prow${sel?" sel":""}${r.n===0?" zero":""}" data-k="${encodeURIComponent(r.key)}" tabindex="0" role="button" aria-pressed="${sel}"><td><span class="pjname">${sel?'<span class="pin">\u25cf</span>':""}${esc(r.name)}</span></td><td class="num">${r.n}</td><td class="num">${state.pview==="split"?tokSplit(r.total, r["in"]+r.cache_r+r.cache_w, r.out):fmtTok(r.total)}</td><td class="num">${state.pview==="split"?usdSplit(r.cost, r.cost-r.costOut, r.costOut):fmtUSD(r.cost)}</td><td class="num">${state.pview==="split"?tokSplit(r.consumed, r["in"], r.out):fmtTok(r.consumed)}</td><td class="num">${state.pview==="split"?tokSplit(r.cachetok, r.cache_r, r.cache_w):fmtTok(r.cachetok)}</td><td class="num">${state.pview==="split"?usdSplit(r.costConsumed, r.costIn, r.costOut):fmtUSD(r.costConsumed)}</td><td class="num">${state.pview==="split"?usdSplit(r.costCache, r.costCacheR, r.costCacheW):fmtUSD(r.costCache)}</td><td class="sharecell"><div class="sharewrap"><div class="sharebar"><i style="width:${share.toFixed(1)}%"></i></div><span class="sharepct">${share.toFixed(1)}%</span></div></td></tr>`;
     }).join("") || `<tr><td colspan="9" class="empty">No projects in range.</td></tr>`;
     $("pbody").querySelectorAll(".prow").forEach(tr=>{ const key=decodeURIComponent(tr.dataset.k);
       const toggle=()=>{ state.project=state.project===key?null:key; state.page=0; load(); };
@@ -682,8 +686,8 @@
   // ---- events table (server-paginated + server-sorted) ----
   function renderTable(ev){
     $("tbody").innerHTML=ev.rows.map(e=>{ const sub=e.kind===1;
-      return `<tr><td class="num">${fmtTime(e.ts)}</td><td>${esc(e.project)}</td><td><span class="mdl"><span class="sw" style="background:${colorFor("model",e.model)}"></span>${esc(e.modelName)}</span></td><td>${esc(e.agent)}</td><td><span class="pill${sub?" sub":""}">${sub?"Sub-agent":"Turn"}</span></td><td class="num">${tokSplit(e.total, e["in"]+e.cache_r+e.cache_w, e.out, fmtInt)}</td><td class="num">${fmtUSD(e.cost)}</td><td class="num">${tokSplit(e.consumed, e["in"], e.out, fmtInt)}</td><td class="num">${tokSplit(e.cachetok, e.cache_r, e.cache_w, fmtInt)}</td><td class="num">${fmtUSD(e.costConsumed)}</td><td class="num">${fmtUSD(e.costCache)}</td></tr>`;
-    }).join("") || `<tr><td colspan="11" class="empty">No events match the filters.</td></tr>`;
+      return `<tr><td class="num">${fmtTime(e.ts)}</td><td>${esc(e.project)}</td><td><span class="mdl"><span class="sw" style="background:${colorFor("model",e.model)}"></span>${esc(e.modelName)}</span></td><td>${esc(e.agent)}</td><td><span class="pill${sub?" sub":""}">${sub?"Sub-agent":"Turn"}</span></td><td class="num">${e.calls==null?"—":fmtInt(e.calls)}</td><td class="num">${e.ctx==null?"—":fmtTok(e.ctx)}</td><td class="num">${state.eview==="split"?tokSplit(e.total, e["in"]+e.cache_r+e.cache_w, e.out, fmtInt):fmtInt(e.total)}</td><td class="num">${state.eview==="split"?usdSplit(e.cost, e.cost-e.costOut, e.costOut):fmtUSD(e.cost)}</td><td class="num">${state.eview==="split"?tokSplit(e.consumed, e["in"], e.out, fmtInt):fmtInt(e.consumed)}</td><td class="num">${state.eview==="split"?tokSplit(e.cachetok, e.cache_r, e.cache_w, fmtInt):fmtInt(e.cachetok)}</td><td class="num">${state.eview==="split"?usdSplit(e.costConsumed, e.costIn, e.costOut):fmtUSD(e.costConsumed)}</td><td class="num">${state.eview==="split"?usdSplit(e.costCache, e.costCacheR, e.costCacheW):fmtUSD(e.costCache)}</td></tr>`;
+    }).join("") || `<tr><td colspan="13" class="empty">No events match the filters.</td></tr>`;
     [...document.querySelectorAll("#tbl thead th")].forEach(th=>{ const on=th.dataset.k===state.sort.k; th.toggleAttribute("data-sorted",on); const ar=th.querySelector(".ar"); if(ar)ar.textContent=on?(state.sort.dir==="desc"?"\u2193":"\u2191"):"\u2195"; });
     const total=ev.total, pages=Math.max(1,Math.ceil(total/ev.pageSize)), from=total?ev.start+1:0, to=Math.min(ev.start+ev.pageSize,total);
     $("tfoot-l").innerHTML=`<button class="pgbtn" id="pg-prev"${ev.page<=0?" disabled":""}>&larr; Prev</button><span class="pginfo">${from}\u2013${to} of ${total}</span><button class="pgbtn" id="pg-next"${ev.page>=pages-1?" disabled":""}>Next &rarr;</button>`;
@@ -717,6 +721,8 @@
   // ---- wiring ----
   document.querySelectorAll("#period button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#period button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.period=b.dataset.p; state.models=null; state.agents=null; state.project=null; state.page=0; load(); }));
   document.querySelectorAll("#metric button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#metric button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.metric=b.dataset.m; if(D){ renderBars("bars-model",D.byModel,"model"); renderBars("bars-agent",D.byAgent,"agent"); renderTimeline(D.timeline); renderComp(D.composition); const cm=metricName(state.metric); $("cap-model").textContent="by "+cm; $("cap-agent").textContent="by "+cm; } }));
+  document.querySelectorAll("#pview button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#pview button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.pview=b.dataset.v; if(D) renderProjects(D.byProject); }));
+  document.querySelectorAll("#eview button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#eview button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.eview=b.dataset.v; if(D) renderTable(D.events); }));
   document.querySelectorAll("#comp-mode button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#comp-mode button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.comp=b.dataset.c; if(D) renderComp(D.composition); }));
   document.querySelectorAll("#ptbl thead th").forEach(th=>th.addEventListener("click",()=>{ const k=th.dataset.k; if(!k)return; if(state.projSort.k===k) state.projSort.dir=state.projSort.dir==="desc"?"asc":"desc"; else { state.projSort.k=k; state.projSort.dir=k==="pj"?"asc":"desc"; } if(D) renderProjects(D.byProject); }));
   document.querySelectorAll("#tbl thead th").forEach(th=>th.addEventListener("click",()=>{ const k=th.dataset.k; if(state.sort.k===k) state.sort.dir=state.sort.dir==="desc"?"asc":"desc"; else { state.sort.k=k; state.sort.dir=(k==="ts"||k==="project"||k==="model"||k==="agent")?"asc":"desc"; } state.page=0; load(); }));
