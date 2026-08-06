@@ -398,10 +398,38 @@ def cmd_serve(port):
         pass
     finally:
         stop.set()
-        try:            # clear the runtime marker so the next `open` starts fresh
-            runtime_path().unlink()
+        # The runtime marker is deliberately left in place: `dashboard-restart`
+        # reuses its port so the still-open browser tab reconnects to the same
+        # URL. A stale marker (dead pid) is harmless — `open`'s reattach check
+        # requires a live pid, and `stop` clears the file explicitly.
+
+
+def _spawn_detached(port):
+    """Start `serve` on `port` as a detached background process; record pid+port."""
+    logf = open(runtime_path().parent / "dashboard.log", "a")
+    proc = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "serve", "--port", str(port)],
+        stdout=logf, stderr=logf, start_new_session=True)
+    for _ in range(60):
+        if _port_open(port):
+            break
+        time.sleep(0.1)
+    runtime_path().write_text(json.dumps(
+        {"pid": proc.pid, "port": port, "started": int(time.time())}))
+    return proc.pid
+
+
+def _stop_running(rt, port):
+    """SIGTERM a live server from `rt` and wait for `port` to be released."""
+    if rt and _pid_alive(rt.get("pid", -1)):
+        try:
+            os.kill(rt["pid"], signal.SIGTERM)
         except OSError:
             pass
+        for _ in range(50):
+            if not _port_open(port):
+                break
+            time.sleep(0.1)
 
 
 def cmd_open(port, no_browser):
@@ -413,21 +441,25 @@ def cmd_open(port, no_browser):
         print(f"Token-telemetry dashboard already running at {url}")
         return
     port = _free_port(port)
-    logf = open(runtime_path().parent / "dashboard.log", "a")
-    proc = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "serve", "--port", str(port)],
-        stdout=logf, stderr=logf, start_new_session=True)
-    for _ in range(60):
-        if _port_open(port):
-            break
-        time.sleep(0.1)
-    runtime_path().write_text(json.dumps(
-        {"pid": proc.pid, "port": port, "started": int(time.time())}))
+    pid = _spawn_detached(port)
     url = f"http://127.0.0.1:{port}/"
     if not no_browser:
         _open_browser(url)
     print(f"Token-telemetry dashboard running at {url}")
-    print(f"(background pid {proc.pid} — stop with: python3 dashboard.py stop)")
+    print(f"(background pid {pid} — stop with: python3 dashboard.py stop)")
+
+
+def cmd_restart(port):
+    """Restart the server on the SAME port the open tab is polling, WITHOUT
+    opening a second browser tab. The tab's connection-lost modal reconnects on
+    its own once the port is serving again."""
+    rt = _read_runtime()
+    target = rt["port"] if rt else port
+    _stop_running(rt, target)
+    target = _free_port(target)
+    pid = _spawn_detached(target)
+    print(f"Token-telemetry dashboard server restarted at http://127.0.0.1:{target}/")
+    print(f"(background pid {pid} — no new tab opened; your open dashboard reconnects automatically)")
 
 
 def cmd_stop():
@@ -454,11 +486,15 @@ def main(argv=None):
     op.add_argument("--no-browser", action="store_true")
     sv = sub.add_parser("serve", help="run the blocking server (internal)")
     sv.add_argument("--port", type=int, default=8756)
+    rs = sub.add_parser("restart", help="restart the server in place (no new browser tab)")
+    rs.add_argument("--port", type=int, default=8756)
     sub.add_parser("stop", help="stop a backgrounded dashboard server")
     args = ap.parse_args(argv)
 
     if args.command == "serve":
         cmd_serve(args.port)
+    elif args.command == "restart":
+        cmd_restart(args.port)
     elif args.command == "stop":
         cmd_stop()
     else:  # default: open
