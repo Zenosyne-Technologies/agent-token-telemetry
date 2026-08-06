@@ -44,7 +44,7 @@ the telemetry dogfoods the conventions it joins against.
 ## Install
 
 ```
-claude plugin marketplace add zenosyne-technologies/agent-operating-kit
+claude plugin marketplace add Zenosyne-Technologies/emprove-marketplace
 claude plugin install token-telemetry@emprove
 ```
 
