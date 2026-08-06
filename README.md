@@ -48,7 +48,7 @@ claude plugin marketplace add Zenosyne-Technologies/emprove-marketplace
 claude plugin install token-telemetry@emprove
 ```
 
-Restart Claude Code (hooks load at session start). Standalone (no marketplace):
+**Restart Claude Code after installing — this is not optional**: capture hooks load only at session start, so sessions before a restart are silently not recorded (the most common "why is nothing logged?" cause; `/token-telemetry:info` diagnoses it). Standalone (no marketplace):
 
 ```
 claude plugin marketplace add /path/to/agent-token-telemetry
