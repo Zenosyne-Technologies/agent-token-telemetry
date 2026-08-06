@@ -66,7 +66,8 @@ def aggregate(entries):
         model = msg.get("model") or "unknown"
         side = 1 if e.get("isSidechain") else 0
         g = groups.setdefault((model, side), {
-            "in": 0, "out": 0, "cr": 0, "cw": 0, "first": None, "last": None,
+            "in": 0, "out": 0, "cr": 0, "cw": 0, "cw1h": 0,
+            "first": None, "last": None,
             "_by_id": {}, "_no_id": [],
         })
         mid = msg.get("id")
@@ -89,7 +90,15 @@ def aggregate(entries):
             g["in"] += usage.get("input_tokens") or 0
             g["out"] += usage.get("output_tokens") or 0
             g["cr"] += usage.get("cache_read_input_tokens") or 0
-            g["cw"] += usage.get("cache_creation_input_tokens") or 0
+            # cw stays the TTL-agnostic total; cw1h carries the 1-hour portion
+            # (billed at 2x input vs 1.25x for 5m) when the API splits it out.
+            cc = usage.get("cache_creation") or {}
+            cw = usage.get("cache_creation_input_tokens")
+            if cw is None:
+                cw = ((cc.get("ephemeral_5m_input_tokens") or 0)
+                      + (cc.get("ephemeral_1h_input_tokens") or 0))
+            g["cw"] += cw or 0
+            g["cw1h"] += cc.get("ephemeral_1h_input_tokens") or 0
     return groups
 
 
@@ -126,19 +135,21 @@ CREATE TABLE IF NOT EXISTS pricing(
   out_usd        REAL,
   cache_r_usd    REAL,
   cache_w_usd    REAL,
+  cache_w_1h_usd REAL,
   effective_from INTEGER NOT NULL,
   source         TEXT,
   UNIQUE(provider, model_prefix, model_version, effective_from));
 """
 
-# USD per 1M tokens: input, output, cache read, cache write. Prefixes (not full
-# model names) so a new dated release prices correctly on longest-prefix match.
-# effective_from 0: the seed applies to all history until a dated row supersedes it.
+# USD per 1M tokens: input, output, cache read, 5m cache write (1.25x input),
+# 1h cache write (2x input). Prefixes (not full model names) so a new dated
+# release prices correctly on longest-prefix match. effective_from 0: the seed
+# applies to all history until a dated row supersedes it.
 PRICING_SEED = [
-    ("anthropic", "claude-fable-", 10.0, 50.0, 1.00, 12.50),
-    ("anthropic", "claude-opus-", 5.0, 25.0, 0.50, 6.25),
-    ("anthropic", "claude-sonnet-", 3.0, 15.0, 0.30, 3.75),
-    ("anthropic", "claude-haiku-", 1.0, 5.0, 0.10, 1.25),
+    ("anthropic", "claude-fable-", 10.0, 50.0, 1.00, 12.50, 20.0),
+    ("anthropic", "claude-opus-", 5.0, 25.0, 0.50, 6.25, 10.0),
+    ("anthropic", "claude-sonnet-", 3.0, 15.0, 0.30, 3.75, 6.0),
+    ("anthropic", "claude-haiku-", 1.0, 5.0, 0.10, 1.25, 2.0),
 ]
 SEED_SOURCE = "seed-v0.2.0"
 
@@ -155,7 +166,12 @@ V2_COLUMNS = ("issue_key", "task_size", "note")
 # timestamp of the last capture that was configured to write one.
 V3_PROJECT_COLUMNS = (("mirror_path", "TEXT"), ("mirror_last_at", "INTEGER"))
 MIRROR_META = {col for col, _ in V3_PROJECT_COLUMNS}
-SCHEMA_VERSION = 3
+# v4: cache writes split by TTL. events.cache_w stays the total; cache_w_1h is
+# the 1-hour portion (5m portion = cache_w - cache_w_1h). pricing gains the 1h
+# write rate; NULL there means unknown and cost queries fall back to cache_w_usd.
+V4_COLUMNS = (("events", "cache_w_1h", "INTEGER NOT NULL DEFAULT 0"),
+              ("pricing", "cache_w_1h_usd", "REAL"))
+SCHEMA_VERSION = 4
 
 
 def table_columns(conn, table):
@@ -184,12 +200,14 @@ def migrate(conn):
     if (conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION
             and set(V2_COLUMNS) <= event_columns(conn)
             and MIRROR_META <= table_columns(conn, "projects")
-            and has_table(conn, "audit_log")):
+            and has_table(conn, "audit_log")
+            and "cache_w_1h" in event_columns(conn)
+            and "cache_w_1h_usd" in table_columns(conn, "pricing")):
         return
     # Hops run in sequence and each returns whether its shape actually landed:
     # v3 must never be attempted - let alone stamped - on a DB that failed v2.
-    if migrate_v2(conn):
-        migrate_v3(conn)
+    if migrate_v2(conn) and migrate_v3(conn):
+        migrate_v4(conn)
 
 
 def migrate_v2(conn):
@@ -213,8 +231,9 @@ def migrate_v2(conn):
                         (SEED_SOURCE,)).fetchone():
         conn.executemany(
             "INSERT OR IGNORE INTO pricing(provider, model_prefix, in_usd,"
-            " out_usd, cache_r_usd, cache_w_usd, effective_from, source)"
-            " VALUES (?,?,?,?,?,?,0,?)",
+            " out_usd, cache_r_usd, cache_w_usd, cache_w_1h_usd,"
+            " effective_from, source)"
+            " VALUES (?,?,?,?,?,?,?,0,?)",
             [(*row, SEED_SOURCE) for row in PRICING_SEED])
     # Commit the data before stamping the version: a crash in between leaves
     # user_version < 2, and the next connect simply migrates again. Also leaves
@@ -238,6 +257,27 @@ def migrate_v3(conn):
     if not (MIRROR_META <= table_columns(conn, "projects")
             and has_table(conn, "audit_log")):
         return False  # next connect retries; the stamp stays at 2
+    conn.commit()
+    conn.execute("PRAGMA user_version=3")
+    return True
+
+
+def migrate_v4(conn):
+    """v3 -> v4: cache writes split by TTL — `events.cache_w_1h` (the 1-hour
+    portion; `cache_w` stays the TTL-agnostic total, so every pre-v4 query
+    keeps working) and `pricing.cache_w_1h_usd` (NULL = unknown; cost queries
+    fall back to `cache_w_usd`, which is exactly the pre-v4 estimate). Same
+    discipline: idempotent ALTERs, post-condition verified before the stamp.
+    A fresh DB's pricing table is created with the column already (the CREATE
+    lives in PRICING_SCHEMA), so its ALTER lands in the except arm here."""
+    for table, col, coltype in V4_COLUMNS:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+        except sqlite3.OperationalError:
+            pass  # duplicate column, or a transient failure the check catches
+    if not ("cache_w_1h" in event_columns(conn)
+            and "cache_w_1h_usd" in table_columns(conn, "pricing")):
+        return False  # next connect retries; the stamp stays at 3
     conn.commit()
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     return True
@@ -298,12 +338,12 @@ def insert_events(conn, project, session_uuid, kind_hint, agent, groups,
         ts = int(g["last"]) if g["last"] is not None else int(time.time())
         conn.execute(
             "INSERT INTO events(ts, session_id, kind, agent, model_id,"
-            " in_tok, out_tok, cache_r, cache_w, dur_ms, branch, commit_sha,"
-            " issue_key, task_size, note)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " in_tok, out_tok, cache_r, cache_w, cache_w_1h, dur_ms, branch,"
+            " commit_sha, issue_key, task_size, note)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ts, session_id, kind, agent, model_id,
-             g["in"], g["out"], g["cr"], g["cw"], dur, branch, commit_sha,
-             issue_key, task_size, note))
+             g["in"], g["out"], g["cr"], g["cw"], g.get("cw1h", 0), dur,
+             branch, commit_sha, issue_key, task_size, note))
     return session_id
 
 
