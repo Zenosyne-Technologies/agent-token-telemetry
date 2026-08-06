@@ -353,6 +353,11 @@ def insert_events(conn, project, session_uuid, kind_hint, agent, groups,
     for (model, side), g in groups.items():
         model_id = get_or_create(conn, "models", "name", model)
         kind = 1 if (kind_hint or side) else 0
+        # The agent label belongs to sub-agent rows only: a main-loop row must
+        # never wear the name of whatever sub-agent happened to trigger the
+        # firing (the SubagentStop payload names the agent, but the MAIN
+        # transcript it points at holds orchestrator work).
+        row_agent = agent if kind else None
         dur = (int((g["last"] - g["first"]) * 1000)
                if g["first"] is not None else None)
         ts = int(g["last"]) if g["last"] is not None else int(time.time())
@@ -361,7 +366,7 @@ def insert_events(conn, project, session_uuid, kind_hint, agent, groups,
             " in_tok, out_tok, cache_r, cache_w, cache_w_1h, dur_ms, branch,"
             " commit_sha, issue_key, task_size, note)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (ts, session_id, kind, agent, model_id,
+            (ts, session_id, kind, row_agent, model_id,
              g["in"], g["out"], g["cr"], g["cw"], g.get("cw1h", 0), dur,
              branch, commit_sha, issue_key, task_size, note))
     return session_id
@@ -406,6 +411,72 @@ def record(conn, project, session_uuid, kind_hint, agent, groups,
             "INSERT INTO cursors(transcript, offset, session_id) VALUES (?,?,?)"
             " ON CONFLICT(transcript) DO UPDATE SET offset=excluded.offset",
             (str(transcript), new_offset, session_id))
+
+
+# At most this many sub-agent transcript files advance per hook firing, so a
+# large backlog (the first sweep after upgrading, or a subagent-heavy session)
+# cannot blow the hook timeout — the remainder lands on subsequent firings.
+SUBAGENT_BATCH = 40
+
+
+def subagents_dir(transcript):
+    """The harness writes each sub-agent's transcript to
+    `<dir>/<session-id>/subagents/agent-<id>.jsonl` beside the main transcript;
+    the SubagentStop hook itself only carries the MAIN transcript path."""
+    p = Path(transcript)
+    return p.parent / p.stem / "subagents"
+
+
+def subagent_label(jsonl_path):
+    """agentType from the sibling `.meta.json` (e.g. 'marvin:developer').
+    None on any problem — the hook payload's agent field is the fallback."""
+    try:
+        with open(jsonl_path.with_name(jsonl_path.stem + ".meta.json")) as f:
+            label = json.load(f).get("agentType")
+        return label if isinstance(label, str) and label else None
+    except Exception:
+        return None
+
+
+def sweep_subagents(conn, project, session_uuid, transcript, meta,
+                    hook_agent):
+    """Capture new usage from the session's sub-agent transcript files —
+    per-file cursors, one kind=1 event batch per file, labeled from its
+    meta.json. Bounded by SUBAGENT_BATCH per firing. Wraps its own BEGIN
+    IMMEDIATE (the caller's main-transcript transaction has already
+    committed). Returns the inserted event-arg tuples for mirroring."""
+    d = subagents_dir(transcript)
+    try:
+        files = sorted(p for p in d.iterdir() if p.suffix == ".jsonl")
+    except OSError:
+        return []  # no subagents directory — nothing to sweep
+    inserted = []
+    conn.execute("BEGIN IMMEDIATE")
+    with conn:
+        for f in files:
+            if len(inserted) >= SUBAGENT_BATCH:
+                break
+            offset = get_offset(conn, f)
+            try:
+                if f.stat().st_size <= offset:
+                    continue  # nothing new — skip without opening the file
+            except OSError:
+                continue
+            entries, new_offset = read_new_entries(f, offset)
+            groups = aggregate(entries)
+            if not groups and new_offset == offset:
+                continue
+            event_args = (project, session_uuid, 1,
+                          subagent_label(f) or hook_agent, groups)
+            session_id = insert_events(conn, *event_args, *meta)
+            conn.execute(
+                "INSERT INTO cursors(transcript, offset, session_id)"
+                " VALUES (?,?,?)"
+                " ON CONFLICT(transcript) DO UPDATE SET offset=excluded.offset",
+                (str(f), new_offset, session_id))
+            if groups:
+                inserted.append(event_args)
+    return inserted
 
 
 def mirror_events(root, *args, **kwargs):
@@ -614,7 +685,7 @@ def main():
         # mirror metadata (below) and the same decision gates the mirror write.
         project_mode = read_storage_mode(root) == STORAGE_PROJECT
         conn = connect(db_path())
-        mirror_args = None
+        mirror_batch = []
         try:
             # Take the write lock up front so concurrent hook firings on the
             # same transcript serialize instead of racing the cursor
@@ -625,39 +696,48 @@ def main():
             offset = get_offset(conn, transcript)
             entries, new_offset = read_new_entries(transcript, offset)
             groups = aggregate(entries)
-            if not groups and new_offset == offset:
-                conn.rollback()
-                return
-            kind_hint = 1 if hook.get("hook_event_name") == "SubagentStop" else 0
+            # The MAIN transcript always holds main-loop work (kind 0): the
+            # SubagentStop payload names an agent but points at the main
+            # transcript — sub-agent usage lives in its own file and is swept
+            # below. Old-harness inline sidechain lines still yield kind=1
+            # groups via their side flag, labeled with the payload agent.
             agent = hook.get("agent_type") or hook.get("agent_name")
-            # Built once and shared with the mirror call below, so the two
-            # writes cannot drift into recording different rows.
-            event_args = (str(root), hook.get("session_id") or "unknown",
-                          kind_hint, agent, groups)
             meta = (branch, sha, issue_key, sidecar_text(ctx.get("size")),
                     sidecar_text(ctx.get("summary")))
-            # Gated on `groups` for the same reason the mirror write below is:
-            # a turn with no usage entries mirrors nothing, so there is no event
-            # timestamp to stamp - `latest_event_ts` would fall back to `now`
-            # and record a mirror that was never written for an event that does
-            # not exist.
-            record(conn, *event_args, transcript, new_offset, *meta,
-                   mirror_path=(mirror_db_path(root)
-                                if project_mode and groups else None))
+            if groups or new_offset != offset:
+                # Built once and shared with the mirror call below, so the two
+                # writes cannot drift into recording different rows.
+                event_args = (str(root), hook.get("session_id") or "unknown",
+                              0, agent, groups)
+                # Gated on `groups` like the mirror write: a turn with no usage
+                # entries mirrors nothing, so there is no event timestamp to
+                # stamp — `latest_event_ts` would fall back to `now` and record
+                # a mirror that was never written for an event that does not
+                # exist.
+                record(conn, *event_args, transcript, new_offset, *meta,
+                       mirror_path=(mirror_db_path(root)
+                                    if project_mode and groups else None))
+                if groups:
+                    mirror_batch.append((*event_args, *meta))
+            else:
+                conn.rollback()
             stamp_project_name(conn, root, kit_name)
-            if groups:
-                mirror_args = (*event_args, *meta)
+            for swept in sweep_subagents(
+                    conn, str(root), hook.get("session_id") or "unknown",
+                    transcript, meta, agent):
+                mirror_batch.append((*swept, *meta))
         finally:
             conn.close()
         # Only now, with the central transaction committed and its connection
         # closed, is the project-local copy attempted - and any failure of it is
         # logged and dropped: the mirror exists for retention and portability,
         # never at the cost of the authoritative write or the session.
-        if mirror_args and project_mode:
-            try:
-                mirror_events(root, *mirror_args)
-            except Exception:
-                log_error(f"mirror write failed: {mirror_db_path(root)}")
+        if mirror_batch and project_mode:
+            for args in mirror_batch:
+                try:
+                    mirror_events(root, *args)
+                except Exception:
+                    log_error(f"mirror write failed: {mirror_db_path(root)}")
     except Exception:
         if enabled:
             log_error()
