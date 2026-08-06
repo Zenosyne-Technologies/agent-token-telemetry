@@ -69,5 +69,7 @@ marker or a config file here.** If something is absent, say so and move on.
      s.project_id = p.id JOIN events e ON e.session_id = s.id GROUP BY path;` against
      the mirror.
 
+**Diagnostic**: when this project is enabled but the central DB has ZERO events for this project's path (or doesn't exist), say the likely cause first: the capture hooks were not loaded when this session started — restart Claude Code after installing the plugin or enabling telemetry; capture begins next session.
+
 Present it as a compact status block: plugin version, project opt-in + mode + sidecar,
 central DB line, mirror DB line. No recommendations beyond the two named above.

@@ -14,6 +14,8 @@ no files are written, until a project explicitly opts in.
 
 ## Turning it on
 
+> **Restart required**: capture hooks load when a Claude Code session starts. After installing the plugin (or enabling telemetry for the first time), restart Claude Code — sessions before the restart are silently not recorded. `/token-telemetry:info` will tell you when this is the likely cause.
+
 Run `/token-telemetry:enable` in the project. This creates a marker file at
 `.claude/telemetry` inside the project's git root. From then on, every
 completed turn and every subagent run in that project is recorded automatically
