@@ -356,6 +356,104 @@ def render_token_stats(d):
     return "\n".join(out)
 
 
+# -------------------------------------------------------------- storage-status
+
+def db_family_size(path):
+    """DB file plus its -wal/-shm siblings; unchecked-pointed WAL can hold a
+    large share of the data."""
+    total = 0
+    for p in (path, f"{path}-wal", f"{path}-shm"):
+        try:
+            total += Path(p).stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024.0
+
+
+def fetch_storage_status(conn, db):
+    d = {"db": str(db), "size": db_family_size(db),
+         "schema": conn.execute("PRAGMA user_version").fetchone()[0],
+         "events": conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]}
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(projects)")}
+    mirror = {"mirror_path", "mirror_last_at"} <= cols
+    d["pre_v3"] = not mirror
+    mp = "p.mirror_path" if mirror else "NULL"
+    ml = "p.mirror_last_at" if mirror else "NULL"
+    d["projects"] = []
+    for path, events, mirror_path, mirror_last in conn.execute(
+            f"SELECT p.path, COUNT(e.rowid), {mp}, {ml}"
+            " FROM projects p"
+            " LEFT JOIN sessions s ON s.project_id = p.id"
+            " LEFT JOIN events e ON e.session_id = s.id"
+            " GROUP BY p.id, p.path ORDER BY COUNT(e.rowid) DESC"):
+        row = {"path": path, "events": events, "mirror_path": mirror_path,
+               "mirror_last_at": mirror_last, "mirror_size": None}
+        if mirror_path:
+            row["mirror_size"] = (db_family_size(mirror_path)
+                                  if Path(mirror_path).exists() else None)
+        d["projects"].append(row)
+    d["audit"] = (conn.execute(
+        "SELECT datetime(ts,'unixepoch'), action, project, detail"
+        " FROM audit_log ORDER BY ts DESC LIMIT 5").fetchall()
+        if has_column(conn, "audit_log", "action") else [])
+    err = Path(db).parent / "error.log"
+    d["error_log"] = None
+    if err.exists():
+        st = err.stat()
+        d["error_log"] = {"size": st.st_size,
+                          "mtime": datetime.datetime.fromtimestamp(st.st_mtime)
+                          .strftime("%Y-%m-%d %H:%M")}
+    return d
+
+
+def render_storage_status(d):
+    out = ["### Central DB", "",
+           "| path | size (incl. -wal/-shm) | events | schema |",
+           "|---|---|---:|---|",
+           f"| `{d['db']}` | {fmt_bytes(d['size'])} | {fmt_n(d['events'])} |"
+           f" v{d['schema']} |",
+           "", "### Projects", "",
+           "| project | events | mirror? | mirror size | last mirrored |",
+           "|---|---:|---|---|---|"]
+    any_mirror = False
+    for p in d["projects"]:
+        if p["mirror_path"]:
+            any_mirror = True
+            size = (fmt_bytes(p["mirror_size"]) if p["mirror_size"] is not None
+                    else "not accessible on this machine")
+            last = (humanize(datetime.date.fromtimestamp(
+                p["mirror_last_at"]).isoformat())
+                if p["mirror_last_at"] else "—")
+            out.append(f"| `{p['path']}` | {fmt_n(p['events'])} | yes |"
+                       f" {size} | {last} |")
+        else:
+            out.append(f"| `{p['path']}` | {fmt_n(p['events'])} | no | — | — |")
+    if d["pre_v3"]:
+        out += ["", "This DB predates the mirror columns (schema < 3); it"
+                " upgrades on its next captured turn."]
+    if any_mirror:
+        out += ["", "`last mirrored` is configured state, not a write receipt"
+                " — a recent value with a missing or stale mirror file means"
+                " mirror writes are failing (check the error log)."]
+    if d["error_log"]:
+        out += ["", f"Error log: {d['error_log']['size']} bytes, last written"
+                f" {d['error_log']['mtime']} (capture and mirror failures land"
+                " there)."]
+    if d["audit"]:
+        out += ["", "Last storage-management actions:", ""]
+        out += md_table(["at", "action", "project", "detail"],
+                        ["---", "---", "---", "---"],
+                        [[a, b, f"`{c}`", e or ""] for a, b, c, e in d["audit"]])
+    return "\n".join(out)
+
+
 # ------------------------------------------------------------------------ info
 
 def fetch_info(conn, db, cwd):
@@ -502,7 +600,8 @@ def render_info(d):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="report.py")
-    ap.add_argument("command", choices=["info", "project-stats", "token-stats"])
+    ap.add_argument("command", choices=["info", "project-stats", "token-stats",
+                                        "storage-status"])
     ap.add_argument("--cwd", default=os.getcwd())
     ap.add_argument("--db", default=None)
     args = ap.parse_args(argv)
@@ -517,6 +616,8 @@ def main(argv=None):
                   " restart Claude Code so the hooks load).")
         elif args.command == "project-stats":
             print(render_project_stats(fetch_project_stats(conn)))
+        elif args.command == "storage-status":
+            print(render_storage_status(fetch_storage_status(conn, db)))
         else:
             print(render_token_stats(fetch_token_stats(conn)))
     finally:
