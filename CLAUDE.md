@@ -1,6 +1,6 @@
 # agent-token-telemetry — orchestrator core rules
 
-Claude Code plugin (`token-telemetry`): Python 3 stdlib capture script (`scripts/capture.py`), JSON manifests, markdown slash commands; tests via `python3 -m unittest tests.test_capture -v`. Telemetry for AI-agent token usage: collection, storage, reporting. Shell: plain zsh on macOS, no env preamble required yet. No dev stack/ports yet — record the command + ports here when one exists. Long-form docs live in `docs/`; the kit rules cascade lives in `.docs/agents/`. Tracker: JIRA, project **AgentOS** (key AOS) at zenosyne.atlassian.net — modern scrum template (Epic/Story/Task/Bug/Idea); current work: epic AOS-1. (Migrated from Linear ZEN 2026-08-03.)
+Claude Code plugin (`token-telemetry`): Python 3 stdlib capture script (`scripts/capture.py`), JSON manifests, markdown slash commands; tests via `python3 -m unittest tests.test_capture -v`. Telemetry for AI-agent token usage: collection, storage, reporting. Shell: plain zsh on macOS, no env preamble required yet. Dev stack: the interactive dashboard is a stdlib HTTP server — `python3 scripts/dashboard.py open` (localhost, default port 8756, self-exits after ~11 min idle); `serve` runs it blocking, `stop` kills a backgrounded one. Long-form docs live in `docs/`; the kit rules cascade lives in `.docs/agents/`. Tracker: JIRA, project **AgentOS** (key AOS) at zenosyne.atlassian.net — modern scrum template (Epic/Story/Task/Bug/Idea); current work: epic AOS-1. (Migrated from Linear ZEN 2026-08-03.)
 
 ## Model-tier dispatch (MANDATORY)
 
