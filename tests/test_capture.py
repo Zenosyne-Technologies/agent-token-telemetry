@@ -9,15 +9,18 @@ import capture
 
 
 def entry(model="claude-sonnet-5", inp=100, out=50, cr=10, cw=5,
-          side=False, ts="2026-07-17T10:00:00.000Z", typ="assistant"):
+          side=False, ts="2026-07-17T10:00:00.000Z", typ="assistant", mid=None):
+    msg = {"model": model, "usage": {
+        "input_tokens": inp, "output_tokens": out,
+        "cache_read_input_tokens": cr, "cache_creation_input_tokens": cw,
+    }}
+    if mid is not None:
+        msg["id"] = mid
     return {
         "type": typ,
         "isSidechain": side,
         "timestamp": ts,
-        "message": {"model": model, "usage": {
-            "input_tokens": inp, "output_tokens": out,
-            "cache_read_input_tokens": cr, "cache_creation_input_tokens": cw,
-        }},
+        "message": msg,
     }
 
 
@@ -89,6 +92,48 @@ class TestAggregate(unittest.TestCase):
         no_usage = {"type": "assistant", "message": {"model": "m"}}
         groups = capture.aggregate([entry(typ="user"), no_usage])
         self.assertEqual(groups, {})
+
+    def test_same_message_id_counted_once_last_wins(self):
+        # One API call = one line per content block, same id; usage snapshots
+        # are cumulative — the last line carries the call's final totals.
+        groups = capture.aggregate([
+            entry(mid="msg_1", inp=100, out=10, cr=1000, cw=50),
+            entry(mid="msg_1", inp=100, out=40, cr=1000, cw=50),
+            entry(mid="msg_1", inp=100, out=90, cr=1000, cw=50),
+        ])
+        g = groups[("claude-sonnet-5", 0)]
+        self.assertEqual(g["in"], 100)
+        self.assertEqual(g["out"], 90)
+        self.assertEqual(g["cr"], 1000)
+        self.assertEqual(g["cw"], 50)
+
+    def test_distinct_message_ids_sum(self):
+        groups = capture.aggregate([
+            entry(mid="msg_1", inp=100, out=10),
+            entry(mid="msg_2", inp=7, out=3),
+        ])
+        g = groups[("claude-sonnet-5", 0)]
+        self.assertEqual(g["in"], 107)
+        self.assertEqual(g["out"], 13)
+
+    def test_id_and_no_id_lines_mix(self):
+        # id-less lines (defensive: never seen in real transcripts) still sum
+        # individually alongside deduped id groups.
+        groups = capture.aggregate([
+            entry(mid="msg_1", inp=100, out=10),
+            entry(mid="msg_1", inp=100, out=20),
+            entry(inp=5, out=1),
+        ])
+        g = groups[("claude-sonnet-5", 0)]
+        self.assertEqual(g["in"], 105)
+        self.assertEqual(g["out"], 21)
+
+    def test_dedupe_is_scoped_per_group(self):
+        # The same id never spans models in practice, but grouping must not
+        # leak temp keys into the returned shape either way.
+        groups = capture.aggregate([entry(mid="msg_1"), entry(mid="msg_2")])
+        g = groups[("claude-sonnet-5", 0)]
+        self.assertEqual(set(g), {"in", "out", "cr", "cw", "first", "last"})
 
     def test_first_last_timestamps(self):
         groups = capture.aggregate([
