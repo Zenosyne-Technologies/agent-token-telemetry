@@ -4,6 +4,14 @@ Claude Code plugin that records per-turn and per-subagent token usage into a
 central SQLite database — with **zero model-token overhead** (capture runs in
 Stop/SubagentStop hooks, outside the model loop).
 
+v0.4.3 fixes a **capture multiple-counting bug**: Claude Code writes one
+transcript line per content block, all repeating the same `message.id` and
+usage object, and capture summed every line — inflating token counts (and
+therefore cost estimates) 2–3× on tool-heavy turns. Usage is now counted once
+per `message.id` (last line wins — snapshots are cumulative). Rows captured by
+older versions are overstated; there is no correction factor stored, so
+delete-and-recapture is the only clean remedy for affected projects.
+
 v0.4.0 adds **storage management**: `/token-telemetry:storage-status` shows where
 every project's data actually lives (central DB size including `-wal`/`-shm`,
 per-project event counts, whether a project-level copy is configured and whether
