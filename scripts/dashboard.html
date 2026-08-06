@@ -1,5 +1,6 @@
 <link rel="icon" type="image/png" href="/favicon.png">
 <style>
+  .tsplit{opacity:.62;font-size:.86em;white-space:nowrap}
   /* ============ TOKENS ============ */
   :root{
     color-scheme: light;
@@ -505,6 +506,9 @@
 
   // ---- formatters ----
   const fmtInt=n=>Math.round(n).toLocaleString("en-US");
+  // token cells render as "total (input/output)" — input side is everything
+  // ingested for that measure, right side what came back or was written
+  const tokSplit=(t,l,r,f)=>{ f=f||fmtTok; return `${f(t)} <span class="tsplit">(${fmtTok(l)}/${fmtTok(r)})</span>`; };
   function fmtTok(n){ n=Math.round(n);
     if(n>=1e9)return (n/1e9).toFixed(2)+"B";
     if(n>=1e6)return (n/1e6).toFixed(2)+"M";
@@ -609,19 +613,25 @@
     });
   }
 
-  // ---- composition ("where it goes"): tokens <-> cost ----
+  // ---- composition ("where it goes"): tokens <-> cost, scoped by measure ----
   const COMP=[{k:"in",nm:"Input",col:"var(--s1)"},{k:"out",nm:"Output",col:"var(--s2)"},{k:"cache_r",nm:"Cache read",col:"var(--s3)"},{k:"cache_w",nm:"Cache write",col:"var(--s4)"}];
+  const compKeys=()=> state.metric==="consumed"?["in","out"] : state.metric==="cache"?["cache_r","cache_w"] : ["in","out","cache_r","cache_w"];
   function renderComp(comp){
-    const mode=state.comp, src=comp[mode];
-    const parts=COMP.map(c=>({...c,v:src[c.k]||0}));
+    const mode=state.comp, src=comp[mode], keys=compKeys();
+    const parts=COMP.filter(c=>keys.includes(c.k)).map(c=>({...c,v:src[c.k]||0}));
     const tot=parts.reduce((s,p)=>s+p.v,0)||1;
     $("comp-stack").innerHTML=parts.map(p=>`<i data-nm="${p.nm}" data-v="${p.v}" style="flex-grow:${p.v};background:${p.col}"></i>`).join("");
     $("comp-legend").innerHTML=parts.map(p=>{ const pc=p.v/tot*100; return `<div class="li"><span class="sw" style="background:${p.col}"></span><span class="nm">${p.nm}</span><span class="vl">${mode==="tokens"?fmtTok(p.v):fmtUSD(p.v)}</span><span class="pc">${pc<0.1&&p.v>0?"<0.1":pc.toFixed(1)}%</span></div>`; }).join("");
     [...$("comp-stack").children].forEach(el=>{ el.addEventListener("mousemove",ev=>{ const v=parseFloat(el.dataset.v); showTip(`<div class="t-t">${el.dataset.nm}</div><div class="t-r"><span>${mode==="tokens"?"Tokens":"Cost"}</span><b>${mode==="tokens"?fmtTok(v):fmtUSD(v)}</b></div><div class="t-r"><span>Share</span><b>${(v/tot*100).toFixed(1)}%</b></div>`,ev.clientX,ev.clientY); }); el.addEventListener("mouseleave",hideTip); });
-    const crShare=parts[2].v/tot*100, outShare=parts[1].v/tot*100;
-    $("comp-note").textContent = mode==="tokens"
-      ? `Cache reads are ${crShare.toFixed(1)}% of tokens \u2014 the model re-reads a large context each turn, but reads are the cheapest tokens.`
-      : `By cost the picture inverts: generated output is ${outShare.toFixed(0)}% of spend yet a sliver of the token volume \u2014 output is priced many times a cache read.`;
+    const share=k=>{ const p=parts.find(x=>x.k===k); return p? p.v/tot*100 : 0; };
+    $("comp-note").textContent =
+      state.metric==="consumed"
+        ? `Consumed tokens only \u2014 uncached input vs generated output; output is ${share("out").toFixed(1)}% of the volume and carries most of its cost.`
+      : state.metric==="cache"
+        ? `Cache tokens only \u2014 reads re-load context each turn (${share("cache_r").toFixed(1)}% of cache traffic); writes store new context at a premium.`
+      : mode==="tokens"
+        ? `Cache reads are ${share("cache_r").toFixed(1)}% of tokens \u2014 the model re-reads a large context each turn, but reads are the cheapest tokens.`
+        : `By cost the picture inverts: generated output is ${share("out").toFixed(0)}% of spend yet a sliver of the token volume \u2014 output is priced many times a cache read.`;
   }
 
   // ---- cumulative timeline ----
@@ -656,7 +666,7 @@
     const grand=groups.reduce((s,g)=>s+g.cost,0)||1e-9;
     const rows=groups.slice().sort((a,b)=> k==="pj"? a.name.localeCompare(b.name)*sgn : (a[k]-b[k])*sgn);
     $("pbody").innerHTML=rows.map(r=>{ const sel=state.project===r.key, share=r.cost/grand*100;
-      return `<tr class="prow${sel?" sel":""}${r.n===0?" zero":""}" data-k="${encodeURIComponent(r.key)}" tabindex="0" role="button" aria-pressed="${sel}"><td><span class="pjname">${sel?'<span class="pin">\u25cf</span>':""}${esc(r.name)}</span></td><td class="num">${r.n}</td><td class="num">${fmtTok(r.total)}</td><td class="num">${fmtUSD(r.cost)}</td><td class="num">${fmtTok(r.consumed)}</td><td class="num">${fmtTok(r.cachetok)}</td><td class="num">${fmtUSD(r.costConsumed)}</td><td class="num">${fmtUSD(r.costCache)}</td><td class="sharecell"><div class="sharewrap"><div class="sharebar"><i style="width:${share.toFixed(1)}%"></i></div><span class="sharepct">${share.toFixed(1)}%</span></div></td></tr>`;
+      return `<tr class="prow${sel?" sel":""}${r.n===0?" zero":""}" data-k="${encodeURIComponent(r.key)}" tabindex="0" role="button" aria-pressed="${sel}"><td><span class="pjname">${sel?'<span class="pin">\u25cf</span>':""}${esc(r.name)}</span></td><td class="num">${r.n}</td><td class="num">${tokSplit(r.total, r["in"]+r.cache_r+r.cache_w, r.out)}</td><td class="num">${fmtUSD(r.cost)}</td><td class="num">${tokSplit(r.consumed, r["in"], r.out)}</td><td class="num">${tokSplit(r.cachetok, r.cache_r, r.cache_w)}</td><td class="num">${fmtUSD(r.costConsumed)}</td><td class="num">${fmtUSD(r.costCache)}</td><td class="sharecell"><div class="sharewrap"><div class="sharebar"><i style="width:${share.toFixed(1)}%"></i></div><span class="sharepct">${share.toFixed(1)}%</span></div></td></tr>`;
     }).join("") || `<tr><td colspan="9" class="empty">No projects in range.</td></tr>`;
     $("pbody").querySelectorAll(".prow").forEach(tr=>{ const key=decodeURIComponent(tr.dataset.k);
       const toggle=()=>{ state.project=state.project===key?null:key; state.page=0; load(); };
@@ -672,7 +682,7 @@
   // ---- events table (server-paginated + server-sorted) ----
   function renderTable(ev){
     $("tbody").innerHTML=ev.rows.map(e=>{ const sub=e.kind===1;
-      return `<tr><td class="num">${fmtTime(e.ts)}</td><td>${esc(e.project)}</td><td><span class="mdl"><span class="sw" style="background:${colorFor("model",e.model)}"></span>${esc(e.modelName)}</span></td><td>${esc(e.agent)}</td><td><span class="pill${sub?" sub":""}">${sub?"Sub-agent":"Turn"}</span></td><td class="num">${fmtInt(e.total)}</td><td class="num">${fmtUSD(e.cost)}</td><td class="num">${fmtInt(e.consumed)}</td><td class="num">${fmtInt(e.cachetok)}</td><td class="num">${fmtUSD(e.costConsumed)}</td><td class="num">${fmtUSD(e.costCache)}</td></tr>`;
+      return `<tr><td class="num">${fmtTime(e.ts)}</td><td>${esc(e.project)}</td><td><span class="mdl"><span class="sw" style="background:${colorFor("model",e.model)}"></span>${esc(e.modelName)}</span></td><td>${esc(e.agent)}</td><td><span class="pill${sub?" sub":""}">${sub?"Sub-agent":"Turn"}</span></td><td class="num">${tokSplit(e.total, e["in"]+e.cache_r+e.cache_w, e.out, fmtInt)}</td><td class="num">${fmtUSD(e.cost)}</td><td class="num">${tokSplit(e.consumed, e["in"], e.out, fmtInt)}</td><td class="num">${tokSplit(e.cachetok, e.cache_r, e.cache_w, fmtInt)}</td><td class="num">${fmtUSD(e.costConsumed)}</td><td class="num">${fmtUSD(e.costCache)}</td></tr>`;
     }).join("") || `<tr><td colspan="11" class="empty">No events match the filters.</td></tr>`;
     [...document.querySelectorAll("#tbl thead th")].forEach(th=>{ const on=th.dataset.k===state.sort.k; th.toggleAttribute("data-sorted",on); const ar=th.querySelector(".ar"); if(ar)ar.textContent=on?(state.sort.dir==="desc"?"\u2193":"\u2191"):"\u2195"; });
     const total=ev.total, pages=Math.max(1,Math.ceil(total/ev.pageSize)), from=total?ev.start+1:0, to=Math.min(ev.start+ev.pageSize,total);
@@ -706,7 +716,7 @@
 
   // ---- wiring ----
   document.querySelectorAll("#period button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#period button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.period=b.dataset.p; state.models=null; state.agents=null; state.project=null; state.page=0; load(); }));
-  document.querySelectorAll("#metric button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#metric button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.metric=b.dataset.m; if(D){ renderBars("bars-model",D.byModel,"model"); renderBars("bars-agent",D.byAgent,"agent"); renderTimeline(D.timeline); const cm=metricName(state.metric); $("cap-model").textContent="by "+cm; $("cap-agent").textContent="by "+cm; } }));
+  document.querySelectorAll("#metric button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#metric button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.metric=b.dataset.m; if(D){ renderBars("bars-model",D.byModel,"model"); renderBars("bars-agent",D.byAgent,"agent"); renderTimeline(D.timeline); renderComp(D.composition); const cm=metricName(state.metric); $("cap-model").textContent="by "+cm; $("cap-agent").textContent="by "+cm; } }));
   document.querySelectorAll("#comp-mode button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#comp-mode button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.comp=b.dataset.c; if(D) renderComp(D.composition); }));
   document.querySelectorAll("#ptbl thead th").forEach(th=>th.addEventListener("click",()=>{ const k=th.dataset.k; if(!k)return; if(state.projSort.k===k) state.projSort.dir=state.projSort.dir==="desc"?"asc":"desc"; else { state.projSort.k=k; state.projSort.dir=k==="pj"?"asc":"desc"; } if(D) renderProjects(D.byProject); }));
   document.querySelectorAll("#tbl thead th").forEach(th=>th.addEventListener("click",()=>{ const k=th.dataset.k; if(state.sort.k===k) state.sort.dir=state.sort.dir==="desc"?"asc":"desc"; else { state.sort.k=k; state.sort.dir=(k==="ts"||k==="project"||k==="model"||k==="agent")?"asc":"desc"; } state.page=0; load(); }));
