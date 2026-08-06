@@ -55,6 +55,7 @@ SORT_MAP = {
     "ts": "ts", "project": "project", "model": "modelName", "agent": "agent",
     "kind": "kind", "total": "total", "cost": "cost", "consumed": "consumed",
     "cachetok": "cachetok", "costConsumed": "costConsumed", "costCache": "costCache",
+    "calls": "calls", "ctx": "ctx",
 }
 
 # ------------------------------------------------------------------ DB access
@@ -141,11 +142,15 @@ def fetch_rows(conn, since, models, agents):
     if agents:
         where.append("COALESCE(e.agent,'main') IN (%s)" % ",".join("?" * len(agents)))
         params += agents
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+    calls_col = "e.api_calls" if "api_calls" in cols else "NULL"
+    ctx_col = "e.ctx_tokens" if "ctx_tokens" in cols else "NULL"
     sql = f"""
       SELECT e.ts AS ts, m.name AS model, COALESCE(e.agent,'main') AS agent,
              p.name AS pname, p.path AS ppath, e.kind AS kind, s.uuid AS session,
              e.in_tok AS in_tok, e.out_tok AS out_tok, e.cache_r AS cache_r,
              e.cache_w AS cache_w, e.cache_w_1h AS cache_w_1h,
+             {calls_col} AS api_calls, {ctx_col} AS ctx_tokens,
              {_rate('in_usd')} AS r_in, {_rate('out_usd')} AS r_out,
              {_rate('cache_r_usd')} AS r_cr, {_rate('cache_w_usd')} AS r_cw,
              {_rate('cache_w_1h_usd')} AS r_cw1h
@@ -172,6 +177,7 @@ def fetch_rows(conn, since, models, agents):
             "agent": r["agent"], "project": _pretty_project(r["pname"], r["ppath"]),
             "projectKey": r["ppath"], "kind": r["kind"], "session": r["session"],
             "in": in_t, "out": out_t, "cache_r": cr, "cache_w": cw,
+            "calls": r["api_calls"], "ctx": r["ctx_tokens"],
             "consumed": in_t + out_t, "cachetok": cr + cw,
             "total": in_t + out_t + cr + cw,
             "costIn": cost_in, "costOut": cost_out, "costCacheR": cost_cr,
@@ -185,7 +191,8 @@ def fetch_rows(conn, since, models, agents):
 # ---------------------------------------------------------------- aggregation
 
 _AGG_FIELDS = ("cost", "total", "consumed", "cachetok", "costConsumed",
-               "costCache", "in", "out", "cache_r", "cache_w")
+               "costCache", "in", "out", "cache_r", "cache_w",
+               "costIn", "costOut", "costCacheR", "costCacheW")
 
 
 def _group(rows, key, name_of):
@@ -237,7 +244,10 @@ def _event_dto(r):
             "cachetok": r["cachetok"], "costConsumed": r["costConsumed"],
             "costCache": r["costCache"],
             "in": r["in"], "out": r["out"],
-            "cache_r": r["cache_r"], "cache_w": r["cache_w"]}
+            "cache_r": r["cache_r"], "cache_w": r["cache_w"],
+            "costIn": r["costIn"], "costOut": r["costOut"],
+            "costCacheR": r["costCacheR"], "costCacheW": r["costCacheW"],
+            "calls": r["calls"], "ctx": r["ctx"]}
 
 
 def build_data(conn, q):
@@ -288,7 +298,8 @@ def build_data(conn, q):
         "outCostPct": (_sum(rows, "costOut") / cost * 100) if cost else 0.0,
     }
 
-    ev = sorted(rows, key=lambda r: r[sort], reverse=reverse)
+    # None-safe sort: pre-v6 rows carry NULL calls/ctx and must not crash it
+    ev = sorted(rows, key=lambda r: (r[sort] is None, r[sort]), reverse=reverse)
     start = page * page_size
     return {
         "period": period,
