@@ -171,7 +171,11 @@ MIRROR_META = {col for col, _ in V3_PROJECT_COLUMNS}
 # write rate; NULL there means unknown and cost queries fall back to cache_w_usd.
 V4_COLUMNS = (("events", "cache_w_1h", "INTEGER NOT NULL DEFAULT 0"),
               ("pricing", "cache_w_1h_usd", "REAL"))
-SCHEMA_VERSION = 4
+# v5: human project name on `projects` — stamped by capture from the kit's
+# .docs/PROJECT-INFO.md (`project:` frontmatter key) or registered at enable
+# time; NULL means unknown and reports fall back to the path basename.
+V5_COLUMNS = (("projects", "name", "TEXT"),)
+SCHEMA_VERSION = 5
 
 
 def table_columns(conn, table):
@@ -199,15 +203,15 @@ def migrate(conn):
     # A few extra PRAGMA reads on the fast path buy that DB a self-heal.
     if (conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION
             and set(V2_COLUMNS) <= event_columns(conn)
-            and MIRROR_META <= table_columns(conn, "projects")
+            and MIRROR_META | {"name"} <= table_columns(conn, "projects")
             and has_table(conn, "audit_log")
             and "cache_w_1h" in event_columns(conn)
             and "cache_w_1h_usd" in table_columns(conn, "pricing")):
         return
     # Hops run in sequence and each returns whether its shape actually landed:
     # v3 must never be attempted - let alone stamped - on a DB that failed v2.
-    if migrate_v2(conn) and migrate_v3(conn):
-        migrate_v4(conn)
+    if migrate_v2(conn) and migrate_v3(conn) and migrate_v4(conn):
+        migrate_v5(conn)
 
 
 def migrate_v2(conn):
@@ -278,6 +282,22 @@ def migrate_v4(conn):
     if not ("cache_w_1h" in event_columns(conn)
             and "cache_w_1h_usd" in table_columns(conn, "pricing")):
         return False  # next connect retries; the stamp stays at 3
+    conn.commit()
+    conn.execute("PRAGMA user_version=4")
+    return True
+
+
+def migrate_v5(conn):
+    """v4 -> v5: `projects.name` — the human project name, filled by capture
+    from the kit's PROJECT-INFO or registered at enable time; NULL = unknown
+    (reports fall back to the path basename). Same discipline as every hop."""
+    for table, col, coltype in V5_COLUMNS:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+        except sqlite3.OperationalError:
+            pass  # duplicate column, or a transient failure the check catches
+    if "name" not in table_columns(conn, "projects"):
+        return False  # next connect retries; the stamp stays at 4
     conn.commit()
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     return True
@@ -488,6 +508,40 @@ def issue_key_from_git(cwd):
     return m.group(1) if m else None
 
 
+PROJECT_INFO_MAX_BYTES = 65536
+PROJECT_NAME_RE = re.compile(r"^project:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def project_name_from_kit(root):
+    """The human project name from the agent-operating-kit's PROJECT-INFO
+    frontmatter (`project:` key). None when the kit is not installed, the file
+    is unreadable/oversized, or the value is an unresolved {{PLACEHOLDER}} —
+    a missing name is never worth failing or slowing a capture over."""
+    try:
+        path = Path(root) / ".docs" / "PROJECT-INFO.md"
+        if path.stat().st_size > PROJECT_INFO_MAX_BYTES:
+            return None
+        m = PROJECT_NAME_RE.search(path.read_text(errors="replace"))
+        if not m:
+            return None
+        name = m.group(1).strip().strip("'\"")
+        return name if name and "{{" not in name else None
+    except Exception:
+        return None
+
+
+def stamp_project_name(conn, project, name):
+    """Keep `projects.name` matched to the kit's source of truth. Overwrites a
+    stale or enable-registered name when the kit document says otherwise; a DB
+    whose v5 hop has not landed simply skips (never worth failing capture)."""
+    if name and "name" in table_columns(conn, "projects"):
+        with conn:
+            conn.execute(
+                "UPDATE projects SET name=? WHERE path=?"
+                " AND COALESCE(name,'') <> ?",
+                (name, str(project), name))
+
+
 SIDECAR_MAX_BYTES = 65536
 
 
@@ -553,6 +607,7 @@ def main():
         # IMMEDIATE could exceed connect()'s 5s busy-wait and drop its event.
         branch, sha = git_meta(cwd)
         root = find_project_root(cwd)
+        kit_name = project_name_from_kit(root)
         ctx = read_sidecar(root) or {}
         issue_key = sidecar_text(ctx.get("issue_key")) or issue_key_from_git(cwd)
         # Read once, before the write lock: the central transaction stamps the
@@ -589,6 +644,7 @@ def main():
             record(conn, *event_args, transcript, new_offset, *meta,
                    mirror_path=(mirror_db_path(root)
                                 if project_mode and groups else None))
+            stamp_project_name(conn, root, kit_name)
             if groups:
                 mirror_args = (*event_args, *meta)
         finally:
