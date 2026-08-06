@@ -55,9 +55,10 @@ sys.path.insert(0, plugin + "/scripts")
 import capture
 
 EVENTS = ("ts, session_id, kind, agent, model_id, in_tok, out_tok, cache_r,"
-          " cache_w, dur_ms, branch, commit_sha, issue_key, task_size, note")
+          " cache_w, cache_w_1h, dur_ms, branch, commit_sha, issue_key,"
+          " task_size, note")
 PRICING = ("provider, model_prefix, model_version, in_usd, out_usd,"
-           " cache_r_usd, cache_w_usd, effective_from, source")
+           " cache_r_usd, cache_w_usd, cache_w_1h_usd, effective_from, source")
 PID = "(SELECT id FROM src.projects WHERE path = ?)"
 SESSIONS = f"(SELECT id FROM src.sessions WHERE project_id = {PID})"
 

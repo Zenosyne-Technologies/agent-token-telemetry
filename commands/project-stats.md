@@ -19,7 +19,7 @@ All-time, no window.
 ```sql
 WITH priced AS (
   SELECT p.path AS project, s.id AS session_id, e.ts AS ts,
-         e.in_tok, e.out_tok, e.cache_r, e.cache_w,
+         e.in_tok, e.out_tok, e.cache_r, e.cache_w, e.cache_w_1h,
     (SELECT pr.in_usd FROM pricing pr
        WHERE m.name LIKE pr.model_prefix || '%' AND pr.effective_from <= e.ts
        ORDER BY LENGTH(pr.model_prefix) DESC, pr.effective_from DESC LIMIT 1) AS in_usd,
@@ -32,6 +32,9 @@ WITH priced AS (
     (SELECT pr.cache_w_usd FROM pricing pr
        WHERE m.name LIKE pr.model_prefix || '%' AND pr.effective_from <= e.ts
        ORDER BY LENGTH(pr.model_prefix) DESC, pr.effective_from DESC LIMIT 1) AS cache_w_usd,
+    (SELECT pr.cache_w_1h_usd FROM pricing pr
+       WHERE m.name LIKE pr.model_prefix || '%' AND pr.effective_from <= e.ts
+       ORDER BY LENGTH(pr.model_prefix) DESC, pr.effective_from DESC LIMIT 1) AS cache_w_1h_usd,
     (SELECT pr.effective_from FROM pricing pr
        WHERE m.name LIKE pr.model_prefix || '%' AND pr.effective_from <= e.ts
        ORDER BY LENGTH(pr.model_prefix) DESC, pr.effective_from DESC LIMIT 1) AS rate_from
@@ -46,7 +49,9 @@ SELECT project,
        COALESCE(SUM(in_tok), 0) AS input,
        COALESCE(SUM(out_tok), 0) AS output,
        ROUND(COALESCE(SUM(in_tok * COALESCE(in_usd, 0) + out_tok * COALESCE(out_usd, 0)
-             + cache_r * COALESCE(cache_r_usd, 0) + cache_w * COALESCE(cache_w_usd, 0)), 0)
+             + cache_r * COALESCE(cache_r_usd, 0)
+             + (cache_w - cache_w_1h) * COALESCE(cache_w_usd, 0)
+             + cache_w_1h * COALESCE(cache_w_1h_usd, cache_w_usd, 0)), 0)
              / 1000000.0, 4) AS est_cost_usd,
        CASE WHEN MAX(rate_from) IS NULL THEN 'unpriced'
             WHEN MAX(rate_from) = 0 THEN 'seed rates (undated)'
