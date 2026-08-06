@@ -440,7 +440,8 @@ def _spawn_detached(port):
             break
         time.sleep(0.1)
     runtime_path().write_text(json.dumps(
-        {"pid": proc.pid, "port": port, "started": int(time.time())}))
+        {"pid": proc.pid, "port": port, "started": int(time.time()),
+         "script": str(Path(__file__).resolve())}))
     return proc.pid
 
 
@@ -460,10 +461,28 @@ def _stop_running(rt, port):
 def cmd_open(port, no_browser):
     rt = _read_runtime()
     if rt and _pid_alive(rt.get("pid", -1)) and _port_open(rt.get("port", 0)):
-        url = f"http://127.0.0.1:{rt['port']}/"
+        # Reattach ONLY to a server running THIS script. A detached server
+        # survives plugin updates and Claude Code restarts, so after an update
+        # the running process may be an older version serving the old UI —
+        # replace it in place (same port, so an open tab reconnects on its
+        # own) instead of silently reattaching to stale code.
+        if rt.get("script") == str(Path(__file__).resolve()):
+            url = f"http://127.0.0.1:{rt['port']}/"
+            if not no_browser:
+                _open_browser(url)
+            print(f"Token-telemetry dashboard already running at {url}")
+            return
+        target = rt["port"]
+        _stop_running(rt, target)
+        port = _free_port(target)
+        pid = _spawn_detached(port)
+        url = f"http://127.0.0.1:{port}/"
         if not no_browser:
             _open_browser(url)
-        print(f"Token-telemetry dashboard already running at {url}")
+        print(f"Token-telemetry dashboard was running an older plugin version"
+              f" — replaced in place at {url}")
+        print(f"(background pid {pid} — an already-open tab reconnects"
+              " automatically)")
         return
     port = _free_port(port)
     pid = _spawn_detached(port)
