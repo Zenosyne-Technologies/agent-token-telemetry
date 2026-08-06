@@ -140,7 +140,7 @@ so is a `/storage-separate` export, which is built through the same `connect()`.
 | `ts` | INTEGER | unix seconds |
 | `session_id` | INTEGER | FK → `sessions.id` |
 | `kind` | INTEGER | 0 = main session, 1 = subagent |
-| `agent` | TEXT | subagent type name, nullable |
+| `agent` | TEXT | subagent type name (namespaced where the harness provides it, e.g. `marvin:developer`), nullable; **always NULL on kind=0 rows** since v0.8.1 — sub-agent usage comes from the per-agent transcript sweep, never from main-transcript slices |
 | `model_id` | INTEGER | FK → `models.id` |
 | `in_tok`, `out_tok`, `cache_r`, `cache_w` | INTEGER | token counts; `cache_w` is the TTL-agnostic cache-write total |
 | `cache_w_1h` | INTEGER | **v4.** 1-hour portion of `cache_w` (5m portion = `cache_w - cache_w_1h`); 0 on pre-v4 rows |

@@ -4,6 +4,18 @@ Claude Code plugin that records per-turn and per-subagent token usage into a
 central SQLite database — with **zero model-token overhead** (capture runs in
 Stop/SubagentStop hooks, outside the model loop).
 
+v0.8.1 fixes **sub-agent capture** for the current harness, which writes each
+sub-agent's transcript to `<session>/subagents/agent-*.jsonl` while the
+SubagentStop hook still passes the MAIN transcript path: capture now sweeps
+that directory on every firing (per-file cursors, `agentType` label from the
+sibling meta.json — e.g. `marvin:developer` — bounded to 40 files per firing so
+a backlog can't blow the hook timeout; the rest lands on subsequent firings,
+which also backfills historical uncaptured sub-agent usage at its original
+timestamps). Main-transcript rows are now always kind 0 with no agent label —
+previously SubagentStop firings mislabeled a slice of main-loop usage as the
+agent. Project totals were always right; per-agent attribution before v0.8.1
+was not.
+
 v0.8.0 adds the **interactive dashboard** (`/token-telemetry:dashboard`): a
 zero-dependency stdlib web app (`scripts/dashboard.py`) that opens a glass UI in
 the browser and computes every KPI, breakdown and cost total **server-side from
