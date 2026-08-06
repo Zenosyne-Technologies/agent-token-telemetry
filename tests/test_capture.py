@@ -140,7 +140,7 @@ class TestAggregate(unittest.TestCase):
         groups = capture.aggregate([entry(mid="msg_1"), entry(mid="msg_2")])
         g = groups[("claude-sonnet-5", 0)]
         self.assertEqual(set(g), {"in", "out", "cr", "cw", "cw1h",
-                                  "first", "last"})
+                                  "calls", "ctx", "first", "last"})
 
     def test_cache_creation_split_tracked(self):
         # cw stays the total; cw1h carries only the 1-hour portion.
@@ -675,19 +675,86 @@ class TestSchemaV5(unittest.TestCase):
     def columns(self, conn, table):
         return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
-    def test_fresh_db_is_user_version_5_with_name_column(self):
+    def test_fresh_db_carries_the_v5_shape(self):
         conn = capture.connect(self.db)
         self.addCleanup(conn.close)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+        self.assertGreaterEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], 5)
         self.assertIn("name", self.columns(conn, "projects"))
 
     def test_migrates_v4_db_without_touching_rows(self):
         build_v4_db(self.db)
         migrated = capture.connect(self.db)
         self.addCleanup(migrated.close)
-        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 5)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         self.assertEqual(migrated.execute(
             "SELECT path, name FROM projects").fetchall(), [("/proj", None)])
+
+
+def build_v5_db(path):
+    """A populated, correctly stamped v5 DB - the starting point of the v5 -> v6
+    migration. Frozen v5 shape: projects.name, no agent-metric columns."""
+    build_v4_db(path)
+    conn = _sqlite3.connect(path)
+    conn.execute("ALTER TABLE projects ADD COLUMN name TEXT")
+    conn.execute("PRAGMA user_version=5")
+    conn.commit()
+    conn.close()
+
+
+class TestSchemaV6(unittest.TestCase):
+    """v6 adds per-event agent metrics: api_calls and ctx_tokens."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = pathlib.Path(self.tmp.name) / "usage.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def columns(self, conn, table):
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    def test_fresh_db_is_user_version_6_with_metric_columns(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
+        self.assertLessEqual({"api_calls", "ctx_tokens"},
+                             self.columns(conn, "events"))
+
+    def test_migrates_v5_db_without_touching_rows(self):
+        build_v5_db(self.db)
+        migrated = capture.connect(self.db)
+        self.addCleanup(migrated.close)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 6)
+        # pre-v6 rows read back with NULL metrics — unknown, never invented
+        self.assertEqual(migrated.execute(
+            "SELECT ts, api_calls, ctx_tokens FROM events").fetchall(),
+            [(99, None, None)])
+
+    def test_aggregate_counts_calls_and_final_context(self):
+        groups = capture.aggregate([
+            entry(mid="m1", inp=10, cr=100, cw=20, out=5,
+                  ts="2026-07-01T10:00:00.000Z"),
+            entry(mid="m1", inp=10, cr=100, cw=20, out=9,
+                  ts="2026-07-01T10:00:01.000Z"),   # same call, later snapshot
+            entry(mid="m2", inp=3, cr=400, cw=7, out=2,
+                  ts="2026-07-01T10:01:00.000Z"),
+        ])
+        g = groups[("claude-sonnet-5", 0)]
+        self.assertEqual(g["calls"], 2)          # dedupe: m1 counted once
+        self.assertEqual(g["ctx"], 3 + 400 + 7)  # last call's input side
+
+    def test_metrics_round_trip_into_the_event_row(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        groups = capture.aggregate([entry(mid="m1", inp=5, cr=50, cw=10)])
+        with conn:
+            capture.insert_events(conn, "/proj", "s1", 0, None, groups)
+        self.assertEqual(conn.execute(
+            "SELECT api_calls, ctx_tokens FROM events").fetchall(),
+            [(1, 65)])
 
 
 class TestProjectName(unittest.TestCase):
