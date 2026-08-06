@@ -4,6 +4,20 @@ Claude Code plugin that records per-turn and per-subagent token usage into a
 central SQLite database — with **zero model-token overhead** (capture runs in
 Stop/SubagentStop hooks, outside the model loop).
 
+v0.8.0 adds the **interactive dashboard** (`/token-telemetry:dashboard`): a
+zero-dependency stdlib web app (`scripts/dashboard.py`) that opens a glass UI in
+the browser and computes every KPI, breakdown and cost total **server-side from
+`usage.db`** — the page only ever receives aggregates and one page of events, so
+it scales past what an embedded snapshot could hold. Filter by period (day /
+week / month / year, default week), by model and agent, and click a project row
+to filter the whole page; the events table is sortable and paginated; four
+token/cost measures; a live auto-refresh every 5 minutes. The server is
+read-only (`mode=ro`, every filter a bound SQL parameter), localhost-only,
+backgrounded by `open`, reattaches instead of duplicating, and self-terminates
+after ~11 minutes idle so nothing lingers once the last tab closes. Every event
+prices at the rate in force at its own timestamp — the same resolution
+`report.py` uses, so the dashboard matches `/token-stats`.
+
 v0.7.2 completes the **permission-hardening pass** (AOS-10): no command grants
 `Bash(sqlite3:*)` or bare `Bash(python3:*)` any more. Write-side bookkeeping
 (export, delete, audit, mirror-meta, name registration) moved into
