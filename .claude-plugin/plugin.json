@@ -1,7 +1,7 @@
 {
   "name": "token-telemetry",
-  "version": "0.7.2",
-  "description": "Zero-token-overhead token usage telemetry: Stop/SubagentStop hooks record per-turn usage into a central SQLite DB; /token-stats reports; /storage-* manages where the data lives.",
+  "version": "0.8.0",
+  "description": "Zero-token-overhead token usage telemetry: Stop/SubagentStop hooks record per-turn usage into a central SQLite DB; /token-stats reports; /dashboard opens an interactive DB-backed web dashboard; /storage-* manages where the data lives.",
   "author": {
     "name": "Emprove Services Kft. (Emprove)"
   }
