@@ -49,7 +49,12 @@ def read_new_entries(path, offset):
 
 def aggregate(entries):
     """Sum usage per (model, sidechain) group. Sidechain entries are subagent
-    activity recorded in the same transcript."""
+    activity recorded in the same transcript.
+
+    One API call is written as one transcript line PER CONTENT BLOCK, each
+    line repeating the same message.id with a usage snapshot — so usage is
+    counted once per id, last line wins (snapshots are cumulative; the last
+    carries the call's final totals). Lines without an id sum individually."""
     groups = {}
     for e in entries:
         if e.get("type") != "assistant":
@@ -62,11 +67,13 @@ def aggregate(entries):
         side = 1 if e.get("isSidechain") else 0
         g = groups.setdefault((model, side), {
             "in": 0, "out": 0, "cr": 0, "cw": 0, "first": None, "last": None,
+            "_by_id": {}, "_no_id": [],
         })
-        g["in"] += usage.get("input_tokens") or 0
-        g["out"] += usage.get("output_tokens") or 0
-        g["cr"] += usage.get("cache_read_input_tokens") or 0
-        g["cw"] += usage.get("cache_creation_input_tokens") or 0
+        mid = msg.get("id")
+        if mid:
+            g["_by_id"][mid] = usage
+        else:
+            g["_no_id"].append(usage)
         ts = e.get("timestamp")
         if ts:
             try:
@@ -77,6 +84,12 @@ def aggregate(entries):
                 g["first"] = t
             if g["last"] is None or t > g["last"]:
                 g["last"] = t
+    for g in groups.values():
+        for usage in list(g.pop("_by_id").values()) + g.pop("_no_id"):
+            g["in"] += usage.get("input_tokens") or 0
+            g["out"] += usage.get("output_tokens") or 0
+            g["cr"] += usage.get("cache_read_input_tokens") or 0
+            g["cw"] += usage.get("cache_creation_input_tokens") or 0
     return groups
 
 
