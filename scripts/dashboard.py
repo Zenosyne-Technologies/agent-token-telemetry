@@ -184,7 +184,8 @@ def fetch_rows(conn, since, models, agents):
 
 # ---------------------------------------------------------------- aggregation
 
-_AGG_FIELDS = ("cost", "total", "consumed", "cachetok", "costConsumed", "costCache")
+_AGG_FIELDS = ("cost", "total", "consumed", "cachetok", "costConsumed",
+               "costCache", "in", "out", "cache_r", "cache_w")
 
 
 def _group(rows, key, name_of):
@@ -234,7 +235,9 @@ def _event_dto(r):
             "modelName": r["modelName"], "agent": r["agent"], "kind": r["kind"],
             "total": r["total"], "cost": r["cost"], "consumed": r["consumed"],
             "cachetok": r["cachetok"], "costConsumed": r["costConsumed"],
-            "costCache": r["costCache"]}
+            "costCache": r["costCache"],
+            "in": r["in"], "out": r["out"],
+            "cache_r": r["cache_r"], "cache_w": r["cache_w"]}
 
 
 def build_data(conn, q):
