@@ -96,8 +96,8 @@ keeps no cursor, replaying a transcript — the central DB being reset, moved or
 from an older copy while the project-local file is kept — re-inserts rows that the
 mirror already has. The re-inserted rows are **identical** across every column, so the
 dedupe hint is the full row tuple: `SELECT DISTINCT ts, session_id, kind, agent,
-model_id, in_tok, out_tok, cache_r, cache_w, dur_ms, branch, commit_sha, issue_key,
-task_size, note FROM events` (or `GROUP BY` those columns). Consumers that need exact
+model_id, in_tok, out_tok, cache_r, cache_w, cache_w_1h, dur_ms, branch, commit_sha,
+issue_key, task_size, note FROM events` (or `GROUP BY` those columns). Consumers that need exact
 totals should read the central DB.
 
 The mirror exists for retention and reuse — it travels with the repo or the team share
@@ -106,7 +106,7 @@ The mirror exists for retention and reuse — it travels with the repo or the te
 
 ## Schema version
 
-Current: `PRAGMA user_version = 3`. Migrations are additive deltas applied in
+Current: `PRAGMA user_version = 4`. Migrations are additive deltas applied in
 `capture.py`'s `migrate()`, run from `connect()`, and are idempotent — safe to run
 concurrently from multiple hook invocations. Hops run in order and each is gated on its
 own post-condition: a version is stamped only once the shape it promises is verifiably
@@ -118,6 +118,11 @@ heals itself.
 - **v1 → v2** — the three `events` columns below and the `pricing` table.
 - **v2 → v3** (v0.4.0) — `projects.mirror_path` and `projects.mirror_last_at`, plus the
   `audit_log` table (both documented above).
+- **v3 → v4** (v0.5.0) — cache writes split by TTL: `events.cache_w_1h` (the 1-hour
+  portion; **`cache_w` stays the TTL-agnostic total**, so every pre-v4 query keeps
+  working and the 5m portion is `cache_w - cache_w_1h`) and `pricing.cache_w_1h_usd`
+  (the 1h write rate, 2× input vs 1.25× for 5m; NULL = unknown — cost queries must fall
+  back to `cache_w_usd`, which reproduces the pre-v4 estimate).
 
 No column has ever been renamed or removed. v0.3.0 changed no schema at all — it added
 storage modes. A project-local mirror is byte-for-byte the same schema as the central DB;
@@ -132,7 +137,8 @@ so is a `/storage-separate` export, which is built through the same `connect()`.
 | `kind` | INTEGER | 0 = main session, 1 = subagent |
 | `agent` | TEXT | subagent type name, nullable |
 | `model_id` | INTEGER | FK → `models.id` |
-| `in_tok`, `out_tok`, `cache_r`, `cache_w` | INTEGER | token counts |
+| `in_tok`, `out_tok`, `cache_r`, `cache_w` | INTEGER | token counts; `cache_w` is the TTL-agnostic cache-write total |
+| `cache_w_1h` | INTEGER | **v4.** 1-hour portion of `cache_w` (5m portion = `cache_w - cache_w_1h`); 0 on pre-v4 rows |
 | `branch` | TEXT | git branch at capture time; kit milestones use `milestone/<slug>` |
 | `commit_sha` | TEXT | short sha at capture time |
 | `issue_key` | TEXT | **v2.** From the context sidecar, else a `<KEY>:` commit-subject fallback, else null |
@@ -174,7 +180,7 @@ recipe the kit's documentation agent uses for its cost-per-issue closing comment
 
 ```
 pricing(provider, model_prefix, model_version, in_usd, out_usd, cache_r_usd,
-        cache_w_usd, effective_from, source)
+        cache_w_usd, cache_w_1h_usd, effective_from, source)
 UNIQUE(provider, model_prefix, model_version, effective_from)
 ```
 
@@ -182,7 +188,11 @@ Cost is never stored per event — always derived at query time. The rate for a 
 event is the `pricing` row with the **longest `model_prefix` that is a prefix of the
 model name**, restricted to `effective_from <= events.ts`, and among those the
 **greatest `effective_from`** (a later dated rate supersedes an earlier one once its
-date arrives). See `commands/token-stats.md` for the reference query.
+date arrives). See `commands/token-stats.md` for the reference query. `cache_w_usd` is
+the 5-minute write rate (1.25× input); `cache_w_1h_usd` (v4) is the 1-hour write rate
+(2× input) and is NULL on rows that predate the split — price `cache_w_1h` tokens with
+`COALESCE(cache_w_1h_usd, cache_w_usd)` so pre-v4 rows keep producing the estimate they
+always did.
 
 **History is never mutated.** A rate change is always a new `INSERT` with today's date
 as `effective_from` and a `source` URL — rows are never `UPDATE`d or `DELETE`d, so a
