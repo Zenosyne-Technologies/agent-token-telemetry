@@ -4,6 +4,15 @@ Claude Code plugin that records per-turn and per-subagent token usage into a
 central SQLite database — with **zero model-token overhead** (capture runs in
 Stop/SubagentStop hooks, outside the model loop).
 
+v0.9.0 marks **backlog roll-ups** and gives the dashboard its face: the first
+capture of an already-running session distills days of history into one event
+dated "today" — capture now stamps such events (`note = 'backlog-capture'`
+when the cursor started at 0 and the span exceeds 24h; a real sidecar note
+always wins), windowed reports and the dashboard exclude them from day/week
+figures (with an explicit exclusion notice; `project-stats` and other all-time
+views still include them), and the dashboard serves the Marvin icon as its
+favicon.
+
 v0.8.1 fixes **sub-agent capture** for the current harness, which writes each
 sub-agent's transcript to `<session>/subagents/agent-*.jsonl` while the
 SubagentStop hook still passes the MAIN transcript path: capture now sweeps
