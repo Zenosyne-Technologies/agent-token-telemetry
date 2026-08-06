@@ -9,11 +9,17 @@ import capture
 
 
 def entry(model="claude-sonnet-5", inp=100, out=50, cr=10, cw=5,
-          side=False, ts="2026-07-17T10:00:00.000Z", typ="assistant", mid=None):
+          side=False, ts="2026-07-17T10:00:00.000Z", typ="assistant", mid=None,
+          cw1h=None):
     msg = {"model": model, "usage": {
         "input_tokens": inp, "output_tokens": out,
         "cache_read_input_tokens": cr, "cache_creation_input_tokens": cw,
     }}
+    if cw1h is not None:
+        msg["usage"]["cache_creation"] = {
+            "ephemeral_5m_input_tokens": cw - cw1h,
+            "ephemeral_1h_input_tokens": cw1h,
+        }
     if mid is not None:
         msg["id"] = mid
     return {
@@ -133,7 +139,27 @@ class TestAggregate(unittest.TestCase):
         # leak temp keys into the returned shape either way.
         groups = capture.aggregate([entry(mid="msg_1"), entry(mid="msg_2")])
         g = groups[("claude-sonnet-5", 0)]
-        self.assertEqual(set(g), {"in", "out", "cr", "cw", "first", "last"})
+        self.assertEqual(set(g), {"in", "out", "cr", "cw", "cw1h",
+                                  "first", "last"})
+
+    def test_cache_creation_split_tracked(self):
+        # cw stays the total; cw1h carries only the 1-hour portion.
+        groups = capture.aggregate([
+            entry(mid="msg_1", cw=100, cw1h=30),
+            entry(mid="msg_2", cw=50, cw1h=50),
+            entry(mid="msg_3", cw=10),  # no split published -> all counted 5m
+        ])
+        g = groups[("claude-sonnet-5", 0)]
+        self.assertEqual(g["cw"], 160)
+        self.assertEqual(g["cw1h"], 80)
+
+    def test_cache_creation_split_without_legacy_total(self):
+        # Defensive: if the flat total ever disappears, the split still sums.
+        e = entry(mid="msg_1", cw=70, cw1h=20)
+        del e["message"]["usage"]["cache_creation_input_tokens"]
+        g = capture.aggregate([e])[("claude-sonnet-5", 0)]
+        self.assertEqual(g["cw"], 70)
+        self.assertEqual(g["cw1h"], 20)
 
     def test_first_last_timestamps(self):
         groups = capture.aggregate([
@@ -364,6 +390,22 @@ class TestSchemaV2(unittest.TestCase):
 # has to be tested against the shape DBs in the field actually carry.
 V2_EVENT_COLUMNS = ("issue_key", "task_size", "note")
 
+# The pricing table as v2 actually shipped it (no cache_w_1h_usd — that column
+# arrived in v4), frozen so migration tests start from the real on-disk shape.
+V2_PRICING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pricing(
+  provider       TEXT NOT NULL,
+  model_prefix   TEXT NOT NULL,
+  model_version  TEXT NOT NULL DEFAULT '',
+  in_usd         REAL,
+  out_usd        REAL,
+  cache_r_usd    REAL,
+  cache_w_usd    REAL,
+  effective_from INTEGER NOT NULL,
+  source         TEXT,
+  UNIQUE(provider, model_prefix, model_version, effective_from));
+"""
+
 
 def build_v2_db(path):
     """A populated, correctly stamped v2 DB - the starting point of the v2 -> v3
@@ -372,11 +414,11 @@ def build_v2_db(path):
     conn.executescript(V1_SCHEMA)
     for col in V2_EVENT_COLUMNS:
         conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
-    conn.executescript(capture.PRICING_SCHEMA)
+    conn.executescript(V2_PRICING_SCHEMA)
     conn.executemany(
         "INSERT OR IGNORE INTO pricing(provider, model_prefix, in_usd, out_usd,"
         " cache_r_usd, cache_w_usd, effective_from, source) VALUES (?,?,?,?,?,?,0,?)",
-        [(*row, capture.SEED_SOURCE) for row in capture.PRICING_SEED])
+        [(*row[:6], capture.SEED_SOURCE) for row in capture.PRICING_SEED])
     conn.execute("INSERT INTO projects(path) VALUES ('/proj')")
     conn.execute("INSERT INTO models(name) VALUES ('claude-sonnet-5')")
     conn.execute("INSERT INTO sessions(uuid, project_id) VALUES ('s1', 1)")
@@ -420,10 +462,11 @@ class TestSchemaV3(unittest.TestCase):
         return {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
 
-    def test_fresh_db_is_user_version_3_with_v3_shape(self):
+    def test_fresh_db_carries_the_v3_shape(self):
         conn = capture.connect(self.db)
         self.addCleanup(conn.close)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertGreaterEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], 3)
         self.assertLessEqual({"mirror_path", "mirror_last_at"},
                              self.columns(conn, "projects"))
         self.assertIn("audit_log", self.tables(conn))
@@ -444,7 +487,8 @@ class TestSchemaV3(unittest.TestCase):
         build_v2_db(self.db)
         migrated = capture.connect(self.db)
         self.addCleanup(migrated.close)
-        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         self.assertIn("audit_log", self.tables(migrated))
         self.assertEqual(
             migrated.execute(
@@ -474,11 +518,12 @@ class TestSchemaV3(unittest.TestCase):
 
         retried = capture.connect(self.db)  # transient cause gone
         self.addCleanup(retried.close)
-        self.assertEqual(retried.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(retried.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         self.assertLessEqual({"mirror_path", "mirror_last_at"},
                              self.columns(retried, "projects"))
 
-    def test_v1_db_chains_through_v2_to_v3(self):
+    def test_v1_db_chains_through_every_hop(self):
         conn = _sqlite3.connect(self.db)
         conn.executescript(V1_SCHEMA)
         conn.execute("INSERT INTO projects(path) VALUES ('/proj')")
@@ -494,17 +539,111 @@ class TestSchemaV3(unittest.TestCase):
 
         migrated = capture.connect(self.db)
         self.addCleanup(migrated.close)
-        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 3)
-        # every delta of both hops applied in one connect
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
+        # every delta of all hops applied in one connect
         self.assertLessEqual(set(V2_EVENT_COLUMNS), self.columns(migrated, "events"))
         self.assertLessEqual({"mirror_path", "mirror_last_at"},
                              self.columns(migrated, "projects"))
         self.assertIn("audit_log", self.tables(migrated))
+        self.assertIn("cache_w_1h", self.columns(migrated, "events"))
+        self.assertIn("cache_w_1h_usd", self.columns(migrated, "pricing"))
         self.assertGreaterEqual(migrated.execute(
             "SELECT COUNT(*) FROM pricing").fetchone()[0], 4)
         self.assertEqual(migrated.execute(
-            "SELECT ts, agent, in_tok, issue_key FROM events").fetchall(),
-            [(99, "legacy", 11, None)])
+            "SELECT ts, agent, in_tok, issue_key, cache_w_1h FROM events").fetchall(),
+            [(99, "legacy", 11, None, 0)])
+
+
+def build_v3_db(path):
+    """A populated, correctly stamped v3 DB - the starting point of the v3 -> v4
+    migration. Frozen v3 shape: mirror columns + audit_log, no cache split."""
+    build_v2_db(path)
+    conn = _sqlite3.connect(path)
+    conn.execute("ALTER TABLE projects ADD COLUMN mirror_path TEXT")
+    conn.execute("ALTER TABLE projects ADD COLUMN mirror_last_at INTEGER")
+    conn.executescript(capture.AUDIT_SCHEMA)
+    conn.execute("PRAGMA user_version=3")
+    conn.commit()
+    conn.close()
+
+
+class AlterPricingBlockedConnection(_sqlite3.Connection):
+    """`ALTER TABLE pricing` failing transiently while the rest proceeds."""
+
+    def execute(self, sql, *args):
+        if sql.lstrip().upper().startswith("ALTER TABLE PRICING"):
+            raise _sqlite3.OperationalError("database is locked")
+        return super().execute(sql, *args)
+
+
+class TestSchemaV4(unittest.TestCase):
+    """v4 splits cache writes by TTL: `events.cache_w_1h` (cache_w stays the
+    total) and `pricing.cache_w_1h_usd` (NULL = fall back to cache_w_usd)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = pathlib.Path(self.tmp.name) / "usage.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def columns(self, conn, table):
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    def test_fresh_db_is_user_version_4_with_v4_shape(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertIn("cache_w_1h", self.columns(conn, "events"))
+        self.assertIn("cache_w_1h_usd", self.columns(conn, "pricing"))
+
+    def test_fresh_seed_carries_1h_rates_at_2x_input(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        for in_usd, cw1h_usd in conn.execute(
+                "SELECT in_usd, cache_w_1h_usd FROM pricing WHERE source=?",
+                (capture.SEED_SOURCE,)):
+            self.assertEqual(cw1h_usd, in_usd * 2)
+
+    def test_migrates_v3_db_without_touching_rows(self):
+        build_v3_db(self.db)
+        migrated = capture.connect(self.db)
+        self.addCleanup(migrated.close)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 4)
+        # pre-v4 events read back unchanged, the new column defaulting to 0
+        self.assertEqual(migrated.execute(
+            "SELECT ts, agent, cache_w, cache_w_1h FROM events").fetchall(),
+            [(99, "legacy", 44, 0)])
+        # pre-v4 pricing rows keep a NULL 1h rate: unknown, never invented
+        for (cw1h_usd,) in migrated.execute(
+                "SELECT cache_w_1h_usd FROM pricing"):
+            self.assertIsNone(cw1h_usd)
+
+    def test_split_event_round_trips(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        groups = capture.aggregate([entry(mid="m1", cw=100, cw1h=30)])
+        with conn:
+            capture.insert_events(conn, "/proj", "s1", 0, None, groups)
+        self.assertEqual(
+            conn.execute("SELECT cache_w, cache_w_1h FROM events").fetchall(),
+            [(100, 30)])
+
+    def test_alter_failure_withholds_v4_stamp_and_retries(self):
+        build_v3_db(self.db)
+        blocked = _sqlite3.connect(self.db, factory=AlterPricingBlockedConnection)
+        capture.migrate(blocked)
+        # Stamping v4 without the pricing column would strand the DB: cost
+        # queries would fail on a column no later connect would ever add.
+        self.assertEqual(blocked.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertNotIn("cache_w_1h_usd", self.columns(blocked, "pricing"))
+        blocked.close()
+
+        retried = capture.connect(self.db)  # transient cause gone
+        self.addCleanup(retried.close)
+        self.assertEqual(retried.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertIn("cache_w_1h_usd", self.columns(retried, "pricing"))
 
 
 class TestIssueKeyRegex(unittest.TestCase):
