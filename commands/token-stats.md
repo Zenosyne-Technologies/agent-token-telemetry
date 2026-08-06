@@ -55,7 +55,7 @@ a price change, some of the cost may have priced at an earlier rate:
 
 ```sql
 WITH priced AS (
-  SELECT e.in_tok, e.out_tok, e.cache_r, e.cache_w, m.name AS model_name,
+  SELECT e.in_tok, e.out_tok, e.cache_r, e.cache_w, e.cache_w_1h, m.name AS model_name,
     (SELECT p.in_usd FROM pricing p
        WHERE m.name LIKE p.model_prefix || '%' AND p.effective_from <= e.ts
        ORDER BY LENGTH(p.model_prefix) DESC, p.effective_from DESC LIMIT 1) AS in_usd,
@@ -68,6 +68,9 @@ WITH priced AS (
     (SELECT p.cache_w_usd FROM pricing p
        WHERE m.name LIKE p.model_prefix || '%' AND p.effective_from <= e.ts
        ORDER BY LENGTH(p.model_prefix) DESC, p.effective_from DESC LIMIT 1) AS cache_w_usd,
+    (SELECT p.cache_w_1h_usd FROM pricing p
+       WHERE m.name LIKE p.model_prefix || '%' AND p.effective_from <= e.ts
+       ORDER BY LENGTH(p.model_prefix) DESC, p.effective_from DESC LIMIT 1) AS cache_w_1h_usd,
     (SELECT p.effective_from FROM pricing p
        WHERE m.name LIKE p.model_prefix || '%' AND p.effective_from <= e.ts
        ORDER BY LENGTH(p.model_prefix) DESC, p.effective_from DESC LIMIT 1) AS rate_effective_from
@@ -77,12 +80,19 @@ WITH priced AS (
 SELECT model_name,
        SUM(in_tok) AS input, SUM(out_tok) AS output,
        ROUND(SUM(in_tok*COALESCE(in_usd,0) + out_tok*COALESCE(out_usd,0)
-             + cache_r*COALESCE(cache_r_usd,0) + cache_w*COALESCE(cache_w_usd,0)) / 1000000.0, 4) AS est_cost_usd,
+             + cache_r*COALESCE(cache_r_usd,0)
+             + (cache_w - cache_w_1h)*COALESCE(cache_w_usd,0)
+             + cache_w_1h*COALESCE(cache_w_1h_usd, cache_w_usd, 0)) / 1000000.0, 4) AS est_cost_usd,
        CASE WHEN MAX(rate_effective_from) IS NULL THEN 'unpriced'
             WHEN MAX(rate_effective_from) = 0 THEN 'seed rates (undated)'
             ELSE date(MAX(rate_effective_from), 'unixepoch') END AS rates_as_of
 FROM priced GROUP BY model_name ORDER BY output DESC;
 ```
+
+`cache_w` is the TTL-agnostic total; `cache_w_1h` is the 1-hour portion (billed at 2×
+input vs 1.25× for 5-minute writes), so the formula prices `cache_w - cache_w_1h` at the
+5m rate and the rest at the 1h rate — falling back to the 5m rate when a pricing row
+predates the split (`cache_w_1h_usd` NULL), which reproduces the pre-v4 estimate.
 
 A model with no matching `pricing` row (no prefix matches) shows `est_cost_usd` of 0 and
 `rates_as_of` of `unpriced` — report it as unpriced, not as free. **`effective_from = 0`

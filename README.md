@@ -4,6 +4,14 @@ Claude Code plugin that records per-turn and per-subagent token usage into a
 central SQLite database — with **zero model-token overhead** (capture runs in
 Stop/SubagentStop hooks, outside the model loop).
 
+v0.5.0 (schema v4) prices **5-minute and 1-hour cache writes separately** — they
+bill at 1.25× and 2× the input rate respectively, so 1h-heavy sessions were
+under-costed. `events.cache_w` stays the TTL-agnostic total (every existing
+query keeps working); new `events.cache_w_1h` carries the 1-hour portion and
+`pricing.cache_w_1h_usd` its rate (NULL on pre-v4 rows → cost queries fall back
+to the 5m rate, which is exactly the old estimate). The seed and
+`/token-telemetry:pricing-update` both carry the 1h rates.
+
 v0.4.3 fixes a **capture multiple-counting bug**: Claude Code writes one
 transcript line per content block, all repeating the same `message.id` and
 usage object, and capture summed every line — inflating token counts (and
