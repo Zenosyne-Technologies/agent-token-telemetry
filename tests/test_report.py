@@ -130,6 +130,29 @@ class TestReportScript(unittest.TestCase):
         self.assertIn("not accessible on this machine", out)
         self.assertIn("configured state, not a write receipt", out)
 
+    def test_token_stats_excludes_backlog_rollups_with_notice(self):
+        self.seed_db()
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE events SET note='backlog-capture'")
+        conn.commit()
+        conn.close()
+        rc, out = run(["token-stats", "--db", str(self.db)])
+        self.assertEqual(rc, 0)
+        # the only event is a roll-up -> windowed totals are zero...
+        self.assertIn("| today | 0 | 0 | 0 | 0 | 0 |", out)
+        # ...and the exclusion is stated, never silent
+        self.assertIn("1 backlog roll-up event(s)", out)
+        self.assertIn("excluded from the windowed figures", out)
+
+    def test_project_stats_all_time_keeps_backlog_rollups(self):
+        self.seed_db()
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE events SET note='backlog-capture'")
+        conn.commit()
+        conn.close()
+        _, out = run(["project-stats", "--db", str(self.db)])
+        self.assertIn("100,000", out)   # all-time view still counts it
+
     def test_token_stats_missing_db(self):
         rc, out = run(["token-stats", "--db", str(self.db)])
         self.assertEqual(rc, 0)

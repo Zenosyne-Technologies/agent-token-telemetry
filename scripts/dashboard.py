@@ -37,6 +37,7 @@ import capture
 HERE = Path(__file__).resolve().parent
 HTML = HERE / "dashboard.html"
 LOGO = HERE / "dashboard-assets" / "marvin-wordmark.png"
+FAVICON = HERE / "dashboard-assets" / "favicon.png"
 
 # rolling windows, in days; the period filter maps onto these. Default: week.
 PERIODS = {"day": 1, "week": 7, "month": 30, "year": 365}
@@ -128,7 +129,11 @@ def fetch_rows(conn, since, models, agents):
     composition panel and all breakdowns share one source of truth. Project
     filtering is applied later in Python so the project table can still show
     every project under the current model/agent filter."""
-    where = ["e.ts >= ?"]
+    # Backlog roll-ups (first captures of pre-telemetry history, note =
+    # 'backlog-capture') are excluded from every dashboard window: their
+    # timestamp is the capture day, not when the tokens were spent. All-time
+    # truth including them lives in /token-telemetry:project-stats.
+    where = ["e.ts >= ?", "COALESCE(e.note,'') <> 'backlog-capture'"]
     params = [since]
     if models:
         where.append("m.name IN (%s)" % ",".join("?" * len(models)))
@@ -263,6 +268,9 @@ def build_data(conn, q):
 
     domains = fetch_domains(conn, since)
     base_rows = fetch_rows(conn, since, models, agents)   # window + model/agent
+    backlog_excluded = conn.execute(
+        "SELECT COUNT(*) FROM events WHERE ts >= ?"
+        " AND COALESCE(note,'') = 'backlog-capture'", (since,)).fetchone()[0]
     by_project = _group(base_rows, "projectKey", name_of=lambda r: r["project"])
     rows = [r for r in base_rows if project is None or r["projectKey"] == project]
 
@@ -293,6 +301,7 @@ def build_data(conn, q):
             "total": len(rows), "start": start, "pageSize": page_size, "page": page,
             "sums": {"cost": cost, "total": total},
         },
+        "backlogExcluded": backlog_excluded,
         "generatedAt": now,
     }
 
@@ -324,6 +333,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_file(HTML, "text/html; charset=utf-8")
         if u.path == "/logo.png":
             return self._send_file(LOGO, "image/png")
+        if u.path in ("/favicon.png", "/favicon.ico"):
+            return self._send_file(FAVICON, "image/png")
         if u.path == "/api/data":
             return self._api_data(parse_qs(u.query))
         self._send(404, b"not found", "text/plain")
