@@ -193,6 +193,12 @@ def render_project_stats(rows):
 
 # ----------------------------------------------------------------- token-stats
 
+# First-capture roll-ups of pre-telemetry history: excluded from every
+# windowed figure (their timestamp is the capture day, not when the tokens
+# were spent) but always included in all-time views. See TELEMETRY-CONTRACT.md.
+NOT_BACKLOG = "COALESCE(note,'') <> 'backlog-capture'"
+
+
 def fetch_token_stats(conn):
     """Every breakdown the token-stats report shows, as plain data."""
     cw1h, cw1h_usd = priced_cte(conn)
@@ -202,10 +208,14 @@ def fetch_token_stats(conn):
         return conn.execute(
             "SELECT COALESCE(SUM(in_tok),0), COALESCE(SUM(out_tok),0),"
             " COALESCE(SUM(cache_r),0), COALESCE(SUM(cache_w),0), COUNT(*)"
-            f" FROM events WHERE {where}").fetchone()
+            f" FROM events WHERE {where} AND {NOT_BACKLOG}").fetchone()
 
     d = {"today": totals("ts >= strftime('%s','now','start of day')"),
          "week": totals("ts >= strftime('%s','now','-7 days')")}
+    d["backlog_excluded"] = conn.execute(
+        "SELECT COUNT(*) FROM events"
+        " WHERE ts >= strftime('%s','now','-7 days')"
+        " AND COALESCE(note,'') = 'backlog-capture'").fetchone()[0]
     d["by_project"] = [
         (nm or Path(path).name, *rest) for path, nm, *rest in conn.execute(
             f"SELECT p.path, {name}, SUM(e.in_tok), SUM(e.out_tok),"
@@ -218,6 +228,7 @@ def fetch_token_stats(conn):
         "SELECT COALESCE(agent, CASE kind WHEN 0 THEN 'main' ELSE 'subagent'"
         " END), SUM(in_tok), SUM(out_tok), COUNT(*)"
         " FROM events WHERE ts >= strftime('%s','now','-7 days')"
+        f" AND {NOT_BACKLOG}"
         " GROUP BY 1 ORDER BY SUM(out_tok) DESC").fetchall()
     d["by_model"] = conn.execute(f"""
 WITH priced AS (
@@ -230,7 +241,7 @@ WITH priced AS (
          {cw1h_usd} AS cache_w_1h_usd,
          {rate_subquery('effective_from')} AS rate_from
   FROM events e JOIN models m ON m.id = e.model_id
-  WHERE e.ts >= strftime('%s','now','-7 days')
+  WHERE e.ts >= strftime('%s','now','-7 days') AND {NOT_BACKLOG}
 )
 SELECT model_name,
        CASE
@@ -252,6 +263,7 @@ FROM priced GROUP BY model_name ORDER BY SUM(out_tok) DESC;""").fetchall()
         " SUM(in_tok), SUM(out_tok),"
         " ROUND(100.0 * SUM(cache_r) / NULLIF(SUM(in_tok) + SUM(cache_r), 0), 1)"
         " FROM events WHERE ts >= strftime('%s','now','-7 days')"
+        f" AND {NOT_BACKLOG}"
         " GROUP BY kind").fetchall()
     d["by_milestone"] = conn.execute(
         "SELECT branch, SUM(in_tok), SUM(out_tok), SUM(cache_r), SUM(cache_w),"
@@ -267,6 +279,7 @@ FROM priced GROUP BY model_name ORDER BY SUM(out_tok) DESC;""").fetchall()
         " SUM(e.in_tok), SUM(e.out_tok), COUNT(*)"
         " FROM events e JOIN models m ON m.id = e.model_id"
         " WHERE e.ts >= strftime('%s','now','-7 days')"
+        f" AND {NOT_BACKLOG}"
         " GROUP BY 1 ORDER BY SUM(e.out_tok) DESC").fetchall()
     d["by_issue"] = conn.execute(
         "SELECT issue_key, SUM(in_tok), SUM(out_tok), SUM(cache_r),"
@@ -353,6 +366,14 @@ def render_token_stats(d):
     else:
         out += ["", "No issue-tagged events recorded (sidecar or"
                 " `<KEY>:` commit-subject fallback)."]
+    if d.get("backlog_excluded"):
+        n = d["backlog_excluded"]
+        out += ["", f"{n} backlog roll-up event(s) — first captures of"
+                " pre-telemetry session history — are excluded from the"
+                " windowed figures above (their timestamp is the capture day,"
+                " not when the tokens were spent). All-time views"
+                " (`/token-telemetry:project-stats`, the by-milestone and"
+                " by-issue tables) include them."]
     return "\n".join(out)
 
 

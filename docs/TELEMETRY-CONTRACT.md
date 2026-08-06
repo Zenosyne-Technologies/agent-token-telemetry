@@ -148,7 +148,7 @@ so is a `/storage-separate` export, which is built through the same `connect()`.
 | `commit_sha` | TEXT | short sha at capture time |
 | `issue_key` | TEXT | **v2.** From the context sidecar, else a `<KEY>:` commit-subject fallback, else null |
 | `task_size` | TEXT | **v2.** From the sidecar's `size`, else null |
-| `note` | TEXT | **v2.** From the sidecar's `summary`, else null |
+| `note` | TEXT | **v2.** From the sidecar's `summary`, else null. **v0.9.0**: `backlog-capture` marks a first-capture roll-up of pre-telemetry history (cursor started at 0 and the aggregated span exceeded 24h; `dur_ms` carries the span; a real sidecar note always wins). Consumers exclude these from windowed figures and include them in all-time views |
 
 `sessions(id, uuid, project_id)` and `models(id, name)` are stable lookup tables
 unchanged since v1; `projects(id, path)` gained the two nullable `mirror_*` columns in

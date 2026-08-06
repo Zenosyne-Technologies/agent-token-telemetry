@@ -338,12 +338,21 @@ def get_offset(conn, transcript):
     return row[0] if row else 0
 
 
+# A first capture whose aggregated span exceeds this is a roll-up of
+# pre-telemetry history, not a per-turn delta — marked so windowed reports
+# and the dashboard can keep it out of day/week figures (all-time totals
+# include it). The event's dur_ms carries the actual span.
+BACKLOG_SPAN_S = 86400
+BACKLOG_NOTE = "backlog-capture"
+
+
 def insert_events(conn, project, session_uuid, kind_hint, agent, groups,
                   branch=None, commit_sha=None, issue_key=None,
-                  task_size=None, note=None):
+                  task_size=None, note=None, first_capture=False):
     """One event row per (model, sidechain) group. Caller owns the transaction.
     Returns the session id (the cursor row, written only in the central DB,
-    needs it)."""
+    needs it). `first_capture` marks rows whose span exceeds BACKLOG_SPAN_S as
+    backlog roll-ups — but never over a real sidecar note."""
     project_id = get_or_create(conn, "projects", "path", project)
     row = conn.execute(
         "SELECT id FROM sessions WHERE uuid=?", (session_uuid,)).fetchone()
@@ -358,6 +367,10 @@ def insert_events(conn, project, session_uuid, kind_hint, agent, groups,
         # firing (the SubagentStop payload names the agent, but the MAIN
         # transcript it points at holds orchestrator work).
         row_agent = agent if kind else None
+        row_note = note
+        if (row_note is None and first_capture and g["first"] is not None
+                and g["last"] - g["first"] > BACKLOG_SPAN_S):
+            row_note = BACKLOG_NOTE
         dur = (int((g["last"] - g["first"]) * 1000)
                if g["first"] is not None else None)
         ts = int(g["last"]) if g["last"] is not None else int(time.time())
@@ -368,7 +381,7 @@ def insert_events(conn, project, session_uuid, kind_hint, agent, groups,
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ts, session_id, kind, row_agent, model_id,
              g["in"], g["out"], g["cr"], g["cw"], g.get("cw1h", 0), dur,
-             branch, commit_sha, issue_key, task_size, note))
+             branch, commit_sha, issue_key, task_size, row_note))
     return session_id
 
 
@@ -399,11 +412,13 @@ def stamp_mirror_meta(conn, project, mirror_path, ts):
 
 def record(conn, project, session_uuid, kind_hint, agent, groups,
            transcript, new_offset, branch=None, commit_sha=None,
-           issue_key=None, task_size=None, note=None, mirror_path=None):
+           issue_key=None, task_size=None, note=None, mirror_path=None,
+           first_capture=False):
     with conn:
         session_id = insert_events(conn, project, session_uuid, kind_hint,
                                    agent, groups, branch, commit_sha,
-                                   issue_key, task_size, note)
+                                   issue_key, task_size, note,
+                                   first_capture=first_capture)
         if mirror_path is not None:
             stamp_mirror_meta(conn, project, mirror_path,
                               latest_event_ts(groups))
@@ -468,14 +483,15 @@ def sweep_subagents(conn, project, session_uuid, transcript, meta,
                 continue
             event_args = (project, session_uuid, 1,
                           subagent_label(f) or hook_agent, groups)
-            session_id = insert_events(conn, *event_args, *meta)
+            session_id = insert_events(conn, *event_args, *meta,
+                                       first_capture=(offset == 0))
             conn.execute(
                 "INSERT INTO cursors(transcript, offset, session_id)"
                 " VALUES (?,?,?)"
                 " ON CONFLICT(transcript) DO UPDATE SET offset=excluded.offset",
                 (str(f), new_offset, session_id))
             if groups:
-                inserted.append(event_args)
+                inserted.append((event_args, offset == 0))
     return inserted
 
 
@@ -716,16 +732,17 @@ def main():
                 # exist.
                 record(conn, *event_args, transcript, new_offset, *meta,
                        mirror_path=(mirror_db_path(root)
-                                    if project_mode and groups else None))
+                                    if project_mode and groups else None),
+                       first_capture=(offset == 0))
                 if groups:
-                    mirror_batch.append((*event_args, *meta))
+                    mirror_batch.append(((*event_args, *meta), offset == 0))
             else:
                 conn.rollback()
             stamp_project_name(conn, root, kit_name)
-            for swept in sweep_subagents(
+            for swept, fc in sweep_subagents(
                     conn, str(root), hook.get("session_id") or "unknown",
                     transcript, meta, agent):
-                mirror_batch.append((*swept, *meta))
+                mirror_batch.append(((*swept, *meta), fc))
         finally:
             conn.close()
         # Only now, with the central transaction committed and its connection
@@ -733,9 +750,9 @@ def main():
         # logged and dropped: the mirror exists for retention and portability,
         # never at the cost of the authoritative write or the session.
         if mirror_batch and project_mode:
-            for args in mirror_batch:
+            for args, fc in mirror_batch:
                 try:
-                    mirror_events(root, *args)
+                    mirror_events(root, *args, first_capture=fc)
                 except Exception:
                     log_error(f"mirror write failed: {mirror_db_path(root)}")
     except Exception:
