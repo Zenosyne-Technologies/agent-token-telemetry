@@ -18,6 +18,7 @@ immediately; a runtime file next to the DB records pid+port so a second `open`
 reattaches instead of starting a duplicate.
 """
 import argparse
+import datetime
 import json
 import os
 import signal
@@ -221,17 +222,36 @@ def _composition(rows):
     return {"tokens": tok, "cost": cost}
 
 
-def _timeline(rows):
+# Timeline granularity follows the PERIOD, not the row count: a week of
+# individual events is unreadable noise, and a year of days is a hairball.
+# day -> every event; week/month -> one point per day; year -> per month.
+TIMELINE_GRAIN = {"day": "event", "week": "day", "month": "day",
+                  "year": "month"}
+
+
+def _bucket_start(ts, grain):
+    if grain == "day":
+        return (ts // 86400) * 86400
+    d = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+    return int(datetime.datetime(d.year, d.month, 1,
+                                 tzinfo=datetime.timezone.utc).timestamp())
+
+
+def _timeline(rows, period):
     pts = sorted(rows, key=lambda r: r["ts"])
-    if len(pts) <= 1500:
+    grain = TIMELINE_GRAIN.get(period, "day")
+    if grain == "event":
         return [{"ts": r["ts"], "cost": r["cost"], "total": r["total"],
                  "consumed": r["consumed"], "cachetok": r["cachetok"],
-                 "model": r["modelName"]} for r in pts]
-    buckets = {}  # large window: bucket by day so the line stays bounded
+                 "model": r["modelName"], "n": 1, "grain": grain}
+                for r in pts]
+    buckets = {}
     for r in pts:
-        day = (r["ts"] // 86400) * 86400
-        b = buckets.setdefault(day, {"ts": day, "cost": 0.0, "total": 0,
-                                     "consumed": 0, "cachetok": 0, "model": ""})
+        key = _bucket_start(r["ts"], grain)
+        b = buckets.setdefault(key, {"ts": key, "cost": 0.0, "total": 0,
+                                     "consumed": 0, "cachetok": 0,
+                                     "model": "", "n": 0, "grain": grain})
+        b["n"] += 1
         for f in ("cost", "total", "consumed", "cachetok"):
             b[f] += r[f]
     return [buckets[k] for k in sorted(buckets)]
@@ -309,7 +329,8 @@ def build_data(conn, q):
         "byAgent": _group(rows, "agent", name_of=lambda r: r["agent"]),
         "byProject": by_project,
         "composition": _composition(rows),
-        "timeline": _timeline(rows),
+        "timeline": _timeline(rows, period),
+        "timelineGrain": TIMELINE_GRAIN.get(period, "day"),
         "events": {
             "rows": [_event_dto(r) for r in ev[start:start + page_size]],
             "total": len(rows), "start": start, "pageSize": page_size, "page": page,
