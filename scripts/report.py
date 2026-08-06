@@ -39,6 +39,16 @@ def fmt_n(n):
     return format(int(n or 0), ",")
 
 
+def fmt_usd(v):
+    """Cost cells: max two decimals, trailing zeros cut ($1.50 -> $1.5,
+    $25.00 -> $25). A nonzero cost must never render as $0 — tiny values
+    show as <$0.01 instead of claiming the work was free."""
+    if 0 < v < 0.005:
+        return "<$0.01"
+    s = f"{v:.2f}".rstrip("0").rstrip(".")
+    return f"${s}"
+
+
 def humanize(day, today=None):
     """`2026-08-06` -> `2026-08-06 (today)` / `(3 days ago)` / `(2 months ago)`."""
     if not day:
@@ -134,10 +144,10 @@ ORDER BY classic_in + classic_out + cached_r + cached_w DESC, output DESC;
 
 
 def split_cell(total, left, right, bold=False):
-    t = f"${total:.4f}"
+    t = fmt_usd(total)
     if bold:
         t = f"**{t}**"
-    return f"{t} (${left:.4f} / ${right:.4f})"
+    return f"{t} ({fmt_usd(left)} / {fmt_usd(right)})"
 
 
 def render_project_stats(rows):
@@ -222,7 +232,14 @@ WITH priced AS (
   FROM events e JOIN models m ON m.id = e.model_id
   WHERE e.ts >= strftime('%s','now','-7 days')
 )
-SELECT model_name, SUM(in_tok), SUM(out_tok),
+SELECT model_name,
+       CASE
+         WHEN model_name LIKE 'claude-fable-%' THEN 'orchestrator'
+         WHEN model_name LIKE 'claude-opus-%' THEN 'heavy'
+         WHEN model_name LIKE 'claude-sonnet-%' THEN 'small'
+         WHEN model_name LIKE 'claude-haiku-%' THEN 'micro'
+         ELSE 'unknown' END,
+       SUM(in_tok), SUM(out_tok),
        ROUND(SUM(in_tok*COALESCE(in_usd,0) + out_tok*COALESCE(out_usd,0)
              + cache_r*COALESCE(cache_r_usd,0)
              + (cache_w - cache_w_1h)*COALESCE(cache_w_usd,0)
@@ -271,14 +288,14 @@ def render_token_stats(d):
         return [label, fmt_n(t[0]), fmt_n(t[1]), fmt_n(t[2]), fmt_n(t[3]),
                 str(t[4])]
 
-    week_cost = sum(r[3] for r in d["by_model"])
-    rates = [r[4] for r in d["by_model"] if r[4] is not None]
+    week_cost = sum(r[4] for r in d["by_model"])
+    rates = [r[5] for r in d["by_model"] if r[5] is not None]
     if not rates:
         cost_label = "unpriced"
     elif min(rates) == 0:
-        cost_label = f"${week_cost:.4f} (seed rates)"
+        cost_label = f"{fmt_usd(week_cost)} (seed rates)"
     else:
-        cost_label = (f"${week_cost:.4f} (rates as of "
+        cost_label = (f"{fmt_usd(week_cost)} (rates as of "
                       + datetime.date.fromtimestamp(max(rates)).isoformat() + ")")
     out = [f"**Today: {fmt_n(d['today'][1])} output /"
            f" {fmt_n(d['today'][0])} input tokens, {d['today'][4]} events —"
@@ -294,13 +311,13 @@ def render_token_stats(d):
         [tok_row(r[0], r[1:]) for r in d["by_project"]])
     out += ["", "**By model (7 days)**", ""]
     model_rows = []
-    for name, inp, outp, cost, rate_from in d["by_model"]:
+    for name, tier, inp, outp, cost, rate_from in d["by_model"]:
         label = ("unpriced" if rate_from is None
-                 else f"${cost:.4f}"
+                 else fmt_usd(cost)
                  + (" (seed rates)" if rate_from == 0 else ""))
-        model_rows.append([name, fmt_n(inp), fmt_n(outp), label])
-    out += md_table(["model", "input", "output", "est. cost"],
-                    ["---", "---:", "---:", "---:"], model_rows)
+        model_rows.append([name, tier, fmt_n(inp), fmt_n(outp), label])
+    out += md_table(["model", "tier", "input", "output", "est. cost"],
+                    ["---", "---", "---:", "---:", "---:"], model_rows)
     out += ["", "**By agent and kind (7 days)**", ""]
     out += md_table(["agent", "input", "output", "events"],
                     ["---", "---:", "---:", "---:"],

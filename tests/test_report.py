@@ -34,8 +34,8 @@ class TestReportScript(unittest.TestCase):
         conn = capture.connect(self.db)
         now = int(time.time())
         groups = capture.aggregate([
-            entry(model="claude-sonnet-5", inp=1000, out=500, cr=100, cw=50,
-                  mid="m1", cw1h=50,
+            entry(model="claude-sonnet-5", inp=100000, out=50000, cr=10000,
+                  cw=5000, mid="m1", cw1h=5000,
                   ts=time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
                                    time.gmtime(now))),
         ])
@@ -55,7 +55,7 @@ class TestReportScript(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("| project | sessions | events |", out)
         self.assertIn("| proj |", out)   # basename fallback, no name stamped
-        self.assertIn("1,000", out)      # thousands separator
+        self.assertIn("100,000", out)    # thousands separator
         self.assertIn("(today)", out)
         # fresh DB prices at the seed -> the closing hint must appear
         self.assertIn("undated seed", out)
@@ -73,24 +73,28 @@ class TestReportScript(unittest.TestCase):
     def test_project_stats_prices_1h_writes_at_1h_rate(self):
         self.seed_db()
         _, out = run(["project-stats", "--db", str(self.db)])
-        # sonnet seed: in 3, out 15, cr 0.3, cw1h 6 per MTok; all writes are 1h
-        expected = (1000 * 3.0 + 500 * 15.0 + 100 * 0.30 + 50 * 6.0) / 1e6
-        self.assertIn(f"**${expected:.4f}**", out)   # est. cost total is bold
+        # sonnet seed per MTok: in 3, out 15, cr 0.3, cw1h 6; all writes 1h.
+        # 100k in + 50k out + 10k cr + 5k cw1h = 0.3+0.75+0.003+0.03 = 1.083
+        self.assertIn("**$1.08**", out)   # est. cost total, bold, 2 decimals
 
     def test_project_stats_cost_split_adds_up(self):
         self.seed_db()
         _, out = run(["project-stats", "--db", str(self.db)])
-        classic = (1000 * 3.0 + 500 * 15.0) / 1e6
-        cached = (100 * 0.30 + 50 * 6.0) / 1e6
-        # classic and cached columns carry their own totals with (l / r) splits
-        self.assertIn(f"${classic:.4f} (${1000 * 3.0 / 1e6:.4f} /"
-                      f" ${500 * 15.0 / 1e6:.4f})", out)
-        self.assertIn(f"${cached:.4f} (${100 * 0.30 / 1e6:.4f} /"
-                      f" ${50 * 6.0 / 1e6:.4f})", out)
+        # classic 1.05 (0.30 in / 0.75 out); cached 0.033 (0.003 r / 0.03 w).
+        # Max two decimals, trailing zeros cut, tiny-but-nonzero -> <$0.01.
+        self.assertIn("$1.05 ($0.3 / $0.75)", out)
+        self.assertIn("$0.03 (<$0.01 / $0.03)", out)
         # cache token counters are columns now
         self.assertIn("| cache read | cache write |", out.splitlines()[0])
         # rates dates no longer appear in the cost cells
         self.assertNotIn("(rates ", out)
+
+    def test_fmt_usd_rounding_rules(self):
+        self.assertEqual(report.fmt_usd(25.6747), "$25.67")
+        self.assertEqual(report.fmt_usd(1.50), "$1.5")
+        self.assertEqual(report.fmt_usd(25.00), "$25")
+        self.assertEqual(report.fmt_usd(0.0003), "<$0.01")
+        self.assertEqual(report.fmt_usd(0), "$0")
 
     def test_token_stats_renders_sections(self):
         self.seed_db()
@@ -101,6 +105,7 @@ class TestReportScript(unittest.TestCase):
         self.assertIn("**By model (7 days)**", out)
         self.assertIn("**By tier (7 days)**", out)
         self.assertIn("claude-sonnet-5", out)
+        self.assertIn("| claude-sonnet-5 | small |", out)  # tier in by-model
         self.assertIn("small", out)          # tier mapping
         self.assertIn("No milestone-branch", out)
         self.assertIn("No issue-tagged", out)
