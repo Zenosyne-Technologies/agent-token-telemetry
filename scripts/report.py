@@ -135,8 +135,8 @@ SELECT path, name,
        MAX(rate_from) AS rate_from,
        SUM(CASE WHEN ts IS NOT NULL AND rate_from IS NULL THEN 1 ELSE 0 END)
          AS unpriced_events,
-       date(MIN(ts), 'unixepoch') AS first_seen,
-       date(MAX(ts), 'unixepoch') AS last_activity
+       date(MIN(ts), 'unixepoch', 'localtime') AS first_seen,
+       date(MAX(ts), 'unixepoch', 'localtime') AS last_activity
 FROM priced GROUP BY path
 ORDER BY classic_in + classic_out + cached_r + cached_w DESC, output DESC;
 """).fetchall()
@@ -197,6 +197,10 @@ def render_project_stats(rows):
 # windowed figure (their timestamp is the capture day, not when the tokens
 # were spent) but always included in all-time views. See TELEMETRY-CONTRACT.md.
 NOT_BACKLOG = "COALESCE(note,'') <> 'backlog-capture'"
+# "Today" means the reader's local day: SQLite's bare 'start of day' is UTC,
+# which after local midnight reports the day before as today. Reports and the
+# dashboard must agree on where a day starts.
+LOCAL_TODAY = "ts >= strftime('%s','now','localtime','start of day','utc')"
 
 
 def fetch_token_stats(conn):
@@ -210,7 +214,7 @@ def fetch_token_stats(conn):
             " COALESCE(SUM(cache_r),0), COALESCE(SUM(cache_w),0), COUNT(*)"
             f" FROM events WHERE {where} AND {NOT_BACKLOG}").fetchone()
 
-    d = {"today": totals("ts >= strftime('%s','now','start of day')"),
+    d = {"today": totals(LOCAL_TODAY),
          "week": totals("ts >= strftime('%s','now','-7 days')")}
     d["backlog_excluded"] = conn.execute(
         "SELECT COUNT(*) FROM events"
@@ -421,7 +425,7 @@ def fetch_storage_status(conn, db):
                                   if Path(mirror_path).exists() else None)
         d["projects"].append(row)
     d["audit"] = (conn.execute(
-        "SELECT datetime(ts,'unixepoch'), action, project, detail"
+        "SELECT datetime(ts,'unixepoch','localtime'), action, project, detail"
         " FROM audit_log ORDER BY ts DESC LIMIT 5").fetchall()
         if has_column(conn, "audit_log", "action") else [])
     err = Path(db).parent / "error.log"
@@ -508,8 +512,8 @@ def fetch_info(conn, db, cwd):
 
     if conn is not None:
         events, first_day, last_day = conn.execute(
-            "SELECT COUNT(*), MIN(date(ts,'unixepoch')),"
-            " MAX(date(ts,'unixepoch')) FROM events").fetchone()
+            "SELECT COUNT(*), MIN(date(ts,'unixepoch','localtime')),"
+            " MAX(date(ts,'unixepoch','localtime')) FROM events").fetchone()
         # Latest rate already in force — a pre-inserted future-dated row (e.g.
         # a published price change) must not masquerade as the current rate.
         pricing_rows, latest = conn.execute(
