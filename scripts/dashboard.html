@@ -222,9 +222,8 @@
   svg.tl{display:block;width:100%;height:auto;overflow:visible;}
   .tl .grid-l{stroke:var(--panel-brd);stroke-width:1;}
   .tl .axis-t{fill:var(--ink-3);font-family:var(--font-mono);font-size:10px;}
-  .tl .area{opacity:.9;}
-  .tl .cross{stroke:var(--accent);stroke-width:1;stroke-dasharray:3 3;opacity:0;}
-  .tl .cdot{fill:var(--accent);opacity:0;}
+  .tl .tlbar{fill:url(#tlg);transition:opacity .12s;}
+  .tl .tlbar.on{opacity:.72;}
 
   /* tooltip */
   .tip{position:fixed;z-index:50;pointer-events:none;opacity:0;transform:translate(-50%,-120%);transition:opacity .12s;background:var(--panel);border:1px solid var(--panel-brd);border-radius:11px;padding:9px 11px;box-shadow:0 12px 30px -8px var(--panel-sh),inset 0 1px 0 var(--panel-hi);-webkit-backdrop-filter:blur(18px) saturate(160%);backdrop-filter:blur(18px) saturate(160%);font-size:12px;color:var(--ink);min-width:120px;}
@@ -409,7 +408,7 @@
       </section>
 
       <section class="card glass wide" aria-labelledby="h-tl">
-        <div class="card-hd"><h2 id="h-tl">Cumulative <span id="tl-metric">cost</span> over the <span id="tl-window">week</span></h2><span class="cap mono" id="cap-tl"></span></div>
+        <div class="card-hd"><h2 id="h-tl"><span id="tl-metric">Est. cost</span> per <span id="tl-grain">day</span></h2><span class="cap mono" id="cap-tl"></span></div>
         <div class="tl-wrap" id="tl-wrap"></div>
       </section>
 
@@ -539,8 +538,8 @@
   function fmtGrain(ts, grain){ const d=new Date(ts*1000);
     return grain==="month" ? `${MONTHS[d.getMonth()]} ${d.getFullYear()}`
          : grain==="day"   ? `${pad(d.getMonth()+1)}/${pad(d.getDate())}`
-         : `${pad(d.getHours())}:${pad(d.getMinutes())}`; }
-  const grainName=g=> g==="month"?"month":g==="day"?"day":"event";
+         : `${pad(d.getHours())}:00`; }
+  const grainName=g=> g==="month"?"month":g==="hour"?"hour":"day";
   // Events table: Detailed adds the clock time to a date-only long window, so a
   // day's worth of rows can be told apart without hovering.
   function fmtEventTime(ts){ const d=new Date(ts*1000), hm=pad(d.getHours())+":"+pad(d.getMinutes());
@@ -659,39 +658,38 @@
         : `By cost the picture inverts: generated output is ${share("out").toFixed(0)}% of spend yet a sliver of the token volume \u2014 output is priced many times a cache read.`;
   }
 
-  // ---- cumulative timeline ----
+  // ---- per-bucket columns: what was spent WHEN (never a running total) ----
   function renderTimeline(points){
     const wrap=$("tl-wrap"), m=state.metric, field=metricField(m);
-    const grain=(D&&D.timelineGrain)||"event";
+    const grain=(D&&D.timelineGrain)||"day";
     $("tl-metric").textContent=metricName(m);
-    $("tl-window").textContent=state.period==="day"?"day":state.period;
+    $("tl-grain").textContent=grainName(grain);
     if(!points.length){ wrap.innerHTML=`<div class="empty">No events in range.</div>`; return; }
-    let cum=0; const data=points.map(p=>{ cum+=p[field]; return {ts:p.ts,y:cum,p}; });
+    const data=points.map(p=>({ts:p.ts, y:p[field]||0, p}));
     const W=1000,H=260,PADL=64,PADR=18,PADT=16,PADB=30;
-    const t0=data[0].ts,t1=data[data.length-1].ts,tSpan=(t1-t0)||1, yMax=data[data.length-1].y||1;
-    const X=ts=>PADL+(ts-t0)/tSpan*(W-PADL-PADR), Y=y=>H-PADB-(y/yMax)*(H-PADT-PADB);
-    let grid="",ticks="",ttick="",lastTick=null;
+    const yMax=Math.max(...data.map(d=>d.y),0)||1, tot=data.reduce((s,d)=>s+d.y,0);
+    const plotW=W-PADL-PADR, slot=plotW/data.length;
+    const bw=Math.max(2,Math.min(46,slot*0.72)), Y=y=>H-PADB-(y/yMax)*(H-PADT-PADB);
+    const cx=i=>PADL+slot*(i+0.5);
+    let grid="",ticks="";
     for(let i=0;i<=4;i++){ const gy=PADT+(H-PADT-PADB)*i/4, val=yMax*(1-i/4);
       grid+=`<line class="grid-l" x1="${PADL}" y1="${gy.toFixed(1)}" x2="${W-PADR}" y2="${gy.toFixed(1)}"/>`;
-      ticks+=`<text class="axis-t" x="${PADL-8}" y="${(gy+3).toFixed(1)}" text-anchor="end">${m==="cost"?fmtUSD(val):fmtTok(val)}</text>`;
-      // Coarse grains can map several evenly-spaced ticks onto one bucket
-      // label (a 2-month year window would print "Jul 2026" four times) —
-      // draw each label once, at its first tick.
-      const ts=t0+tSpan*i/4, lab=fmtGrain(ts,grain);
-      if(lab!==lastTick){ lastTick=lab; ttick+=`<text class="axis-t" x="${X(ts).toFixed(1)}" y="${H-PADB+18}" text-anchor="middle">${lab}</text>`; } }
-    let d=`M ${X(data[0].ts).toFixed(1)} ${Y(data[0].y).toFixed(1)}`;
-    data.forEach(p=> d+=` L ${X(p.ts).toFixed(1)} ${Y(p.y).toFixed(1)}`);
-    const area=d+` L ${X(t1).toFixed(1)} ${(H-PADB).toFixed(1)} L ${X(t0).toFixed(1)} ${(H-PADB).toFixed(1)} Z`;
-    const dots=data.map((p,i)=>`<circle cx="${X(p.ts).toFixed(1)}" cy="${Y(p.y).toFixed(1)}" r="3" fill="var(--accent)" opacity="${i===data.length-1?1:0}"/>`).join("");
-    wrap.innerHTML=`<svg class="tl" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Cumulative ${m} over time"><defs><linearGradient id="tlg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity="0.42"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0.02"/></linearGradient></defs>${grid}${ticks}${ttick}<path class="area" d="${area}" fill="url(#tlg)"/><path d="${d}" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/><line class="cross" id="tl-cross" x1="0" y1="${PADT}" x2="0" y2="${H-PADB}"/><circle class="cdot" id="tl-cdot" r="4.5"/>${dots}<rect x="${PADL}" y="0" width="${W-PADL-PADR}" height="${H}" fill="transparent" id="tl-hit"/></svg>`;
-    const svg=wrap.querySelector("svg"),cross=wrap.querySelector("#tl-cross"),cdot=wrap.querySelector("#tl-cdot"),hit=wrap.querySelector("#tl-hit");
-    hit.addEventListener("mousemove",ev=>{ const r=svg.getBoundingClientRect(),px=(ev.clientX-r.left)/r.width*W; let best=data[0],bd=1e18; data.forEach(p=>{const dd=Math.abs(X(p.ts)-px); if(dd<bd){bd=dd;best=p;}}); const bx=X(best.ts),by=Y(best.y); cross.setAttribute("x1",bx);cross.setAttribute("x2",bx);cross.style.opacity="1"; cdot.setAttribute("cx",bx);cdot.setAttribute("cy",by);cdot.style.opacity="1";
-      const detail = grain==="event"
-        ? `<div class="t-r"><span>This event</span><b>${esc(best.p.model||"")}</b></div>`
-        : `<div class="t-r"><span>This ${grainName(grain)}</span><b>${best.p.n||0} event${(best.p.n||0)===1?"":"s"}</b></div>`;
-      showTip(`<div class="t-t">${fmtGrain(best.ts,grain)} \u00b7 cumulative</div><div class="t-r"><span>${m==="cost"?"Cost":m==="tokens"?"Tokens":m==="consumed"?"Consumed":"Cache"}</span><b>${m==="cost"?fmtUSD(best.y):fmtTok(best.y)}</b></div>${detail}<div class="t-r"><span>+ added</span><b>${m==="cost"?fmtUSD(best.p[field]):fmtTok(best.p[field])}</b></div>`,ev.clientX,ev.clientY);
+      ticks+=`<text class="axis-t" x="${PADL-8}" y="${(gy+3).toFixed(1)}" text-anchor="end">${m==="cost"?fmtUSD(val):fmtTok(val)}</text>`; }
+    // Label every bucket when they fit, else thin to ~10 evenly spaced labels.
+    const step=Math.max(1,Math.ceil(data.length/10));
+    const ttick=data.map((d,i)=> (i%step===0||i===data.length-1)
+      ? `<text class="axis-t" x="${cx(i).toFixed(1)}" y="${H-PADB+18}" text-anchor="middle">${fmtGrain(d.ts,grain)}</text>` : "").join("");
+    const bars=data.map((d,i)=>{ const h=Math.max(d.y>0?1.5:0,(H-PADB)-Y(d.y));
+      return `<rect class="tlbar" x="${(cx(i)-bw/2).toFixed(1)}" y="${(H-PADB-h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="${Math.min(3,bw/3).toFixed(1)}" data-i="${i}"/>`; }).join("");
+    const hits=data.map((d,i)=>`<rect x="${(PADL+slot*i).toFixed(1)}" y="${PADT}" width="${slot.toFixed(1)}" height="${(H-PADT-PADB).toFixed(1)}" fill="transparent" data-i="${i}"/>`).join("");
+    wrap.innerHTML=`<svg class="tl" viewBox="0 0 ${W} ${H}" role="img" aria-label="${metricName(m)} per ${grainName(grain)}"><defs><linearGradient id="tlg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity="0.95"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0.32"/></linearGradient></defs>${grid}${ticks}${ttick}${bars}<g id="tl-hits">${hits}</g></svg>`;
+    const svg=wrap.querySelector("svg");
+    svg.querySelectorAll("#tl-hits rect").forEach(hit=>{
+      const d=data[+hit.dataset.i], bar=svg.querySelector(`.tlbar[data-i="${hit.dataset.i}"]`);
+      hit.addEventListener("mousemove",ev=>{ if(bar)bar.classList.add("on");
+        showTip(`<div class="t-t">${fmtGrain(d.ts,grain)}</div><div class="t-r"><span>${m==="cost"?"Cost":m==="tokens"?"Tokens":m==="consumed"?"Consumed":"Cache"}</span><b>${m==="cost"?fmtUSD(d.y):fmtTok(d.y)}</b></div><div class="t-r"><span>Events</span><b>${d.p.n||0}</b></div><div class="t-r"><span>Share of ${state.period}</span><b>${(tot?d.y/tot*100:0).toFixed(1)}%</b></div>`,ev.clientX,ev.clientY); });
+      hit.addEventListener("mouseleave",()=>{ if(bar)bar.classList.remove("on"); hideTip(); });
     });
-    hit.addEventListener("mouseleave",()=>{ cross.style.opacity="0"; cdot.style.opacity="0"; hideTip(); });
   }
 
   // ---- projects table (stats + click-to-filter) ----
@@ -739,7 +737,7 @@
     renderTable(D.events);
     const cm=metricName(state.metric);
     $("cap-model").textContent="by "+cm; $("cap-agent").textContent="by "+cm;
-    $("cap-tl").textContent="running total · "+({event:"per event",day:"per day",month:"per month"}[D.timelineGrain||"event"]);
+    $("cap-tl").textContent=({hour:"hourly",day:"daily",month:"monthly"}[D.timelineGrain||"day"])+" consumption across the "+state.period;
     const d=new Date((D.generatedAt||0)*1000);
     $("snapline").innerHTML=`${state.period} window \u00b7 ${D.events.total} events<br>as of ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
