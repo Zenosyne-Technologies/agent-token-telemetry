@@ -222,35 +222,52 @@ def _composition(rows):
     return {"tokens": tok, "cost": cost}
 
 
-# Timeline granularity follows the PERIOD, not the row count: a week of
-# individual events is unreadable noise, and a year of days is a hairball.
-# day -> every event; week/month -> one point per day; year -> per month.
-TIMELINE_GRAIN = {"day": "event", "week": "day", "month": "day",
+# Timeline granularity follows the PERIOD: the chart answers "how much was
+# spent WHEN", so each column is one bucket's own consumption (never a running
+# total). day -> hourly; week/month -> daily; year -> monthly.
+TIMELINE_GRAIN = {"day": "hour", "week": "day", "month": "day",
                   "year": "month"}
+# Buckets are LOCAL-time aligned: the server is localhost-only, so its clock is
+# the one the reader's dates are rendered in — a UTC-aligned "day" would split
+# an evening's work across two columns.
+_GRAIN_FLOOR = {"hour": dict(minute=0, second=0, microsecond=0),
+                "day": dict(hour=0, minute=0, second=0, microsecond=0),
+                "month": dict(day=1, hour=0, minute=0, second=0,
+                              microsecond=0)}
 
 
 def _bucket_start(ts, grain):
+    return int(datetime.datetime.fromtimestamp(ts)
+               .replace(**_GRAIN_FLOOR[grain]).timestamp())
+
+
+def _next_bucket(ts, grain):
+    if grain == "hour":
+        return _bucket_start(ts + 3600, grain)
     if grain == "day":
-        return (ts // 86400) * 86400
-    d = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
-    return int(datetime.datetime(d.year, d.month, 1,
-                                 tzinfo=datetime.timezone.utc).timestamp())
+        # +26h clears the boundary even on a DST-shortened day, then re-floors
+        return _bucket_start(ts + 26 * 3600, grain)
+    d = datetime.datetime.fromtimestamp(ts)
+    y, m = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
+    return int(datetime.datetime(y, m, 1).timestamp())
 
 
-def _timeline(rows, period):
-    pts = sorted(rows, key=lambda r: r["ts"])
+def _timeline(rows, period, since, now):
+    """One point per bucket across the WHOLE window — quiet buckets included as
+    zeros, so a gap reads as "nothing happened" instead of vanishing and
+    stretching its neighbours across the axis."""
     grain = TIMELINE_GRAIN.get(period, "day")
-    if grain == "event":
-        return [{"ts": r["ts"], "cost": r["cost"], "total": r["total"],
-                 "consumed": r["consumed"], "cachetok": r["cachetok"],
-                 "model": r["modelName"], "n": 1, "grain": grain}
-                for r in pts]
     buckets = {}
-    for r in pts:
-        key = _bucket_start(r["ts"], grain)
-        b = buckets.setdefault(key, {"ts": key, "cost": 0.0, "total": 0,
-                                     "consumed": 0, "cachetok": 0,
-                                     "model": "", "n": 0, "grain": grain})
+    key = _bucket_start(since, grain)
+    end = _bucket_start(now, grain)
+    while key <= end:
+        buckets[key] = {"ts": key, "cost": 0.0, "total": 0, "consumed": 0,
+                        "cachetok": 0, "n": 0, "grain": grain}
+        key = _next_bucket(key, grain)
+    for r in rows:
+        b = buckets.get(_bucket_start(r["ts"], grain))
+        if b is None:      # event older than the window's first bucket
+            continue
         b["n"] += 1
         for f in ("cost", "total", "consumed", "cachetok"):
             b[f] += r[f]
@@ -329,7 +346,7 @@ def build_data(conn, q):
         "byAgent": _group(rows, "agent", name_of=lambda r: r["agent"]),
         "byProject": by_project,
         "composition": _composition(rows),
-        "timeline": _timeline(rows, period),
+        "timeline": _timeline(rows, period, since, now),
         "timelineGrain": TIMELINE_GRAIN.get(period, "day"),
         "events": {
             "rows": [_event_dto(r) for r in ev[start:start + page_size]],
