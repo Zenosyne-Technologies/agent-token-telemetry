@@ -411,7 +411,7 @@
       </section>
 
       <section class="card glass wide" aria-labelledby="h-tl">
-        <div class="card-hd"><h2 id="h-tl"><span id="tl-metric">Est. cost</span> per <span id="tl-grain">day</span></h2><span class="cap mono" id="cap-tl"></span></div>
+        <div class="card-hd"><h2 id="h-tl"><span id="tl-metric">Est. cost</span> per <span id="tl-grain">day</span></h2><div class="miniseg" id="grain" role="group" aria-label="Granularity"></div><span class="cap mono" id="cap-tl"></span></div>
         <div class="tl-wrap" id="tl-wrap"></div>
       </section>
 
@@ -508,6 +508,7 @@
     models:null, agents:null, project:null,            // null = all
     sort:{k:"ts",dir:"desc"}, projSort:{k:"cost",dir:"desc"},
     pview:"split", eview:"split",                      // detailed vs summary tables
+    grain:null,                                        // null = the period's default
     page:0, pageSize:12, refreshMs:300000
   };
 
@@ -557,6 +558,7 @@
   function query(){
     const p=new URLSearchParams();
     p.set("period",state.period);
+    if(state.grain) p.set("grain",state.grain);
     if(state.models) p.set("models",[...state.models].join(","));
     if(state.agents) p.set("agents",[...state.agents].join(","));
     if(state.project) p.set("project",state.project);
@@ -661,6 +663,16 @@
         : `By cost the picture inverts: generated output is ${share("out").toFixed(0)}% of spend yet a sliver of the token volume \u2014 output is priced many times a cache read.`;
   }
 
+  // ---- granularity picker: built from what the server says the window can
+  // carry, so the rule lives in one place (an hour grain over a year would be
+  // 8,760 points; a month grain over a week would be one).
+  const GRAIN_LAB={hour:"Hourly",day:"Daily",month:"Monthly"};
+  function buildGrainSeg(){
+    const host=$("grain"), opts=(D&&D.timelineGrains)||["day"], cur=(D&&D.timelineGrain)||"day";
+    host.innerHTML=opts.map(g=>`<button data-g="${g}" aria-pressed="${g===cur}">${GRAIN_LAB[g]||g}</button>`).join("");
+    host.querySelectorAll("button").forEach(b=>b.onclick=()=>{ state.grain=b.dataset.g; load(); });
+  }
+
   // ---- per-bucket filled line: what was spent WHEN (never a running total) ----
   function renderTimeline(points){
     const wrap=$("tl-wrap"), m=state.metric, field=metricField(m);
@@ -739,6 +751,10 @@
     renderBars("bars-model",D.byModel,"model");
     renderBars("bars-agent",D.byAgent,"agent");
     renderComp(D.composition);
+    // The server is the authority on which grain actually applied (a choice the
+    // window cannot carry falls back) — the segment shows that, while
+    // state.grain stays "explicit choice, or null for the period's default".
+    buildGrainSeg();
     renderTimeline(D.timeline);
     renderProjects(D.byProject);
     renderTable(D.events);
@@ -755,7 +771,7 @@
   function setRefresh(ms,kick){ state.refreshMs=ms; if(refreshTimer){clearInterval(refreshTimer);refreshTimer=null;} if(ms>0){ refreshTimer=setInterval(load,ms); if(kick!==false) load(); } [["rf-off",0],["rf-1",60000],["rf-5",300000]].forEach(([id,v])=>$(id).setAttribute("aria-pressed",v===ms?"true":"false")); updateRefreshStatus(); }
 
   // ---- wiring ----
-  document.querySelectorAll("#period button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#period button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.period=b.dataset.p; state.models=null; state.agents=null; state.project=null; state.page=0; load(); }));
+  document.querySelectorAll("#period button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#period button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.period=b.dataset.p; state.models=null; state.agents=null; state.project=null; state.page=0; state.grain=null; load(); }));   // grain: back to the new period's default
   document.querySelectorAll("#metric button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#metric button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.metric=b.dataset.m; if(D){ renderBars("bars-model",D.byModel,"model"); renderBars("bars-agent",D.byAgent,"agent"); renderTimeline(D.timeline); renderComp(D.composition); const cm=metricName(state.metric); $("cap-model").textContent="by "+cm; $("cap-agent").textContent="by "+cm; } }));
   document.querySelectorAll("#pview button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#pview button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.pview=b.dataset.v; if(D) renderProjects(D.byProject); }));
   document.querySelectorAll("#eview button").forEach(b=>b.addEventListener("click",()=>{ document.querySelectorAll("#eview button").forEach(x=>x.setAttribute("aria-pressed","false")); b.setAttribute("aria-pressed","true"); state.eview=b.dataset.v; if(D) renderTable(D.events); }));

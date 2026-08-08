@@ -222,11 +222,15 @@ def _composition(rows):
     return {"tokens": tok, "cost": cost}
 
 
-# Timeline granularity follows the PERIOD: the chart answers "how much was
-# spent WHEN", so each column is one bucket's own consumption (never a running
-# total). day -> hourly; week/month -> daily; year -> monthly.
+# Timeline granularity: the chart answers "how much was spent WHEN", so each
+# point is one bucket's own consumption (never a running total). The period
+# picks a sensible default; the reader can override it within what the window
+# can carry — hours across a year would be 8,760 points, months across a week
+# would be one.
 TIMELINE_GRAIN = {"day": "hour", "week": "day", "month": "day",
                   "year": "month"}
+GRAIN_ALLOWED = {"day": ("hour", "day"), "week": ("hour", "day"),
+                 "month": ("hour", "day"), "year": ("day", "month")}
 # Buckets are LOCAL-time aligned: the server is localhost-only, so its clock is
 # the one the reader's dates are rendered in — a UTC-aligned "day" would split
 # an evening's work across two columns.
@@ -252,11 +256,18 @@ def _next_bucket(ts, grain):
     return int(datetime.datetime(y, m, 1).timestamp())
 
 
-def _timeline(rows, period, since, now):
+def resolve_grain(period, requested):
+    """The reader's choice when the window can carry it, else the default."""
+    allowed = GRAIN_ALLOWED.get(period, ("day",))
+    return requested if requested in allowed else TIMELINE_GRAIN.get(period,
+                                                                     "day")
+
+
+def _timeline(rows, period, since, now, grain=None):
     """One point per bucket across the WHOLE window — quiet buckets included as
     zeros, so a gap reads as "nothing happened" instead of vanishing and
     stretching its neighbours across the axis."""
-    grain = TIMELINE_GRAIN.get(period, "day")
+    grain = grain or TIMELINE_GRAIN.get(period, "day")
     buckets = {}
     key = _bucket_start(since, grain)
     end = _bucket_start(now, grain)
@@ -303,6 +314,7 @@ def build_data(conn, q):
     now = int(time.time())
     since = now - PERIODS[period] * 86400
 
+    grain = resolve_grain(period, one("grain", ""))
     models, agents = listparam("models"), listparam("agents")
     project = one("project", "") or None
     sort = SORT_MAP.get(one("sort", "ts"), "ts")
@@ -346,8 +358,9 @@ def build_data(conn, q):
         "byAgent": _group(rows, "agent", name_of=lambda r: r["agent"]),
         "byProject": by_project,
         "composition": _composition(rows),
-        "timeline": _timeline(rows, period, since, now),
-        "timelineGrain": TIMELINE_GRAIN.get(period, "day"),
+        "timeline": _timeline(rows, period, since, now, grain),
+        "timelineGrain": grain,
+        "timelineGrains": list(GRAIN_ALLOWED.get(period, ("day",))),
         "events": {
             "rows": [_event_dto(r) for r in ev[start:start + page_size]],
             "total": len(rows), "start": start, "pageSize": page_size, "page": page,
