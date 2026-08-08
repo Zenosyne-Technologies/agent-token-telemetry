@@ -197,5 +197,40 @@ class TestTimelineGrain(unittest.TestCase):
         self.assertEqual(sum(b["n"] for b in tl), 0)
 
 
+class TestGrainChoice(unittest.TestCase):
+    """The period picks a default; the reader may override it within what the
+    window can carry (hours across a year would be 8,760 points)."""
+
+    def test_defaults_are_used_when_nothing_is_asked(self):
+        for period, grain in dashboard.TIMELINE_GRAIN.items():
+            self.assertEqual(dashboard.resolve_grain(period, ""), grain)
+
+    def test_explicit_choice_is_honoured_when_offered(self):
+        self.assertEqual(dashboard.resolve_grain("week", "hour"), "hour")
+        self.assertEqual(dashboard.resolve_grain("month", "hour"), "hour")
+        self.assertEqual(dashboard.resolve_grain("year", "day"), "day")
+
+    def test_unavailable_choice_falls_back_to_the_default(self):
+        # months across a week would be one point; hours across a year, 8,760
+        self.assertEqual(dashboard.resolve_grain("week", "month"), "day")
+        self.assertEqual(dashboard.resolve_grain("year", "hour"), "month")
+        self.assertEqual(dashboard.resolve_grain("day", "nonsense"), "hour")
+
+    def test_month_grain_is_offered_for_the_year_window_only(self):
+        for period, offers in dashboard.GRAIN_ALLOWED.items():
+            self.assertEqual("month" in offers, period == "year", period)
+
+    def test_every_default_is_among_its_own_offers(self):
+        for period, grain in dashboard.TIMELINE_GRAIN.items():
+            self.assertIn(grain, dashboard.GRAIN_ALLOWED[period])
+
+    def test_timeline_honours_an_explicit_grain(self):
+        since, now = ts(2026, 8, 6), ts(2026, 8, 6, 5)
+        tl = dashboard._timeline([row(ts(2026, 8, 6, 2))], "week", since, now,
+                                 grain="hour")
+        self.assertEqual(len(tl), 6)                 # 6 hourly buckets, not 1 day
+        self.assertTrue(all(b["grain"] == "hour" for b in tl))
+
+
 if __name__ == "__main__":
     unittest.main()
