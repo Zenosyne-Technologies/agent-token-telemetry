@@ -222,8 +222,11 @@
   svg.tl{display:block;width:100%;height:auto;overflow:visible;}
   .tl .grid-l{stroke:var(--panel-brd);stroke-width:1;}
   .tl .axis-t{fill:var(--ink-3);font-family:var(--font-mono);font-size:10px;}
-  .tl .tlbar{fill:url(#tlg);transition:opacity .12s;}
-  .tl .tlbar.on{opacity:.72;}
+  .tl .area{opacity:.95;}
+  .tl .tlline{fill:none;stroke:var(--accent);stroke-width:2.2;stroke-linejoin:round;stroke-linecap:round;}
+  .tl .tldot{fill:var(--accent);opacity:.55;}
+  .tl .cross{stroke:var(--accent);stroke-width:1;stroke-dasharray:3 3;opacity:0;}
+  .tl .cdot{fill:var(--accent);opacity:0;}
 
   /* tooltip */
   .tip{position:fixed;z-index:50;pointer-events:none;opacity:0;transform:translate(-50%,-120%);transition:opacity .12s;background:var(--panel);border:1px solid var(--panel-brd);border-radius:11px;padding:9px 11px;box-shadow:0 12px 30px -8px var(--panel-sh),inset 0 1px 0 var(--panel-hi);-webkit-backdrop-filter:blur(18px) saturate(160%);backdrop-filter:blur(18px) saturate(160%);font-size:12px;color:var(--ink);min-width:120px;}
@@ -658,7 +661,7 @@
         : `By cost the picture inverts: generated output is ${share("out").toFixed(0)}% of spend yet a sliver of the token volume \u2014 output is priced many times a cache read.`;
   }
 
-  // ---- per-bucket columns: what was spent WHEN (never a running total) ----
+  // ---- per-bucket filled line: what was spent WHEN (never a running total) ----
   function renderTimeline(points){
     const wrap=$("tl-wrap"), m=state.metric, field=metricField(m);
     const grain=(D&&D.timelineGrain)||"day";
@@ -668,28 +671,32 @@
     const data=points.map(p=>({ts:p.ts, y:p[field]||0, p}));
     const W=1000,H=260,PADL=64,PADR=18,PADT=16,PADB=30;
     const yMax=Math.max(...data.map(d=>d.y),0)||1, tot=data.reduce((s,d)=>s+d.y,0);
-    const plotW=W-PADL-PADR, slot=plotW/data.length;
-    const bw=Math.max(2,Math.min(46,slot*0.72)), Y=y=>H-PADB-(y/yMax)*(H-PADT-PADB);
-    const cx=i=>PADL+slot*(i+0.5);
+    const plotW=W-PADL-PADR, n=data.length;
+    const X=i=> n===1 ? PADL+plotW/2 : PADL+(i/(n-1))*plotW;
+    const Y=y=>H-PADB-(y/yMax)*(H-PADT-PADB);
     let grid="",ticks="";
     for(let i=0;i<=4;i++){ const gy=PADT+(H-PADT-PADB)*i/4, val=yMax*(1-i/4);
       grid+=`<line class="grid-l" x1="${PADL}" y1="${gy.toFixed(1)}" x2="${W-PADR}" y2="${gy.toFixed(1)}"/>`;
       ticks+=`<text class="axis-t" x="${PADL-8}" y="${(gy+3).toFixed(1)}" text-anchor="end">${m==="cost"?fmtUSD(val):fmtTok(val)}</text>`; }
     // Label every bucket when they fit, else thin to ~10 evenly spaced labels.
-    const step=Math.max(1,Math.ceil(data.length/10));
-    const ttick=data.map((d,i)=> (i%step===0||i===data.length-1)
-      ? `<text class="axis-t" x="${cx(i).toFixed(1)}" y="${H-PADB+18}" text-anchor="middle">${fmtGrain(d.ts,grain)}</text>` : "").join("");
-    const bars=data.map((d,i)=>{ const h=Math.max(d.y>0?1.5:0,(H-PADB)-Y(d.y));
-      return `<rect class="tlbar" x="${(cx(i)-bw/2).toFixed(1)}" y="${(H-PADB-h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="${Math.min(3,bw/3).toFixed(1)}" data-i="${i}"/>`; }).join("");
-    const hits=data.map((d,i)=>`<rect x="${(PADL+slot*i).toFixed(1)}" y="${PADT}" width="${slot.toFixed(1)}" height="${(H-PADT-PADB).toFixed(1)}" fill="transparent" data-i="${i}"/>`).join("");
-    wrap.innerHTML=`<svg class="tl" viewBox="0 0 ${W} ${H}" role="img" aria-label="${metricName(m)} per ${grainName(grain)}"><defs><linearGradient id="tlg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity="0.95"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0.32"/></linearGradient></defs>${grid}${ticks}${ttick}${bars}<g id="tl-hits">${hits}</g></svg>`;
-    const svg=wrap.querySelector("svg");
-    svg.querySelectorAll("#tl-hits rect").forEach(hit=>{
-      const d=data[+hit.dataset.i], bar=svg.querySelector(`.tlbar[data-i="${hit.dataset.i}"]`);
-      hit.addEventListener("mousemove",ev=>{ if(bar)bar.classList.add("on");
-        showTip(`<div class="t-t">${fmtGrain(d.ts,grain)}</div><div class="t-r"><span>${m==="cost"?"Cost":m==="tokens"?"Tokens":m==="consumed"?"Consumed":"Cache"}</span><b>${m==="cost"?fmtUSD(d.y):fmtTok(d.y)}</b></div><div class="t-r"><span>Events</span><b>${d.p.n||0}</b></div><div class="t-r"><span>Share of ${state.period}</span><b>${(tot?d.y/tot*100:0).toFixed(1)}%</b></div>`,ev.clientX,ev.clientY); });
-      hit.addEventListener("mouseleave",()=>{ if(bar)bar.classList.remove("on"); hideTip(); });
+    const step=Math.max(1,Math.ceil(n/10));
+    const ttick=data.map((d,i)=> (i%step===0||i===n-1)
+      ? `<text class="axis-t" x="${X(i).toFixed(1)}" y="${H-PADB+18}" text-anchor="middle">${fmtGrain(d.ts,grain)}</text>` : "").join("");
+    const line=data.map((d,i)=>`${i?"L":"M"} ${X(i).toFixed(1)} ${Y(d.y).toFixed(1)}`).join(" ");
+    const area=`${line} L ${X(n-1).toFixed(1)} ${(H-PADB).toFixed(1)} L ${X(0).toFixed(1)} ${(H-PADB).toFixed(1)} Z`;
+    // Dots only while they stay legible; a month of days would be a bead curtain.
+    const dots=n<=32 ? data.map((d,i)=>`<circle class="tldot" cx="${X(i).toFixed(1)}" cy="${Y(d.y).toFixed(1)}" r="2.6"/>`).join("") : "";
+    wrap.innerHTML=`<svg class="tl" viewBox="0 0 ${W} ${H}" role="img" aria-label="${metricName(m)} per ${grainName(grain)}"><defs><linearGradient id="tlg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity="0.46"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0.03"/></linearGradient></defs>${grid}${ticks}${ttick}<path class="area" d="${area}" fill="url(#tlg)"/><path class="tlline" d="${line}"/>${dots}<line class="cross" id="tl-cross" x1="0" y1="${PADT}" x2="0" y2="${H-PADB}"/><circle class="cdot" id="tl-cdot" r="4.5"/><rect x="${PADL}" y="0" width="${plotW}" height="${H}" fill="transparent" id="tl-hit"/></svg>`;
+    const svg=wrap.querySelector("svg"),cross=svg.querySelector("#tl-cross"),cdot=svg.querySelector("#tl-cdot"),hit=svg.querySelector("#tl-hit");
+    hit.addEventListener("mousemove",ev=>{
+      const r=svg.getBoundingClientRect(), px=(ev.clientX-r.left)/r.width*W;
+      const i=Math.max(0,Math.min(n-1,Math.round(n===1?0:(px-PADL)/plotW*(n-1))));
+      const d=data[i], bx=X(i), by=Y(d.y);
+      cross.setAttribute("x1",bx); cross.setAttribute("x2",bx); cross.style.opacity="1";
+      cdot.setAttribute("cx",bx); cdot.setAttribute("cy",by); cdot.style.opacity="1";
+      showTip(`<div class="t-t">${fmtGrain(d.ts,grain)}</div><div class="t-r"><span>${m==="cost"?"Cost":m==="tokens"?"Tokens":m==="consumed"?"Consumed":"Cache"}</span><b>${m==="cost"?fmtUSD(d.y):fmtTok(d.y)}</b></div><div class="t-r"><span>Events</span><b>${d.p.n||0}</b></div><div class="t-r"><span>Share of ${state.period}</span><b>${(tot?d.y/tot*100:0).toFixed(1)}%</b></div>`,ev.clientX,ev.clientY);
     });
+    hit.addEventListener("mouseleave",()=>{ cross.style.opacity="0"; cdot.style.opacity="0"; hideTip(); });
   }
 
   // ---- projects table (stats + click-to-filter) ----
