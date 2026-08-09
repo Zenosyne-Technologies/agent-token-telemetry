@@ -361,6 +361,7 @@ def build_data(conn, q):
         "timeline": _timeline(rows, period, since, now, grain),
         "timelineGrain": grain,
         "timelineGrains": list(GRAIN_ALLOWED.get(period, ("day",))),
+        "serverVersion": own_version(),
         "events": {
             "rows": [_event_dto(r) for r in ev[start:start + page_size]],
             "total": len(rows), "start": start, "pageSize": page_size, "page": page,
@@ -429,6 +430,67 @@ def _free_port(preferred):
 def _port_open(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+# A plugin update leaves older versions in the cache, and a Claude Code session
+# keeps serving the command text it loaded at startup — so `open`/`restart` can
+# be invoked from a stale copy long after an update, silently rolling the
+# dashboard back. Those two commands re-exec the newest INSTALLED copy instead.
+NO_REDIRECT_ENV = "TOKEN_TELEMETRY_NO_REDIRECT"
+
+
+def own_version():
+    """The plugin version THIS server is running, surfaced on the page: a
+    rollback (an older copy restarting the server) is then visible rather than
+    silently serving stale UI. Unknown in a checkout without a manifest."""
+    try:
+        return json.loads((HERE.parent / ".claude-plugin" / "plugin.json")
+                          .read_text())["version"]
+    except Exception:
+        return None
+
+
+def _version_tuple(name):
+    try:
+        return tuple(int(p) for p in name.split("."))
+    except ValueError:
+        return None
+
+
+def newest_sibling_script(me=None):
+    """This script from the highest version installed beside it, or None when
+    it already IS the newest — or when the layout is not a versioned plugin
+    cache (`.../<plugin>/<version>/scripts/dashboard.py`), e.g. a dev
+    checkout, where the invoking copy is exactly what was meant."""
+    me = Path(me or __file__).resolve()
+    mine = _version_tuple(me.parent.parent.name)
+    if mine is None:
+        return None
+    best, best_v = None, mine
+    try:
+        siblings = list(me.parent.parent.parent.iterdir())
+    except OSError:
+        return None
+    for d in siblings:
+        v = _version_tuple(d.name)
+        cand = d / me.parent.name / me.name
+        if v and v > best_v and cand.exists():
+            best, best_v = cand, v
+    return best
+
+
+def _redirect_to_newest():
+    """Hand off to the newest installed copy, once (the env guard makes the
+    re-exec non-recursive even if the newest copy resolves differently)."""
+    if os.environ.get(NO_REDIRECT_ENV):
+        return
+    newer = newest_sibling_script()
+    if newer is None:
+        return
+    print(f"note: invoked from an older installed copy — running"
+          f" {newer.parent.parent.name} instead")
+    os.environ[NO_REDIRECT_ENV] = "1"
+    os.execv(sys.executable, [sys.executable, str(newer), *sys.argv[1:]])
 
 
 def _read_runtime():
@@ -585,6 +647,11 @@ def main(argv=None):
     rs.add_argument("--port", type=int, default=8756)
     sub.add_parser("stop", help="stop a backgrounded dashboard server")
     args = ap.parse_args(argv)
+
+    # `serve` runs exactly what it was handed (open/restart spawn it
+    # deliberately, after any redirect); `stop` only signals a pid.
+    if args.command in (None, "open", "restart"):
+        _redirect_to_newest()
 
     if args.command == "serve":
         cmd_serve(args.port)
