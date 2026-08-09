@@ -232,5 +232,58 @@ class TestGrainChoice(unittest.TestCase):
         self.assertTrue(all(b["grain"] == "hour" for b in tl))
 
 
+class TestVersionRedirect(unittest.TestCase):
+    """A plugin update leaves older copies in the cache and a running session
+    keeps serving the command text it loaded — `open`/`restart` must not roll
+    the dashboard back to the stale copy they were invoked from."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name) / "token-telemetry"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def make(self, *versions):
+        for v in versions:
+            d = self.root / v / "scripts"
+            d.mkdir(parents=True)
+            (d / "dashboard.py").write_text("# copy\n")
+        return self.root
+
+    def test_points_at_the_highest_installed_version(self):
+        self.make("0.9.1", "0.10.3", "0.12.0")
+        got = dashboard.newest_sibling_script(
+            self.root / "0.10.3" / "scripts" / "dashboard.py")
+        self.assertEqual(got,
+                         (self.root / "0.12.0" / "scripts" / "dashboard.py")
+                         .resolve())
+
+    def test_semver_ordering_is_numeric_not_lexical(self):
+        # "0.9.1" > "0.12.0" as strings; the version tuple must win
+        self.make("0.9.1", "0.12.0")
+        got = dashboard.newest_sibling_script(
+            self.root / "0.9.1" / "scripts" / "dashboard.py")
+        self.assertEqual(got.parent.parent.name, "0.12.0")
+
+    def test_newest_copy_redirects_nowhere(self):
+        self.make("0.11.1", "0.12.0")
+        self.assertIsNone(dashboard.newest_sibling_script(
+            self.root / "0.12.0" / "scripts" / "dashboard.py"))
+
+    def test_dev_checkout_is_left_alone(self):
+        # not a versioned cache layout -> the invoking copy is what was meant
+        d = pathlib.Path(self.tmp.name) / "repo" / "scripts"
+        d.mkdir(parents=True)
+        (d / "dashboard.py").write_text("# dev\n")
+        self.assertIsNone(dashboard.newest_sibling_script(d / "dashboard.py"))
+
+    def test_incomplete_version_dirs_are_skipped(self):
+        self.make("0.11.1")
+        (self.root / "0.13.0").mkdir()          # no scripts/dashboard.py
+        self.assertIsNone(dashboard.newest_sibling_script(
+            self.root / "0.11.1" / "scripts" / "dashboard.py"))
+
+
 if __name__ == "__main__":
     unittest.main()

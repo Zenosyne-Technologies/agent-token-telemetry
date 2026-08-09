@@ -762,7 +762,9 @@
     $("cap-model").textContent="by "+cm; $("cap-agent").textContent="by "+cm;
     $("cap-tl").textContent=({hour:"hourly",day:"daily",month:"monthly"}[D.timelineGrain||"day"])+" consumption across the "+state.period;
     const d=new Date((D.generatedAt||0)*1000);
-    $("snapline").innerHTML=`${state.period} window \u00b7 ${D.events.total} events<br>as of ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    // The running server's version is shown so a rollback (an older installed
+    // copy restarting the server) is visible instead of silently stale UI.
+    $("snapline").innerHTML=`${state.period} window \u00b7 ${D.events.total} events<br>as of ${pad(d.getHours())}:${pad(d.getMinutes())}${D.serverVersion?` \u00b7 v${esc(D.serverVersion)}`:""}`;
   }
 
   // ---- auto-refresh (now a real live re-query) ----
