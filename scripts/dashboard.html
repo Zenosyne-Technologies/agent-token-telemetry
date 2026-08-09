@@ -620,7 +620,7 @@
     const consumedPct = k.total ? k.consumed/k.total*100 : 0;
     const cards=[
       {lab:"Est. cost",val:fmtUSD(k.cost),accent:true,sub:`across ${k.events} event${k.events!==1?"s":""}`},
-      {lab:"Total tokens",val:fmtTok(k.total),sub:`${fmtInt(k.out)} generated out`},
+      {lab:"Total tokens",val:fmtTok(k.total),sub:`${fmtTok(k.out)} generated out`},
       {lab:"Consumed tokens",val:fmtTok(k.consumed),meter:consumedPct,sub:`${consumedPct.toFixed(1)}% of all tokens`},
       {lab:"Cache tokens",val:fmtTok(k.cachetok),meter:k.cachePct,sub:`${k.cachePct.toFixed(1)}% of all tokens`},
       {lab:"Output \u2192 cost",val:Math.round(k.outCostPct)+"%",meter:k.outCostPct,sub:"of spend is generated text"},
