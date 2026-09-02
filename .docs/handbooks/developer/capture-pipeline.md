@@ -3,7 +3,7 @@ title: Capture Pipeline
 audience: developer
 module: capture
 sources: [scripts/capture.py, hooks/hooks.json, docs/TELEMETRY-CONTRACT.md]
-updated: 2026-08-06
+updated: 2026-09-02
 related: [[pricing-and-cost]]
 ---
 
@@ -147,6 +147,22 @@ commit. `sidecar_text()` further restricts sidecar values to scalars only:
 sidecar files are agent-written JSON and could contain a dict or list, and
 binding either into sqlite3 raises `ProgrammingError` — which would take
 capture offline for as long as the bad file exists.
+
+## Project name: a three-location ladder, first match wins
+
+`project_name_from_kit()` reads the human project name from the kit's
+`PROJECT-INFO.md` frontmatter (`project:` key). The kit document has moved
+across its own versions, so the function checks a fixed ladder — `.marvin/`
+(kit >=v0.21), then `.docs/` (kit v0.15-0.20), then `docs/` (kit <v0.15) — and
+stops at the **first location whose file exists**. That file alone decides the
+result: if its `project:` value is missing or an unresolved `{{PLACEHOLDER}}`,
+the function returns `None` rather than falling through to the next rung, even
+though a later location might hold a perfectly valid name. This keeps
+resolution deterministic for a repo mid-migration between kit versions —
+exactly one document is ever authoritative for a given capture, never a merge
+of several. `stamp_project_name()` re-runs this resolution on every capture, so
+a renamed or relocated `PROJECT-INFO.md` self-heals the stamped `projects.name`
+on the next turn, with no migration step of its own.
 
 ## Pricing at query time, not capture time
 
