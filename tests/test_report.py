@@ -2,6 +2,7 @@ import contextlib
 import io
 import pathlib
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -107,8 +108,22 @@ class TestReportScript(unittest.TestCase):
         self.assertIn("claude-sonnet-5", out)
         self.assertIn("| claude-sonnet-5 | small |", out)  # tier in by-model
         self.assertIn("small", out)          # tier mapping
-        self.assertIn("No milestone-branch", out)
         self.assertIn("No issue-tagged", out)
+
+    def test_token_stats_never_groups_by_branch(self):
+        self.seed_db()
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE events SET branch='milestone/foo'")
+        conn.commit()
+        conn.close()
+        _, out = run(["token-stats", "--db", str(self.db)])
+        self.assertNotIn("milestone", out.lower())
+        self.assertNotIn("By milestone", out)
+        # events.branch must no longer be used as a grouping key anywhere
+        src = pathlib.Path(report.__file__).read_text()
+        self.assertNotIn("branch LIKE", src)
+        self.assertNotIn("GROUP BY branch", src)
+        self.assertNotIn("by_milestone", src)
 
     def test_storage_status_renders_tables(self):
         self.seed_db()
@@ -226,6 +241,118 @@ class TestReportScript(unittest.TestCase):
         rc, out = run(["project-stats", "--db", str(self.db)])
         self.assertEqual(rc, 0)
         self.assertIn("| project |", out)
+
+
+class TestScopedRollup(unittest.TestCase):
+    """AOS-79: caller-supplied issue-key-set scoping, replacing the
+    `branch LIKE 'milestone/%'` grouping gitflow (kit v0.22.0) makes match
+    nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name)
+        self.db = self.dir / "usage.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def seed_event(self, issue_key=None, commit_sha=None, out_tok=50000):
+        conn = capture.connect(self.db)
+        now = int(time.time())
+        groups = capture.aggregate([
+            entry(model="claude-sonnet-5", inp=100000, out=out_tok, cr=10000,
+                  cw=5000, mid="m1", cw1h=5000,
+                  ts=time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
+                                   time.gmtime(now))),
+        ])
+        with conn:
+            capture.insert_events(conn, str(self.dir), "s1", 0, None, groups,
+                                  commit_sha=commit_sha, issue_key=issue_key)
+        conn.close()
+
+    def init_git_repo(self):
+        for args in (["git", "init", "-q"],
+                     ["git", "config", "user.email", "t@example.com"],
+                     ["git", "config", "user.name", "Test"]):
+            subprocess.run(args, cwd=self.dir, check=True,
+                           capture_output=True)
+
+    def commit(self, subject):
+        (self.dir / "f.txt").write_text(subject)
+        subprocess.run(["git", "add", "-A"], cwd=self.dir, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", subject], cwd=self.dir,
+                       check=True, capture_output=True)
+        return subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                              cwd=self.dir, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def test_empty_key_set_fails_resolution(self):
+        _, out = run(["token-stats", "--scope", " , ,", "--db", str(self.db),
+                      "--cwd", str(self.dir)])
+        self.assertIn("scope resolution failed — empty key set", out)
+        self.assertNotIn("$", out)   # no figure
+
+    def test_invalid_keys_are_named_and_rejected(self):
+        _, out = run(["token-stats", "--scope", "not valid!,also-bad-",
+                      "--db", str(self.db), "--cwd", str(self.dir)])
+        self.assertIn("Rejected invalid scope key(s)", out)
+        self.assertIn("not valid!", out)
+        self.assertIn("scope resolution failed — empty key set", out)
+
+    def test_telemetry_absent_when_db_missing(self):
+        _, out = run(["token-stats", "--scope", "AOS-79", "--db", str(self.db),
+                      "--cwd", str(self.dir)])
+        self.assertIn("telemetry absent", out)
+        self.assertNotIn("$", out)
+
+    def test_telemetry_absent_when_project_has_no_events(self):
+        # DB exists (seeded for an unrelated project path) but nothing for
+        # this project's cwd.
+        conn = capture.connect(self.db)
+        groups = capture.aggregate([entry(mid="m1")])
+        with conn:
+            capture.insert_events(conn, "/some/other/project", "s1", 0, None,
+                                  groups)
+        conn.close()
+        _, out = run(["token-stats", "--scope", "AOS-79", "--db", str(self.db),
+                      "--cwd", str(self.dir)])
+        self.assertIn("telemetry absent", out)
+
+    def test_broken_scope_when_no_key_has_rows(self):
+        self.seed_event(issue_key="AOS-1")   # some events, but not AOS-79
+        _, out = run(["token-stats", "--scope", "AOS-79", "--db", str(self.db),
+                      "--cwd", str(self.dir)])
+        self.assertIn("0 of 1 scoped issues have telemetry rows"
+                      " (broken scope until proven otherwise)", out)
+        self.assertNotIn("$", out)
+
+    def test_scoped_rollup_via_issue_key(self):
+        self.seed_event(issue_key="AOS-79")
+        _, out = run(["token-stats", "--scope", "AOS-79", "--db", str(self.db),
+                      "--cwd", str(self.dir)])
+        self.assertIn("**Scoped rollup**", out)
+        self.assertIn("1 events", out)
+        self.assertIn("100,000 input / 50,000 output", out)
+        self.assertNotIn("of 1 issues have rows", out)   # full coverage
+
+    def test_scoped_rollup_falls_back_to_commit_sha(self):
+        self.init_git_repo()
+        sha = self.commit("AOS-79: fix the thing")
+        self.seed_event(issue_key=None, commit_sha=sha)   # untagged row
+        _, out = run(["token-stats", "--scope", "AOS-79", "--db", str(self.db),
+                      "--cwd", str(self.dir)])
+        self.assertIn("**Scoped rollup**", out)
+        self.assertIn("1 events", out)
+        self.assertNotIn("broken scope", out)
+
+    def test_scoped_rollup_partial_coverage_sums_across_set(self):
+        self.seed_event(issue_key="AOS-79", out_tok=50000)
+        # AOS-80 has no tagged rows and no matching commit -> uncovered
+        _, out = run(["token-stats", "--scope", "AOS-79,AOS-80",
+                      "--db", str(self.db), "--cwd", str(self.dir)])
+        self.assertIn("1 of 2 issues have rows.", out)
+        self.assertIn("50,000 output", out)   # sum is just the covered key
 
 
 if __name__ == "__main__":
