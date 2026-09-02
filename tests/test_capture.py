@@ -766,9 +766,9 @@ class TestProjectName(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def write_info(self, name_line):
-        (self.root / ".docs").mkdir(exist_ok=True)
-        (self.root / ".docs" / "PROJECT-INFO.md").write_text(
+    def write_info(self, name_line, loc=".docs"):
+        (self.root / loc).mkdir(exist_ok=True)
+        (self.root / loc / "PROJECT-INFO.md").write_text(
             f"---\nproject: {name_line}\npm_tool: jira\n---\n# body\n")
 
     def test_name_read_from_kit_frontmatter(self):
@@ -781,6 +781,35 @@ class TestProjectName(unittest.TestCase):
         self.assertIsNone(capture.project_name_from_kit(self.root))
 
     def test_missing_kit_doc_is_none(self):
+        self.assertIsNone(capture.project_name_from_kit(self.root))
+
+    def test_name_read_from_marvin_location(self):
+        self.write_info("Marvin Portal", loc=".marvin")
+        self.assertEqual(capture.project_name_from_kit(self.root),
+                         "Marvin Portal")
+
+    def test_name_read_from_bare_docs_location(self):
+        self.write_info("Legacy Portal", loc="docs")
+        self.assertEqual(capture.project_name_from_kit(self.root),
+                         "Legacy Portal")
+
+    def test_marvin_location_wins_over_docs(self):
+        self.write_info("Docs Name", loc=".docs")
+        self.write_info("Marvin Name", loc=".marvin")
+        self.assertEqual(capture.project_name_from_kit(self.root),
+                         "Marvin Name")
+
+    def test_docs_location_wins_over_bare_docs(self):
+        self.write_info("Bare Docs Name", loc="docs")
+        self.write_info("Docs Name", loc=".docs")
+        self.assertEqual(capture.project_name_from_kit(self.root),
+                         "Docs Name")
+
+    def test_first_existing_location_invalid_does_not_fall_through(self):
+        # .marvin/ exists but is invalid (placeholder) - .docs/ has a valid
+        # name, but the ladder must not fall through to it.
+        self.write_info("{{PROJECT_NAME}}", loc=".marvin")
+        self.write_info("Docs Name", loc=".docs")
         self.assertIsNone(capture.project_name_from_kit(self.root))
 
     def test_stamp_sets_and_kit_wins_over_registered_name(self):
@@ -797,6 +826,29 @@ class TestProjectName(unittest.TestCase):
         self.assertEqual(conn.execute(
             "SELECT name FROM projects WHERE path='/p'").fetchone()[0],
             "Kit Name")
+
+    def test_renamed_kit_doc_re_stamps_on_next_capture(self):
+        # A name already stamped in the DB from an earlier capture...
+        self.write_info("Old Name", loc=".marvin")
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        conn.execute(
+            "INSERT INTO projects(path, name) VALUES (?, ?)",
+            (str(self.root), "Old Name"))
+        conn.commit()
+        capture.stamp_project_name(
+            conn, self.root, capture.project_name_from_kit(self.root))
+        self.assertEqual(conn.execute(
+            "SELECT name FROM projects WHERE path=?",
+            (str(self.root),)).fetchone()[0], "Old Name")
+
+        # ...self-heals to a changed name on the next capture.
+        self.write_info("New Name", loc=".marvin")
+        capture.stamp_project_name(
+            conn, self.root, capture.project_name_from_kit(self.root))
+        self.assertEqual(conn.execute(
+            "SELECT name FROM projects WHERE path=?",
+            (str(self.root),)).fetchone()[0], "New Name")
 
 
 class TestSubagentSweep(unittest.TestCase):
