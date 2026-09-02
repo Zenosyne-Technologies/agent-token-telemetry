@@ -287,6 +287,16 @@ class TestScopedRollup(unittest.TestCase):
                               cwd=self.dir, check=True, capture_output=True,
                               text=True).stdout.strip()
 
+    def commit_with_body(self, subject, body):
+        (self.dir / "f.txt").write_text(subject + body)
+        subprocess.run(["git", "add", "-A"], cwd=self.dir, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", subject, "-m", body],
+                       cwd=self.dir, check=True, capture_output=True)
+        return subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                              cwd=self.dir, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
     def test_empty_key_set_fails_resolution(self):
         _, out = run(["token-stats", "--scope", " , ,", "--db", str(self.db),
                       "--cwd", str(self.dir)])
@@ -297,7 +307,8 @@ class TestScopedRollup(unittest.TestCase):
         _, out = run(["token-stats", "--scope", "not valid!,also-bad-",
                       "--db", str(self.db), "--cwd", str(self.dir)])
         self.assertIn("Rejected invalid scope key(s)", out)
-        self.assertIn("not valid!", out)
+        self.assertIn("notvalid", out)   # sanitized echo (space/! stripped)
+        self.assertIn("also-bad-", out)
         self.assertIn("scope resolution failed — empty key set", out)
 
     def test_telemetry_absent_when_db_missing(self):
@@ -353,6 +364,57 @@ class TestScopedRollup(unittest.TestCase):
                       "--db", str(self.db), "--cwd", str(self.dir)])
         self.assertIn("1 of 2 issues have rows.", out)
         self.assertIn("50,000 output", out)   # sum is just the covered key
+
+    def test_commit_sha_fallback_matches_subject_only_not_body_paragraph(self):
+        # Security fix: --grep matches anywhere in the full commit message,
+        # not just the subject; a key mentioned only in a later body
+        # paragraph must never be attributed to that key's rollup.
+        self.init_git_repo()
+        good_sha = self.commit("AOS-79: real fix")
+        bad_sha = self.commit_with_body(
+            "Unrelated change", "AOS-79: mentioned only in the body")
+        shas = report.commits_for_key(self.dir, "AOS-79")
+        self.assertIn(good_sha, shas)
+        self.assertNotIn(bad_sha, shas)
+
+    def test_commit_sha_fallback_pipeline_ignores_body_only_mention(self):
+        self.init_git_repo()
+        bad_sha = self.commit_with_body(
+            "Unrelated change", "AOS-79: mentioned only in the body")
+        self.seed_event(issue_key=None, commit_sha=bad_sha)
+        _, out = run(["token-stats", "--scope", "AOS-79", "--db", str(self.db),
+                      "--cwd", str(self.dir)])
+        self.assertIn("0 of 1 scoped issues have telemetry rows"
+                      " (broken scope until proven otherwise)", out)
+
+    def test_invalid_scope_key_echo_is_sanitized(self):
+        # Security fix: a rejected --scope token is echoed into markdown —
+        # it must not carry backticks/newlines/pipes into the rendered text.
+        evil = "bad`key\nwith|pipe"
+        _, out = run(["token-stats", "--scope", evil, "--db", str(self.db),
+                      "--cwd", str(self.dir)])
+        self.assertIn("Rejected invalid scope key(s)", out)
+        self.assertNotIn(evil, out)
+        segment = (out.split("Rejected invalid scope key(s):")[1]
+                  .split("(must match")[0])
+        self.assertNotIn("\n", segment)
+        self.assertNotIn("|", segment)
+        # exactly one backtick pair wraps the sanitized token — no breakout
+        self.assertEqual(segment.count("`"), 2)
+
+    def test_invalid_scope_key_echo_is_length_capped(self):
+        long_tok = "!" * 100 + "1"  # all invalid chars but the trailing "1"
+        _, out = run(["token-stats", "--scope", long_tok, "--db", str(self.db),
+                      "--cwd", str(self.dir)])
+        self.assertIn("`1`", out)
+
+    def test_sanitize_invalid_echo_helper(self):
+        self.assertEqual(report.sanitize_invalid_echo("bad`key\nwith|pipe"),
+                         "badkeywithpipe")
+        self.assertEqual(report.sanitize_invalid_echo("```\n\n"),
+                         "(unprintable)")
+        self.assertEqual(report.sanitize_invalid_echo("a" * 50),
+                         "a" * 32 + "…")
 
 
 if __name__ == "__main__":
