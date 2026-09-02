@@ -15,6 +15,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -269,10 +270,6 @@ FROM priced GROUP BY model_name ORDER BY SUM(out_tok) DESC;""").fetchall()
         " FROM events WHERE ts >= strftime('%s','now','-7 days')"
         f" AND {NOT_BACKLOG}"
         " GROUP BY kind").fetchall()
-    d["by_milestone"] = conn.execute(
-        "SELECT branch, SUM(in_tok), SUM(out_tok), SUM(cache_r), SUM(cache_w),"
-        " COUNT(*) FROM events WHERE branch LIKE 'milestone/%'"
-        " GROUP BY branch ORDER BY SUM(out_tok) DESC").fetchall()
     d["by_tier"] = conn.execute(
         "SELECT CASE"
         " WHEN m.name LIKE 'claude-fable-%' THEN 'orchestrator'"
@@ -351,15 +348,6 @@ def render_token_stats(d):
                     ["---", "---:", "---:", "---:"],
                     [[r[0], fmt_n(r[1]), fmt_n(r[2]), str(r[3])]
                      for r in d["by_tier"]])
-    if d["by_milestone"]:
-        out += ["", "**By milestone (all-time)**", ""]
-        out += md_table(
-            ["branch", "input", "output", "cache read", "cache write",
-             "events"],
-            ["---", "---:", "---:", "---:", "---:", "---:"],
-            [tok_row(r[0], r[1:]) for r in d["by_milestone"]])
-    else:
-        out += ["", "No milestone-branch (`milestone/*`) events recorded."]
     if d["by_issue"]:
         out += ["", "**By issue (all-time)**", ""]
         out += md_table(
@@ -376,8 +364,189 @@ def render_token_stats(d):
                 " pre-telemetry session history — are excluded from the"
                 " windowed figures above (their timestamp is the capture day,"
                 " not when the tokens were spent). All-time views"
-                " (`/token-telemetry:project-stats`, the by-milestone and"
-                " by-issue tables) include them."]
+                " (`/token-telemetry:project-stats`, the by-issue table)"
+                " include them."]
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- scoped rollup
+
+# Conservative tracker-key shape: leading letter, then letters/digits/underscore,
+# a hyphen, then digits — e.g. AOS-79. Keys reach a git subprocess (--grep) and
+# SQL; validating here means an invalid key is rejected with a named message
+# instead of ever being interpolated into either.
+SCOPE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-\d+$")
+
+
+def parse_scope_keys(raw):
+    """Split `KEY1,KEY2,...` on commas, strip whitespace, drop empties, and
+    partition into (valid, invalid) preserving first-seen order and dropping
+    duplicates from valid. Never raises — an unparseable/empty result is a
+    normal outcome the caller renders, not an error."""
+    valid, invalid = [], []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if SCOPE_KEY_RE.match(tok):
+            if tok not in valid:
+                valid.append(tok)
+        else:
+            invalid.append(tok)
+    return valid, invalid
+
+
+def commits_for_key(root, key):
+    """Commit shas whose subject starts with `<key>:`, per the contract's
+    per-issue fallback recipe. Queried at both %h (short, repo-default
+    abbreviation) and %H (full) length, since a sha captured under one repo's
+    abbreviation setting may not match `%h` under another. The pattern is
+    anchored and regex-escaped so a key can never inject `--grep` regex —
+    belt-and-suspenders on top of SCOPE_KEY_RE, whose charset already
+    excludes every regex metacharacter."""
+    pattern = "^" + re.escape(key) + ":"
+    shas = set()
+    for fmt in ("%h", "%H"):
+        out = capture.git(root, "log", f"--format={fmt}", f"--grep={pattern}")
+        if out:
+            shas.update(line.strip() for line in out.splitlines() if line.strip())
+    return sorted(shas)
+
+
+def _rowids_where(conn, project_path, clause, param):
+    return [r[0] for r in conn.execute(
+        "SELECT e.rowid FROM events e"
+        " JOIN sessions s ON s.id = e.session_id"
+        " JOIN projects p ON p.id = s.project_id"
+        f" WHERE p.path = ? AND {clause}", (project_path, *param))]
+
+
+def rowids_for_issue_key(conn, project_path, key):
+    return _rowids_where(conn, project_path, "e.issue_key = ?", (key,))
+
+
+def rowids_for_commit_shas(conn, project_path, shas):
+    if not shas:
+        return []
+    placeholders = ",".join("?" for _ in shas)  # parameterized, never inlined
+    return _rowids_where(conn, project_path,
+                         f"e.commit_sha IN ({placeholders})", tuple(shas))
+
+
+def priced_sum_for_rowids(conn, rowids):
+    """Same per-event pricing as fetch_project_stats/fetch_token_stats,
+    restricted to a caller-supplied set of event rowids."""
+    empty = {"in_tok": 0, "out_tok": 0, "cache_r": 0, "cache_w": 0,
+             "events": 0, "cost": 0.0, "rate_from": None, "unpriced": 0}
+    if not rowids:
+        return empty
+    cw1h, cw1h_usd = priced_cte(conn)
+    placeholders = ",".join("?" for _ in rowids)  # parameterized, never inlined
+    row = conn.execute(f"""
+WITH priced AS (
+  SELECT e.in_tok, e.out_tok, e.cache_r, e.cache_w, {cw1h} AS cache_w_1h,
+         {rate_subquery('in_usd')} AS in_usd,
+         {rate_subquery('out_usd')} AS out_usd,
+         {rate_subquery('cache_r_usd')} AS cache_r_usd,
+         {rate_subquery('cache_w_usd')} AS cache_w_usd,
+         {cw1h_usd} AS cache_w_1h_usd,
+         {rate_subquery('effective_from')} AS rate_from
+  FROM events e LEFT JOIN models m ON m.id = e.model_id
+  WHERE e.rowid IN ({placeholders})
+)
+SELECT COALESCE(SUM(in_tok), 0), COALESCE(SUM(out_tok), 0),
+       COALESCE(SUM(cache_r), 0), COALESCE(SUM(cache_w), 0), COUNT(*),
+       COALESCE(SUM(in_tok * COALESCE(in_usd, 0))
+             + SUM(out_tok * COALESCE(out_usd, 0))
+             + SUM(cache_r * COALESCE(cache_r_usd, 0))
+             + SUM((cache_w - cache_w_1h) * COALESCE(cache_w_usd, 0))
+             + SUM(cache_w_1h * COALESCE(cache_w_1h_usd, cache_w_usd, 0)),
+             0) / 1000000.0,
+       MAX(rate_from),
+       SUM(CASE WHEN rate_from IS NULL THEN 1 ELSE 0 END)
+FROM priced""", rowids).fetchone()
+    inp, outp, cr, cw, n, cost, rate_from, unpriced = row
+    return {"in_tok": inp, "out_tok": outp, "cache_r": cr, "cache_w": cw,
+            "events": n, "cost": cost or 0.0, "rate_from": rate_from,
+            "unpriced": unpriced or 0}
+
+
+def fetch_scoped_rollup(conn, cwd, scope_raw):
+    """Caller-supplied issue-key-set scoping (the kit contract's per-issue
+    recipe, summed across the set) — replaces the old milestone-branch-prefix
+    grouping, which gitflow (kit v0.22.0) makes match nothing. Returns plain
+    data; render_scoped_rollup turns it into the three-state
+    empty-vs-broken-vs-covered markdown."""
+    valid, invalid = parse_scope_keys(scope_raw)
+    if not valid:
+        return {"state": "empty_keyset", "invalid": invalid}
+    if conn is None:
+        return {"state": "absent", "keys": valid, "invalid": invalid}
+    root = capture.find_project_root(cwd)
+    project_events = conn.execute(
+        "SELECT COUNT(*) FROM events e"
+        " JOIN sessions s ON s.id = e.session_id"
+        " JOIN projects p ON p.id = s.project_id WHERE p.path = ?",
+        (str(root),)).fetchone()[0]
+    if not project_events:
+        return {"state": "absent", "keys": valid, "invalid": invalid}
+
+    per_key = []
+    for key in valid:
+        rowids = rowids_for_issue_key(conn, str(root), key)
+        if not rowids:
+            shas = commits_for_key(root, key)
+            rowids = rowids_for_commit_shas(conn, str(root), shas)
+        per_key.append({"key": key, **priced_sum_for_rowids(conn, rowids)})
+
+    covered = [k for k in per_key if k["events"] > 0]
+    n, k = len(valid), len(covered)
+    if k == 0:
+        return {"state": "broken", "keys": valid, "invalid": invalid,
+                "n": n, "k": k}
+    totals = {
+        "in_tok": sum(x["in_tok"] for x in covered),
+        "out_tok": sum(x["out_tok"] for x in covered),
+        "cache_r": sum(x["cache_r"] for x in covered),
+        "cache_w": sum(x["cache_w"] for x in covered),
+        "events": sum(x["events"] for x in covered),
+        "cost": sum(x["cost"] for x in covered),
+        "rate_from": [x["rate_from"] for x in covered],
+        "unpriced": sum(x["unpriced"] for x in covered),
+    }
+    return {"state": "partial" if k < n else "full", "keys": valid,
+            "invalid": invalid, "n": n, "k": k, **totals}
+
+
+def render_scoped_rollup(d):
+    out = ["", "**Scoped rollup**", ""]
+    if d["invalid"]:
+        out.append("Rejected invalid scope key(s): "
+                   + ", ".join(f"`{t}`" for t in d["invalid"])
+                   + " (must match `KEY-123`).")
+    if d["state"] == "empty_keyset":
+        out.append("scope resolution failed — empty key set")
+        return "\n".join(out)
+    if d["state"] == "absent":
+        out.append("telemetry absent")
+        return "\n".join(out)
+    if d["state"] == "broken":
+        out.append(f"0 of {d['n']} scoped issues have telemetry rows"
+                   " (broken scope until proven otherwise).")
+        return "\n".join(out)
+    # partial or full coverage: a sum across the covered keys in the set
+    rates = [r for r in d["rate_from"] if r is not None]
+    if not rates:
+        cost_label = "unpriced"
+    elif min(rates) == 0:
+        cost_label = f"{fmt_usd(d['cost'])} (seed rates)"
+    else:
+        cost_label = fmt_usd(d["cost"])
+    out.append(f"**{cost_label}** — {fmt_n(d['events'])} events,"
+               f" {fmt_n(d['in_tok'])} input / {fmt_n(d['out_tok'])} output"
+               " tokens.")
+    if d["k"] < d["n"]:
+        out.append(f"{d['k']} of {d['n']} issues have rows.")
     return "\n".join(out)
 
 
@@ -629,11 +798,18 @@ def main(argv=None):
                                         "storage-status"])
     ap.add_argument("--cwd", default=os.getcwd())
     ap.add_argument("--db", default=None)
+    ap.add_argument("--scope", default=None,
+                    help="comma-separated issue keys (KEY1,KEY2,...) —"
+                         " renders a Scoped rollup summed across the set"
+                         " instead of the normal command output")
     args = ap.parse_args(argv)
     db = args.db or capture.db_path()
     conn = open_ro(db)
     try:
-        if args.command == "info":
+        if args.scope is not None:
+            print(render_scoped_rollup(fetch_scoped_rollup(conn, args.cwd,
+                                                            args.scope)))
+        elif args.command == "info":
             print(render_info(fetch_info(conn, db, args.cwd)))
         elif conn is None:
             print("No telemetry has been recorded yet — enable capture"
