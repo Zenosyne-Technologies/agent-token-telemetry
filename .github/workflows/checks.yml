@@ -1,0 +1,12 @@
+name: checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  no-local-paths:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No local home paths in tracked files
+        run: bash scripts/check-no-local-paths.sh
