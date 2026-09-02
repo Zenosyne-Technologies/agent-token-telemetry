@@ -96,6 +96,26 @@ class TestReportScript(unittest.TestCase):
         # sanitized form is present instead
         self.assertIn("evil \\| name ' with newline junk", out)
 
+    def test_project_stats_strips_ansi_control_bytes(self):
+        self.seed_db()
+        hostile = "\x01\x1b[31mRedText\x1b[0m normal"
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE projects SET name=? WHERE path='/proj'",
+                     (hostile,))
+        conn.commit()
+        conn.close()
+        _, out = run(["project-stats", "--db", str(self.db)])
+        table_lines = [l for l in out.splitlines() if l.startswith("|")]
+        # header + alignment row + exactly one data row: structure intact
+        self.assertEqual(len(table_lines), 3)
+        # no byte below 0x20 (space) and no DEL (0x7f) in the rendered row
+        # (the raw string still uses "\n" as the normal line separator)
+        data_row = table_lines[2]
+        self.assertTrue(all(ord(ch) >= 0x20 and ord(ch) != 0x7f
+                            for ch in data_row))
+        # the sanitized text survives (with the escape bytes gone)
+        self.assertIn("RedText", data_row)
+
     def test_project_stats_prices_1h_writes_at_1h_rate(self):
         self.seed_db()
         _, out = run(["project-stats", "--db", str(self.db)])
