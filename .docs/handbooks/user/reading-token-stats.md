@@ -60,6 +60,16 @@ up-to-date rates. Once that's done, reports show the date the rates came into
 effect instead. Either way, the cost shown is always an estimate for
 budgeting, not an authoritative invoice.
 
+## Names shown are cleaned up for display
+
+Project, model, and issue names in these reports can come from files or
+values that weren't written with a report table in mind. Before they're
+shown, they're cleaned up — stray characters that would break the table
+layout are escaped, hidden or invisible characters are stripped, and very
+long values are trimmed — so a malformed or unusual name can't distort the
+report or hide misleading text. If a name looks unexpectedly short, plain, or
+ends in an ellipsis, this cleanup is why.
+
 ## Cache hit rate
 
 Claude Code can reuse previously-processed context instead of reprocessing it
