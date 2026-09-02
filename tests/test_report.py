@@ -1,6 +1,7 @@
 import contextlib
 import io
 import pathlib
+import re
 import sqlite3
 import subprocess
 import sys
@@ -70,6 +71,30 @@ class TestReportScript(unittest.TestCase):
         conn.close()
         _, out = run(["project-stats", "--db", str(self.db)])
         self.assertIn("| My Project |", out)
+
+    def test_project_stats_escapes_hostile_project_name(self):
+        self.seed_db()
+        hostile = "evil | name ` with\nnewline junk"
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE projects SET name=? WHERE path='/proj'",
+                     (hostile,))
+        conn.commit()
+        conn.close()
+        _, out = run(["project-stats", "--db", str(self.db)])
+        table_lines = [l for l in out.splitlines() if l.startswith("|")]
+        # header + alignment row + exactly one data row: structure intact
+        self.assertEqual(len(table_lines), 3)
+        # column count matches between header and the hostile data row —
+        # an unescaped "|" in the name would have added a spurious column
+        header_cols = len(re.split(r"(?<!\\)\|", table_lines[0]))
+        row_cols = len(re.split(r"(?<!\\)\|", table_lines[2]))
+        self.assertEqual(header_cols, row_cols)
+        # raw hostile characters never appear unescaped in the output
+        self.assertNotIn("evil | name", out)
+        self.assertNotIn("` with", out)
+        self.assertNotIn("with\nnewline", out)
+        # sanitized form is present instead
+        self.assertIn("evil \\| name ' with newline junk", out)
 
     def test_project_stats_prices_1h_writes_at_1h_rate(self):
         self.seed_db()
