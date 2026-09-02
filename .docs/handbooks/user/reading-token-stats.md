@@ -2,8 +2,8 @@
 title: Reading Token Stats
 audience: user
 module: reporting
-sources: [commands/token-stats.md, commands/project-stats.md]
-updated: 2026-08-06
+sources: [commands/token-stats.md, commands/project-stats.md, scripts/report.py]
+updated: 2026-09-02
 related: [[enabling-telemetry]]
 ---
 
@@ -22,8 +22,8 @@ so instead of showing empty numbers.
   using the most.
 - **Estimated cost** — a dollar estimate per model, worked out from current
   published pricing. This is an estimate for visibility, not a bill.
-- **By milestone / by issue** — usage rolled up under a milestone branch or a
-  tracked issue key, when that information was available at the time.
+- **By issue** — usage rolled up under a tracked issue key, when that
+  information was available at the time.
 
 ## One row per project
 
@@ -37,6 +37,17 @@ If a project's cost cell says *unpriced*, no rate is known for the models that
 project used — it does not mean the work was free. If it says something like
 "14 of 96 events unpriced", the figure shown is real but understates the total
 by those events.
+
+## Scoped rollups (a specific set of tracked issues)
+
+The reporting tool can also be pointed at a specific set of tracked issue keys
+and asked for the combined cost of just those — this is how a milestone or
+other multi-issue rollup gets its total, by summing the matching issues rather
+than by branch name. A rollup like this never shows a bare, unexplained "$0" —
+if it comes back empty, the report says why: the requested set of issues
+couldn't be resolved at all, telemetry hasn't recorded anything for this
+project yet, or none of the requested issues have any recorded usage (which
+usually means the scope itself is wrong, not that the work was free).
 
 ## "seed rates (undated)"
 

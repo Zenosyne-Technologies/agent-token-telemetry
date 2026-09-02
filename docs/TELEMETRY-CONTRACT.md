@@ -152,7 +152,7 @@ so is a `/storage-separate` export, which is built through the same `connect()`.
 | `model_id` | INTEGER | FK → `models.id` |
 | `in_tok`, `out_tok`, `cache_r`, `cache_w` | INTEGER | token counts; `cache_w` is the TTL-agnostic cache-write total |
 | `cache_w_1h` | INTEGER | **v4.** 1-hour portion of `cache_w` (5m portion = `cache_w - cache_w_1h`); 0 on pre-v4 rows |
-| `branch` | TEXT | git branch at capture time; kit milestones use `milestone/<slug>` |
+| `branch` | TEXT | git branch at capture time — corroboration for a single work item only, **never a grouping key**: gitflow (kit >=v0.22) no longer names milestone branches `milestone/<slug>`, so a query that groups or filters on that pattern silently matches nothing. Use the per-issue/per-scope recipe below instead |
 | `commit_sha` | TEXT | short sha at capture time |
 | `issue_key` | TEXT | **v2.** From the context sidecar, else a `<KEY>:` commit-subject fallback, else null |
 | `task_size` | TEXT | **v2.** From the sidecar's `size`, else null |
@@ -182,7 +182,12 @@ Model name prefix → kit tier, mirroring the `pricing` table's own prefixes (us
 `events.agent` + `events.kind` further distinguish main-session vs subagent work
 within a tier.
 
-## Per-issue recipe (with pre-v2 fallback)
+## Scoping recipes (with pre-v2 fallback)
+
+There is no reliable grouping key for "everything spent on this milestone/effort" —
+`branch` is capture-time corroboration for one event, not a stable label to group or
+filter by (see the `branch` row above). Scope a rollup by caller-supplied issue key(s)
+instead:
 
 Preferred: `events.issue_key = '<KEY>'` (populated from schema v2 onward). Rows
 recorded before v2 predate the column and need the fallback instead: `commit_sha IN
@@ -190,6 +195,17 @@ recorded before v2 predate the column and need the fallback instead: `commit_sha
 lengths (git's default abbreviation length can change per-repo). A complete per-issue
 query unions both: `issue_key = '<KEY>' OR commit_sha IN (...)`. This is the same
 recipe the kit's documentation agent uses for its cost-per-issue closing comment.
+
+**Scoping to a set of keys** (e.g. every issue in a milestone): apply the recipe above
+per key — try `issue_key = '<KEY>'` first, fall back to the `commit_sha` search only
+for a key with zero tagged rows — then sum across the set. `report.py`'s `--scope
+KEY1,KEY2,...` flag implements exactly this and renders the result as three-state:
+an unparseable/empty key set fails scope resolution outright; a project with zero
+events at all reads as telemetry absent, not as zero spend; and zero of N scoped keys
+having rows reads as a broken scope, not as zero spend. A bare `$0`/`0` render for a
+rollup that matched nothing is exactly the failure mode this replaces (`branch LIKE
+'milestone/%'` reading as "spent nothing" once gitflow stopped naming branches that
+way) — never repeat it for a different empty-match reason.
 
 ## Pricing table
 
