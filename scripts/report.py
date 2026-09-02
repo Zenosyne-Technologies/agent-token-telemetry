@@ -75,16 +75,19 @@ MD_CELL_MAX = 120
 def md_cell(value):
     """Make an untrusted string (project/model/agent/issue name-like data,
     ultimately repo- or caller-influenced) safe to interpolate into one
-    markdown table cell: fold newlines/tabs into a single space, drop every
-    other C0 control character and DEL anywhere in the string (terminals and
+    markdown table cell: fold newlines/tabs and the Unicode line/paragraph
+    separators (U+2028/U+2029) into a single space, drop every other C0
+    control character and DEL anywhere in the string (terminals and
     downstream renderers must never see a raw escape byte — e.g. ANSI
-    sequences), escape characters that would break the table structure or
-    bleed formatting into the surrounding document, strip leading markdown
-    control characters, and cap length so one hostile value can't blow up
-    the render."""
+    sequences) plus the Unicode bidi-control characters (U+202A-U+202E,
+    U+2066-U+2069) that can visually reorder or spoof rendered text, escape
+    characters that would break the table structure or bleed formatting
+    into the surrounding document, strip leading markdown control
+    characters, and cap length so one hostile value can't blow up the
+    render."""
     s = str(value)
-    s = re.sub(r"[\r\n\t]+", " ", s)
-    s = re.sub(r"[\x00-\x1f\x7f]", "", s)
+    s = re.sub(r"[\r\n\t  ]+", " ", s)
+    s = re.sub(r"[\x00-\x1f\x7f‪-‮⁦-⁩]", "", s)
     s = s.lstrip("#>-*+= ")
     s = s.replace("|", "\\|").replace("`", "'")
     if len(s) > MD_CELL_MAX:

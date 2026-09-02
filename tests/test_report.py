@@ -116,6 +116,25 @@ class TestReportScript(unittest.TestCase):
         # the sanitized text survives (with the escape bytes gone)
         self.assertIn("RedText", data_row)
 
+    def test_project_stats_strips_bidi_controls_and_line_separators(self):
+        self.seed_db()
+        hostile = "evil‮SPOOFED⁦pop next end"
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE projects SET name=? WHERE path='/proj'",
+                     (hostile,))
+        conn.commit()
+        conn.close()
+        _, out = run(["project-stats", "--db", str(self.db)])
+        table_lines = [l for l in out.splitlines() if l.startswith("|")]
+        # header + alignment row + exactly one data row: structure intact
+        self.assertEqual(len(table_lines), 3)
+        data_row = table_lines[2]
+        self.assertNotIn("‮", data_row)  # RIGHT-TO-LEFT OVERRIDE
+        self.assertNotIn("⁦", data_row)  # LEFT-TO-RIGHT ISOLATE
+        self.assertNotIn(" ", data_row)  # LINE SEPARATOR
+        self.assertNotIn(" ", data_row)  # PARAGRAPH SEPARATOR
+        self.assertIn("evilSPOOFEDpop next end", data_row)
+
     def test_project_stats_prices_1h_writes_at_1h_rate(self):
         self.seed_db()
         _, out = run(["project-stats", "--db", str(self.db)])
