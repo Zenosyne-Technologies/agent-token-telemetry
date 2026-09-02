@@ -1,6 +1,7 @@
 import contextlib
 import io
 import pathlib
+import re
 import sqlite3
 import subprocess
 import sys
@@ -70,6 +71,69 @@ class TestReportScript(unittest.TestCase):
         conn.close()
         _, out = run(["project-stats", "--db", str(self.db)])
         self.assertIn("| My Project |", out)
+
+    def test_project_stats_escapes_hostile_project_name(self):
+        self.seed_db()
+        hostile = "evil | name ` with\nnewline junk"
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE projects SET name=? WHERE path='/proj'",
+                     (hostile,))
+        conn.commit()
+        conn.close()
+        _, out = run(["project-stats", "--db", str(self.db)])
+        table_lines = [l for l in out.splitlines() if l.startswith("|")]
+        # header + alignment row + exactly one data row: structure intact
+        self.assertEqual(len(table_lines), 3)
+        # column count matches between header and the hostile data row —
+        # an unescaped "|" in the name would have added a spurious column
+        header_cols = len(re.split(r"(?<!\\)\|", table_lines[0]))
+        row_cols = len(re.split(r"(?<!\\)\|", table_lines[2]))
+        self.assertEqual(header_cols, row_cols)
+        # raw hostile characters never appear unescaped in the output
+        self.assertNotIn("evil | name", out)
+        self.assertNotIn("` with", out)
+        self.assertNotIn("with\nnewline", out)
+        # sanitized form is present instead
+        self.assertIn("evil \\| name ' with newline junk", out)
+
+    def test_project_stats_strips_ansi_control_bytes(self):
+        self.seed_db()
+        hostile = "\x01\x1b[31mRedText\x1b[0m normal"
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE projects SET name=? WHERE path='/proj'",
+                     (hostile,))
+        conn.commit()
+        conn.close()
+        _, out = run(["project-stats", "--db", str(self.db)])
+        table_lines = [l for l in out.splitlines() if l.startswith("|")]
+        # header + alignment row + exactly one data row: structure intact
+        self.assertEqual(len(table_lines), 3)
+        # no byte below 0x20 (space) and no DEL (0x7f) in the rendered row
+        # (the raw string still uses "\n" as the normal line separator)
+        data_row = table_lines[2]
+        self.assertTrue(all(ord(ch) >= 0x20 and ord(ch) != 0x7f
+                            for ch in data_row))
+        # the sanitized text survives (with the escape bytes gone)
+        self.assertIn("RedText", data_row)
+
+    def test_project_stats_strips_bidi_controls_and_line_separators(self):
+        self.seed_db()
+        hostile = "evil‮SPOOFED⁦pop next end"
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE projects SET name=? WHERE path='/proj'",
+                     (hostile,))
+        conn.commit()
+        conn.close()
+        _, out = run(["project-stats", "--db", str(self.db)])
+        table_lines = [l for l in out.splitlines() if l.startswith("|")]
+        # header + alignment row + exactly one data row: structure intact
+        self.assertEqual(len(table_lines), 3)
+        data_row = table_lines[2]
+        self.assertNotIn("‮", data_row)  # RIGHT-TO-LEFT OVERRIDE
+        self.assertNotIn("⁦", data_row)  # LEFT-TO-RIGHT ISOLATE
+        self.assertNotIn(" ", data_row)  # LINE SEPARATOR
+        self.assertNotIn(" ", data_row)  # PARAGRAPH SEPARATOR
+        self.assertIn("evilSPOOFEDpop next end", data_row)
 
     def test_project_stats_prices_1h_writes_at_1h_rate(self):
         self.seed_db()

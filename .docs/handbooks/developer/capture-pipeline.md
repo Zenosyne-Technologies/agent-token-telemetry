@@ -164,6 +164,14 @@ of several. `stamp_project_name()` re-runs this resolution on every capture, so
 a renamed or relocated `PROJECT-INFO.md` self-heals the stamped `projects.name`
 on the next turn, with no migration step of its own.
 
+Each candidate path is resolved and checked against the resolved repo root
+before it is opened: a symlink at any ladder location that escapes the root
+(e.g. `.marvin/PROJECT-INFO.md` pointing at `/etc/passwd`) makes that location
+invalid, same as a missing file or an unresolved placeholder — the function
+returns `None` rather than falling through to the next rung. A symlink that
+resolves back inside the root (including a symlinked repo root itself) is
+unaffected and still reads normally.
+
 ## Pricing at query time, not capture time
 
 `capture.py` never writes a cost column. It stamps raw token counts
