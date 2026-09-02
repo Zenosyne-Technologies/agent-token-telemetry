@@ -69,6 +69,32 @@ def humanize(day, today=None):
     return f"{day} ({rel})"
 
 
+MD_CELL_MAX = 120
+
+
+def md_cell(value):
+    """Make an untrusted string (project/model/agent/issue name-like data,
+    ultimately repo- or caller-influenced) safe to interpolate into one
+    markdown table cell: fold newlines/tabs and the Unicode line/paragraph
+    separators (U+2028/U+2029) into a single space, drop every other C0
+    control character and DEL anywhere in the string (terminals and
+    downstream renderers must never see a raw escape byte — e.g. ANSI
+    sequences) plus the Unicode bidi-control characters (U+202A-U+202E,
+    U+2066-U+2069) that can visually reorder or spoof rendered text, escape
+    characters that would break the table structure or bleed formatting
+    into the surrounding document, strip leading markdown control
+    characters, and cap length so one hostile value can't blow up the
+    render."""
+    s = str(value)
+    s = re.sub(r"[\r\n\t  ]+", " ", s)
+    s = re.sub(r"[\x00-\x1f\x7f‪-‮⁦-⁩]", "", s)
+    s = s.lstrip("#>-*+= ")
+    s = s.replace("|", "\\|").replace("`", "'")
+    if len(s) > MD_CELL_MAX:
+        s = s[:MD_CELL_MAX] + "…"
+    return s
+
+
 def rate_subquery(column):
     return (f"(SELECT pr.{column} FROM pricing pr"
             " WHERE m.name LIKE pr.model_prefix || '%'"
@@ -159,7 +185,7 @@ def render_project_stats(rows):
            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|"]
     seed_seen = False
     for r in rows:
-        project = r["name"] or Path(r["path"]).name
+        project = md_cell(r["name"] or Path(r["path"]).name)
         classic = r["classic_in"] + r["classic_out"]
         cached = r["cached_r"] + r["cached_w"]
         if r["events"] == 0:
@@ -322,20 +348,20 @@ def render_token_stats(d):
     out += md_table(
         ["project", "input", "output", "cache read", "cache write", "events"],
         ["---", "---:", "---:", "---:", "---:", "---:"],
-        [tok_row(r[0], r[1:]) for r in d["by_project"]])
+        [tok_row(md_cell(r[0]), r[1:]) for r in d["by_project"]])
     out += ["", "**By model (7 days)**", ""]
     model_rows = []
     for name, tier, inp, outp, cost, rate_from in d["by_model"]:
         label = ("unpriced" if rate_from is None
                  else fmt_usd(cost)
                  + (" (seed rates)" if rate_from == 0 else ""))
-        model_rows.append([name, tier, fmt_n(inp), fmt_n(outp), label])
+        model_rows.append([md_cell(name), tier, fmt_n(inp), fmt_n(outp), label])
     out += md_table(["model", "tier", "input", "output", "est. cost"],
                     ["---", "---", "---:", "---:", "---:"], model_rows)
     out += ["", "**By agent and kind (7 days)**", ""]
     out += md_table(["agent", "input", "output", "events"],
                     ["---", "---:", "---:", "---:"],
-                    [[r[0], fmt_n(r[1]), fmt_n(r[2]), str(r[3])]
+                    [[md_cell(r[0]), fmt_n(r[1]), fmt_n(r[2]), str(r[3])]
                      for r in d["by_agent"]])
     out += [""]
     out += md_table(["kind", "input", "output", "cache hit %"],
@@ -354,7 +380,7 @@ def render_token_stats(d):
             ["issue", "input", "output", "cache read", "cache write",
              "events"],
             ["---", "---:", "---:", "---:", "---:", "---:"],
-            [tok_row(r[0], r[1:]) for r in d["by_issue"]])
+            [tok_row(md_cell(r[0]), r[1:]) for r in d["by_issue"]])
     else:
         out += ["", "No issue-tagged events recorded (sidecar or"
                 " `<KEY>:` commit-subject fallback)."]

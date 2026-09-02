@@ -133,9 +133,12 @@ heals itself.
   document wins over any other source), resolved via a three-location ladder:
   `.marvin/PROJECT-INFO.md` (kit >=v0.21), then `.docs/PROJECT-INFO.md` (kit
   v0.15-0.20), then `docs/PROJECT-INFO.md` (kit <v0.15) — the first of these that
-  exists is the one read, and it alone decides the result; `/token-telemetry:enable`
-  registers a user-supplied name when no kit document exists at any of the three.
-  NULL = unknown; reports fall back to the path basename.
+  exists is the one read, and it alone decides the result (each candidate is
+  resolved and must stay within the resolved repo root, so a symlink escaping
+  it is treated as invalid at that location rather than falling through);
+  `/token-telemetry:enable` registers a user-supplied name when no kit
+  document exists at any of the three. NULL = unknown; reports fall back to
+  the path basename.
 
 No column has ever been renamed or removed. v0.3.0 changed no schema at all — it added
 storage modes. A project-local mirror is byte-for-byte the same schema as the central DB;
