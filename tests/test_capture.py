@@ -812,6 +812,31 @@ class TestProjectName(unittest.TestCase):
         self.write_info("Docs Name", loc=".docs")
         self.assertIsNone(capture.project_name_from_kit(self.root))
 
+    def test_symlink_escaping_root_is_none_and_no_fall_through(self):
+        # .marvin/PROJECT-INFO.md is a symlink to a file OUTSIDE root with a
+        # valid `project:` line; .docs/ has a valid name too, but a
+        # location that resolves outside root must be treated as invalid at
+        # that location - no fall-through.
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_file = pathlib.Path(outside.name) / "PROJECT-INFO.md"
+        outside_file.write_text("---\nproject: Outside Name\n---\n# body\n")
+        (self.root / ".marvin").mkdir(exist_ok=True)
+        (self.root / ".marvin" / "PROJECT-INFO.md").symlink_to(outside_file)
+        self.write_info("Docs Name", loc=".docs")
+        self.assertIsNone(capture.project_name_from_kit(self.root))
+
+    def test_symlink_within_root_still_resolves(self):
+        # .marvin/PROJECT-INFO.md is a symlink to another file INSIDE root -
+        # containment must not break legitimate in-root symlinks.
+        real = self.root / "real-info.md"
+        real.write_text("---\nproject: Real Name\n---\n# body\n")
+        (self.root / ".marvin").mkdir(exist_ok=True)
+        (self.root / ".marvin" / "PROJECT-INFO.md").symlink_to(
+            pathlib.Path("..") / "real-info.md")
+        self.assertEqual(capture.project_name_from_kit(self.root),
+                         "Real Name")
+
     def test_stamp_sets_and_kit_wins_over_registered_name(self):
         conn = capture.connect(self.db)
         self.addCleanup(conn.close)
