@@ -397,19 +397,33 @@ def parse_scope_keys(raw):
 
 
 def commits_for_key(root, key):
-    """Commit shas whose subject starts with `<key>:`, per the contract's
-    per-issue fallback recipe. Queried at both %h (short, repo-default
-    abbreviation) and %H (full) length, since a sha captured under one repo's
-    abbreviation setting may not match `%h` under another. The pattern is
-    anchored and regex-escaped so a key can never inject `--grep` regex —
-    belt-and-suspenders on top of SCOPE_KEY_RE, whose charset already
-    excludes every regex metacharacter."""
+    """Commit shas whose SUBJECT LINE starts with `<key>:`, per the
+    contract's per-issue fallback recipe. `--grep` alone is not enough here:
+    it matches the pattern anywhere in the full commit message, so a commit
+    whose unrelated subject merely has a later paragraph starting with
+    `<key>:` would be misattributed. `--grep` is kept only as a cheap
+    prefilter; the real check is `subject.startswith(f"{key}:")` in Python
+    against just the `%s` (subject) field. Both %h (short, repo-default
+    abbreviation) and %H (full) sha are collected in one pass since a sha
+    captured under one repo's abbreviation setting may not match `%h` under
+    another. The `--grep` pattern is anchored and regex-escaped so a key can
+    never inject regex — belt-and-suspenders on top of SCOPE_KEY_RE, whose
+    charset already excludes every regex metacharacter."""
     pattern = "^" + re.escape(key) + ":"
+    prefix = f"{key}:"
+    sep = "\x1f"  # unit separator: won't collide with real commit-subject text
+    out = capture.git(root, "log", f"--format=%h{sep}%H{sep}%s",
+                      f"--grep={pattern}")
     shas = set()
-    for fmt in ("%h", "%H"):
-        out = capture.git(root, "log", f"--format={fmt}", f"--grep={pattern}")
-        if out:
-            shas.update(line.strip() for line in out.splitlines() if line.strip())
+    if out:
+        for line in out.splitlines():
+            parts = line.split(sep, 2)
+            if len(parts) != 3:
+                continue
+            short, full, subject = parts
+            if subject.startswith(prefix):
+                shas.add(short)
+                shas.add(full)
     return sorted(shas)
 
 
@@ -518,12 +532,27 @@ def fetch_scoped_rollup(conn, cwd, scope_raw):
             "invalid": invalid, "n": n, "k": k, **totals}
 
 
+INVALID_ECHO_MAX = 32
+
+
+def sanitize_invalid_echo(tok):
+    """A rejected --scope token is arbitrary caller input, about to be
+    echoed into rendered markdown — it must never carry backticks, pipes,
+    or newlines that could break out of the inline-code span (or the wider
+    table/document) it's shown in. Strip to a conservative safe charset and
+    cap the length so one hostile token can't blow up the render."""
+    cleaned = re.sub(r"[^A-Za-z0-9_,-]", "", tok)
+    if len(cleaned) > INVALID_ECHO_MAX:
+        cleaned = cleaned[:INVALID_ECHO_MAX] + "…"
+    return cleaned or "(unprintable)"
+
+
 def render_scoped_rollup(d):
     out = ["", "**Scoped rollup**", ""]
     if d["invalid"]:
-        out.append("Rejected invalid scope key(s): "
-                   + ", ".join(f"`{t}`" for t in d["invalid"])
-                   + " (must match `KEY-123`).")
+        shown = ", ".join(f"`{sanitize_invalid_echo(t)}`" for t in d["invalid"])
+        out.append(f"Rejected invalid scope key(s): {shown}"
+                   " (must match `KEY-123`).")
     if d["state"] == "empty_keyset":
         out.append("scope resolution failed — empty key set")
         return "\n".join(out)
