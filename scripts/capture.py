@@ -631,20 +631,32 @@ PROJECT_INFO_MAX_BYTES = 65536
 PROJECT_NAME_RE = re.compile(r"^project:\s*(.+?)\s*$", re.MULTILINE)
 
 
+PROJECT_INFO_LOCATIONS = (".marvin", ".docs", "docs")
+
+
 def project_name_from_kit(root):
     """The human project name from the agent-operating-kit's PROJECT-INFO
-    frontmatter (`project:` key). None when the kit is not installed, the file
-    is unreadable/oversized, or the value is an unresolved {{PLACEHOLDER}} —
-    a missing name is never worth failing or slowing a capture over."""
+    frontmatter (`project:` key). Looks in a three-location ladder, in order:
+    `.marvin/` (kit >=v0.21), `.docs/` (kit v0.15-0.20), `docs/` (kit <v0.15) —
+    the kit's PROJECT-INFO.md has moved across versions, so a project on an
+    older kit still resolves. The first location whose PROJECT-INFO.md exists
+    wins; that file alone decides the result and never falls through to the
+    next location, even if it turns out invalid. None when the kit is not
+    installed, the file is unreadable/oversized, or the value is an
+    unresolved {{PLACEHOLDER}} — a missing name is never worth failing or
+    slowing a capture over."""
     try:
-        path = Path(root) / ".docs" / "PROJECT-INFO.md"
-        if path.stat().st_size > PROJECT_INFO_MAX_BYTES:
-            return None
-        m = PROJECT_NAME_RE.search(path.read_text(errors="replace"))
-        if not m:
-            return None
-        name = m.group(1).strip().strip("'\"")
-        return name if name and "{{" not in name else None
+        for loc in PROJECT_INFO_LOCATIONS:
+            path = Path(root) / loc / "PROJECT-INFO.md"
+            if path.is_file():
+                if path.stat().st_size > PROJECT_INFO_MAX_BYTES:
+                    return None
+                m = PROJECT_NAME_RE.search(path.read_text(errors="replace"))
+                if not m:
+                    return None
+                name = m.group(1).strip().strip("'\"")
+                return name if name and "{{" not in name else None
+        return None
     except Exception:
         return None
 

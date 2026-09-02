@@ -129,10 +129,13 @@ heals itself.
   cache write; this is the number Claude Code's own token gauge shows for an agent).
   NULL on pre-v6 rows = unknown, never backfilled.
 - **v4 → v5** (v0.7.0) — `projects.name`: the human project name. Capture stamps it
-  every turn from the kit's `.docs/PROJECT-INFO.md` frontmatter (`project:` key —
-  the kit document wins over any other source); `/token-telemetry:enable` registers a
-  user-supplied name when no kit document exists. NULL = unknown; reports fall back
-  to the path basename.
+  every turn from the kit's PROJECT-INFO.md frontmatter (`project:` key — the kit
+  document wins over any other source), resolved via a three-location ladder:
+  `.marvin/PROJECT-INFO.md` (kit >=v0.21), then `.docs/PROJECT-INFO.md` (kit
+  v0.15-0.20), then `docs/PROJECT-INFO.md` (kit <v0.15) — the first of these that
+  exists is the one read, and it alone decides the result; `/token-telemetry:enable`
+  registers a user-supplied name when no kit document exists at any of the three.
+  NULL = unknown; reports fall back to the path basename.
 
 No column has ever been renamed or removed. v0.3.0 changed no schema at all — it added
 storage modes. A project-local mirror is byte-for-byte the same schema as the central DB;
