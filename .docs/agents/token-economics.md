@@ -8,9 +8,27 @@ SQLite DB at `~/.claude/telemetry/usage.db` (override: `$TOKEN_TELEMETRY_DB`), t
 
 ## Scoping recipes
 
-- **Milestone**: `events.branch = 'milestone/<slug>'`.
+`events.branch` is capture-time corroboration for a single event only — **never**
+a grouping or filter key. Gitflow (kit ≥v0.22) no longer names milestone
+branches `milestone/<slug>`, so a query grouping on that pattern silently
+matches nothing rather than erroring.
+
+- **Milestone/version**: resolve to the milestone's issue-key set first (the
+  native mapping documented in `.docs/agents/tracker-config.md` — epics carry
+  a `milestone:<slug>` label under the virtual-milestone rule), then apply the
+  per-issue recipe below to each key and sum across the set.
+  `scripts/report.py --scope KEY1,KEY2,...` implements exactly this and
+  renders three distinguishable empty states instead of a bare `$0`: an
+  unparseable/empty key set (scope resolution failed), a project with zero
+  telemetry at all (telemetry absent), and zero of N scoped keys having rows
+  (broken scope) — never collapse these into an unexplained zero.
 - **Period**: `events.ts` window (the report's date range).
-- **Per-issue**: `events.issue_key = '<KEY>'` when rows are tagged directly (preferred); fallback `events.commit_sha IN (git log --format=%h --grep='^<KEY>:')` (match both `%h` lengths) when `issue_key` is null.
+- **Per-issue**: `events.issue_key = '<KEY>'` when rows are tagged directly
+  (preferred); fallback `events.commit_sha IN (git log --format=%h
+  --grep='^<KEY>:')` (match both `%h` lengths) when `issue_key` is null,
+  restricted to shas whose commit **subject line** actually starts with
+  `<KEY>:` — the `--grep` pass is a prefilter only, since it can also match a
+  later body paragraph and misattribute the commit.
 
 ## Tier mapping
 
