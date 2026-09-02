@@ -644,14 +644,30 @@ def project_name_from_kit(root):
     next location, even if it turns out invalid. None when the kit is not
     installed, the file is unreadable/oversized, or the value is an
     unresolved {{PLACEHOLDER}} — a missing name is never worth failing or
-    slowing a capture over."""
+    slowing a capture over. A repo-controlled symlink at any ladder location
+    (e.g. `.marvin/PROJECT-INFO.md` -> /etc/passwd) must not read outside the
+    repo root: each candidate is resolved and required to stay under the
+    resolved root before it is opened; one that escapes is treated as invalid
+    at that location, same as any other bad file — no fall-through."""
     try:
+        root_resolved = Path(root).resolve()
         for loc in PROJECT_INFO_LOCATIONS:
             path = Path(root) / loc / "PROJECT-INFO.md"
             if path.is_file():
-                if path.stat().st_size > PROJECT_INFO_MAX_BYTES:
+                resolved = path.resolve()
+                try:
+                    within_root = resolved.is_relative_to(root_resolved)
+                except AttributeError:
+                    try:
+                        resolved.relative_to(root_resolved)
+                        within_root = True
+                    except ValueError:
+                        within_root = False
+                if not within_root:
                     return None
-                m = PROJECT_NAME_RE.search(path.read_text(errors="replace"))
+                if resolved.stat().st_size > PROJECT_INFO_MAX_BYTES:
+                    return None
+                m = PROJECT_NAME_RE.search(resolved.read_text(errors="replace"))
                 if not m:
                     return None
                 name = m.group(1).strip().strip("'\"")
