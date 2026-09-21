@@ -170,6 +170,15 @@ CREATE TABLE IF NOT EXISTS audit_log(
   detail  TEXT);
 """
 
+# v7: identity foundation — the `users` table and a nullable
+# `sessions.owner_id` REFERENCES users(uuid). Additive and inert: this phase
+# only lays the schema down. NULL owner_id = pre-identity, never backfilled
+# except by a later retro-link step.
+USERS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(uuid TEXT PRIMARY KEY, name TEXT NOT NULL,
+  created_at INTEGER NOT NULL);
+"""
+
 V2_COLUMNS = ("issue_key", "task_size", "note")
 # v3: where a project-level copy of this project's events lives, and the event
 # timestamp of the last capture that was configured to write one.
@@ -189,7 +198,11 @@ V5_COLUMNS = (("projects", "name", "TEXT"),)
 # when it ended. NULL on pre-v6 rows = unknown, never backfilled.
 V6_COLUMNS = (("events", "api_calls", "INTEGER"),
               ("events", "ctx_tokens", "INTEGER"))
-SCHEMA_VERSION = 6
+# v7: `sessions.owner_id` — nullable FK to users(uuid). NULL = pre-identity
+# (rows recorded before the identity feature), never backfilled except by a
+# later retro-link step. The `users` table itself lives in USERS_SCHEMA above.
+V7_COLUMNS = (("sessions", "owner_id", "TEXT REFERENCES users(uuid)"),)
+SCHEMA_VERSION = 7
 
 
 def table_columns(conn, table):
@@ -221,13 +234,15 @@ def migrate(conn):
             and has_table(conn, "audit_log")
             and "cache_w_1h" in event_columns(conn)
             and "cache_w_1h_usd" in table_columns(conn, "pricing")
-            and {"api_calls", "ctx_tokens"} <= event_columns(conn)):
+            and {"api_calls", "ctx_tokens"} <= event_columns(conn)
+            and has_table(conn, "users")
+            and "owner_id" in table_columns(conn, "sessions")):
         return
     # Hops run in sequence and each returns whether its shape actually landed:
     # v3 must never be attempted - let alone stamped - on a DB that failed v2.
     if (migrate_v2(conn) and migrate_v3(conn) and migrate_v4(conn)
-            and migrate_v5(conn)):
-        migrate_v6(conn)
+            and migrate_v5(conn) and migrate_v6(conn)):
+        migrate_v7(conn)
 
 
 def migrate_v2(conn):
@@ -329,6 +344,26 @@ def migrate_v6(conn):
             pass  # duplicate column, or a transient failure the check catches
     if not {"api_calls", "ctx_tokens"} <= event_columns(conn):
         return False  # next connect retries; the stamp stays at 5
+    conn.commit()
+    conn.execute("PRAGMA user_version=6")
+    return True
+
+
+def migrate_v7(conn):
+    """v6 -> v7: identity foundation — the `users` table and a nullable
+    `sessions.owner_id` REFERENCES users(uuid) (NULL = pre-identity, never
+    backfilled except by a later retro-link step). Additive and inert: nothing
+    here mints uuids or stamps owner_id yet. Same discipline: idempotent
+    CREATE/ALTER, post-condition verified before the stamp."""
+    conn.executescript(USERS_SCHEMA)
+    for table, col, coltype in V7_COLUMNS:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+        except sqlite3.OperationalError:
+            pass  # duplicate column, or a transient failure the check catches
+    if not (has_table(conn, "users")
+            and "owner_id" in table_columns(conn, "sessions")):
+        return False  # next connect retries; the stamp stays at 6
     conn.commit()
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     return True

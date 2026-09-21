@@ -719,7 +719,8 @@ class TestSchemaV6(unittest.TestCase):
     def test_fresh_db_is_user_version_6_with_metric_columns(self):
         conn = capture.connect(self.db)
         self.addCleanup(conn.close)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
+        self.assertGreaterEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], 6)
         self.assertLessEqual({"api_calls", "ctx_tokens"},
                              self.columns(conn, "events"))
 
@@ -727,7 +728,8 @@ class TestSchemaV6(unittest.TestCase):
         build_v5_db(self.db)
         migrated = capture.connect(self.db)
         self.addCleanup(migrated.close)
-        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 6)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         # pre-v6 rows read back with NULL metrics — unknown, never invented
         self.assertEqual(migrated.execute(
             "SELECT ts, api_calls, ctx_tokens FROM events").fetchall(),
@@ -755,6 +757,122 @@ class TestSchemaV6(unittest.TestCase):
         self.assertEqual(conn.execute(
             "SELECT api_calls, ctx_tokens FROM events").fetchall(),
             [(1, 65)])
+
+
+def build_v6_db(path):
+    """A populated, correctly stamped v6 DB - the starting point of the v6 -> v7
+    migration. Frozen v6 shape: events.api_calls/ctx_tokens present, but no
+    `users` table and no `sessions.owner_id`."""
+    build_v5_db(path)
+    conn = _sqlite3.connect(path)
+    conn.execute("ALTER TABLE events ADD COLUMN api_calls INTEGER")
+    conn.execute("ALTER TABLE events ADD COLUMN ctx_tokens INTEGER")
+    conn.execute("PRAGMA user_version=6")
+    conn.commit()
+    conn.close()
+
+
+class TestSchemaV7(unittest.TestCase):
+    """v7 adds the identity foundation: the `users` table and a nullable
+    `sessions.owner_id` FK. Additive and inert — no rows are minted yet."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = pathlib.Path(self.tmp.name) / "usage.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def columns(self, conn, table):
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    def tables(self, conn):
+        return {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+
+    def test_fresh_db_is_user_version_7_with_identity_shape(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
+        self.assertIn("users", self.tables(conn))
+        self.assertIn("owner_id", self.columns(conn, "sessions"))
+        self.assertEqual(
+            self.columns(conn, "users"), {"uuid", "name", "created_at"})
+
+    def test_migrates_v6_db_without_touching_rows(self):
+        build_v6_db(self.db)
+        migrated = capture.connect(self.db)
+        self.addCleanup(migrated.close)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 7)
+        self.assertIn("users", self.tables(migrated))
+        # existing session rows read back with NULL owner_id — pre-identity,
+        # never backfilled.
+        self.assertEqual(migrated.execute(
+            "SELECT uuid, owner_id FROM sessions").fetchall(), [("s1", None)])
+        # the event row from the v2 build survives untouched.
+        self.assertEqual(migrated.execute(
+            "SELECT ts FROM events").fetchall(), [(99,)])
+        # the identity table starts empty — this phase mints nothing.
+        self.assertEqual(
+            migrated.execute("SELECT COUNT(*) FROM users").fetchone()[0], 0)
+
+    def test_owner_id_accepts_a_uuid_and_stays_nullable(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        conn.execute("INSERT INTO projects(path) VALUES ('/p')")
+        conn.execute(
+            "INSERT INTO users(uuid, name, created_at) VALUES ('u1', 'Ada', 1)")
+        conn.execute("INSERT INTO sessions(uuid, project_id, owner_id)"
+                     " VALUES ('s-owned', 1, 'u1')")
+        conn.execute("INSERT INTO sessions(uuid, project_id)"
+                     " VALUES ('s-null', 1)")
+        conn.commit()
+        self.assertEqual(
+            conn.execute("SELECT uuid, owner_id FROM sessions"
+                         " ORDER BY uuid").fetchall(),
+            [("s-null", None), ("s-owned", "u1")])
+
+
+class TestStrandedMigrationV7(unittest.TestCase):
+    """A DB stamped user_version=7 without the v7 shape (an early stamp or a
+    rollback) must self-heal on the next connect rather than fail every capture
+    forever — the fast-path re-checks the actual shape, not the stamp."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = pathlib.Path(self.tmp.name) / "usage.db"
+        # A real, fully-shaped v6 DB, then mis-stamped 7 without adding the
+        # `users` table or `sessions.owner_id`.
+        build_v6_db(self.db)
+        conn = _sqlite3.connect(self.db)
+        conn.execute("PRAGMA user_version=7")  # stranded: stamped, no v7 shape
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def columns(self, conn, table):
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    def tables(self, conn):
+        return {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+
+    def test_stranded_v7_db_heals_on_next_connect(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        self.assertIn("users", self.tables(conn))
+        self.assertIn("owner_id", self.columns(conn, "sessions"))
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
+        # capture still works end to end against the healed DB.
+        capture.record(conn, "/proj", "s1", 0, None,
+                       capture.aggregate([entry()]), "/t2.jsonl", 10,
+                       issue_key="AOS-99")
+        self.assertEqual(
+            conn.execute("SELECT issue_key FROM events WHERE issue_key='AOS-99'")
+            .fetchall(), [("AOS-99",)])
 
 
 class TestProjectName(unittest.TestCase):

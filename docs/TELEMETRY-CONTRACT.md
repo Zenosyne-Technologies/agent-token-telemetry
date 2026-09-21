@@ -106,7 +106,7 @@ The mirror exists for retention and reuse — it travels with the repo or the te
 
 ## Schema version
 
-Current: `PRAGMA user_version = 6`. Migrations are additive deltas applied in
+Current: `PRAGMA user_version = 7`. Migrations are additive deltas applied in
 `capture.py`'s `migrate()`, run from `connect()`, and are idempotent — safe to run
 concurrently from multiple hook invocations. Hops run in order and each is gated on its
 own post-condition: a version is stamped only once the shape it promises is verifiably
@@ -139,6 +139,10 @@ heals itself.
   size when the slice ended — the input side of its last call: input + cache read +
   cache write; this is the number Claude Code's own token gauge shows for an agent).
   NULL on pre-v6 rows = unknown, never backfilled.
+- **v6 → v7** — identity foundation: the `users(uuid, name, created_at)` table and a
+  nullable `sessions.owner_id` (FK → `users.uuid`). Additive and inert — this hop only
+  lays the schema down; nothing yet mints uuids or stamps `owner_id`. **NULL `owner_id` =
+  pre-identity, never backfilled except by a later retro-link step.**
 
 No column has ever been renamed or removed. v0.3.0 changed no schema at all — it added
 storage modes. A project-local mirror is byte-for-byte the same schema as the central DB;
@@ -163,9 +167,13 @@ so is a `/storage-separate` export, which is built through the same `connect()`.
 | `ctx_tokens` | INTEGER | **v6.** context size at slice end (last call's input + cache read + cache write); NULL = pre-v6 |
 | `note` | TEXT | **v2.** From the sidecar's `summary`, else null. **v0.9.0**: `backlog-capture` marks a first-capture roll-up of pre-telemetry history (cursor started at 0 and the aggregated span exceeded 24h; `dur_ms` carries the span; a real sidecar note always wins). Consumers exclude these from windowed figures and include them in all-time views |
 
-`sessions(id, uuid, project_id)` and `models(id, name)` are stable lookup tables
+`models(id, name)` is a stable lookup table unchanged since v1; `sessions(id, uuid,
+project_id)` gained the nullable `owner_id` column in **v7** (FK → `users.uuid`; NULL =
+pre-identity, never backfilled except by a later retro-link step) and is otherwise
 unchanged since v1; `projects(id, path)` gained the two nullable `mirror_*` columns in
-v3 and the nullable `name` column in v5 (both above) and is otherwise unchanged. A row's absence is meaningful: storage-management
+v3 and the nullable `name` column in v5 (both above) and is otherwise unchanged.
+`users(uuid, name, created_at)` is the **v7** identity table — inert in this phase
+(nothing yet writes rows to it). A row's absence is meaningful: storage-management
 commands delete a project's `projects`/`sessions`/`events`/`cursors` rows outright, so a
 consumer must treat "no project row" as "no data", never as an error.
 
