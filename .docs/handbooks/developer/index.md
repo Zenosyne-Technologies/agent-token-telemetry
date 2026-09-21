@@ -6,7 +6,7 @@ summary: The table of contents for one handbook audience — every page in this 
 keywords: [handbook, index, pages, audience]
 level: project
 created: 2026-09-21
-updated: 2026-09-21
+updated: 2026-09-22
 ---
 
 # Handbook Index
@@ -19,4 +19,5 @@ updated: 2026-09-21
 
 | item | sources | what it covers | status | updated |
 |---|---|---|---|---|
-| [[capture-pipeline]] | `scripts/capture.py`, `hooks/hooks.json`, `docs/TELEMETRY-CONTRACT.md` | Stop/SubagentStop capture hook: never-break-a-session guarantee, cursor/offset transcript tailing, lock ordering, migration post-conditions and the version hop chain, storage modes and central authority, mirror metadata semantics, sidecar attribution, project-name ladder resolution, pricing-at-query-time | active | 2026-09-21 |
+| [[capture-pipeline]] | `scripts/capture.py`, `hooks/hooks.json`, `docs/TELEMETRY-CONTRACT.md` | Stop/SubagentStop capture hook: never-break-a-session guarantee, cursor/offset transcript tailing, lock ordering, migration post-conditions and the version hop chain, storage modes and central authority, mirror metadata semantics, sidecar attribution, project-name ladder resolution, pricing-at-query-time | active | 2026-09-22 |
+| [[pricing-updates]] | `scripts/pricing_update.py`, `commands/pricing-update.md`, `docs/TELEMETRY-CONTRACT.md` | How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, the never-mint-a-future-dated-row rule, and the two narrow exceptions to the pricing table's immutability contract. | active | 2026-09-22 |

@@ -3,7 +3,7 @@ title: Capture Pipeline
 audience: developer
 module: capture
 sources: [scripts/capture.py, hooks/hooks.json, docs/TELEMETRY-CONTRACT.md]
-updated: 2026-09-02
+updated: 2026-09-22
 related: [[pricing-and-cost]]
 ---
 
@@ -176,7 +176,8 @@ unaffected and still reads normally.
 
 `capture.py` never writes a cost column. It stamps raw token counts
 (`in_tok`/`out_tok`/`cache_r`/`cache_w`) and lets the `pricing` table (seeded
-at `effective_from=0`, superseded by dated rows as prices change) resolve cost
+at `effective_from=0`, superseded by dated rows as prices change — see
+[[pricing-updates]] for how `pricing_update.py` adds those rows) resolve cost
 at query time — see [[pricing-and-cost]] for the rate-resolution rule
 consumers use. This keeps a rate change a pure data insert: historical events
 never need rewriting, and capture itself stays free of any pricing logic or
