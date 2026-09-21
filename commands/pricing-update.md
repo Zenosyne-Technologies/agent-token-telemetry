@@ -25,8 +25,13 @@ changed or the fetch failed; its stderr says which). Then do it manually:
 3. INSERT a new row (`effective_from = strftime('%s','now','start of day')`,
    source = the URL) when: any rate changed, the family has no row, only the
    undated seed (`effective_from = 0`) exists, or the latest row predates the
-   v4 cache split (`cache_w_1h_usd IS NULL`). **Never UPDATE or DELETE** —
-   history must re-price identically forever. `INSERT OR IGNORE` (unique key
+   v4 cache split (`cache_w_1h_usd IS NULL`). A **`starting <date>` scheduled
+   increase is recorded only on the first run on or after that date** — never
+   dated in the future in advance (a forecast is not a recorded charge; see the
+   `## Pricing table` § of `docs/TELEMETRY-CONTRACT.md`). **Never UPDATE or
+   DELETE** a row that priced a real charge — history must re-price identically
+   forever; the only deletable row is a withdrawn future-dated forecast that
+   never took effect (same contract §). `INSERT OR IGNORE` (unique key
    `provider, model_prefix, model_version, effective_from`) makes same-day
    reruns a no-op.
 4. A `models`-table name matching no prefix is **unpriced** — report it, do

@@ -233,6 +233,20 @@ as `effective_from` and a `source` URL — rows are never `UPDATE`d or `DELETE`d
 past event always re-prices identically no matter when the query runs. `INSERT OR
 IGNORE` against the unique key makes same-day reruns of `pricing-update` a no-op.
 
+**Narrow exception — a withdrawn forecast may be deleted.** A pricing row may be
+`DELETE`d in exactly two cases: (1) it is **future-dated and not yet in effect**
+(`effective_from > now`), or (2) it recorded a **forecast** — a `starting <date>`
+scheduled increase that was written before its date arrived — that the publisher
+**subsequently withdrew** (the announced rate changed or was cancelled before it ever
+took effect). The reason immutability does not protect these rows is that they never
+priced a real charge: a withdrawn prediction is not a record of what was actually
+billed, so deleting it corrects the table rather than rewriting history. Every other
+row — one whose `effective_from <= now` and whose rate was, at some point, the rate
+actually charged — is immutable and is never `UPDATE`d or `DELETE`d. `pricing-update`
+itself never mints a future-dated row: a scheduled increase is recorded only on the
+first run on or after its effective date (so case (2) cannot arise from the script and
+is only reachable by a manual fallback that recorded a forecast by hand).
+
 **`effective_from = 0` is the seed marker, not a timestamp.** The v0.2.0 migration
 seeds four rows (`claude-fable-`, `claude-opus-`, `claude-sonnet-`, `claude-haiku-`,
 `source='seed-v0.2.0'`) at `effective_from = 0` so they price *all* history until a

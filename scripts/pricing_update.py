@@ -78,18 +78,27 @@ def parse_models(html):
     {family, version, rates, condition: None|('through'|'starting', date)}."""
     tc = TableCollector()
     tc.feed(html)
+    # Header text is matched case-insensitively: the published page has shipped
+    # both title case ("Base Input Tokens") and sentence case ("Base input
+    # tokens") for the same columns, and a case-sensitive match silently failed
+    # to find the table (exit 2) when the casing changed.
     table = next((t for t in tc.tables
-                  if t and any("Base Input Tokens" in c for c in t[0])), None)
+                  if t and any("base input tokens" in c.lower()
+                               for c in t[0])), None)
     if table is None:
         raise ValueError("model pricing table not found on the page")
     header = table[0]
     col = {}
     for i, cell in enumerate(header):
-        for key, needle in (("in", "Base Input"), ("w5", "5m Cache"),
-                            ("w1h", "1h Cache"), ("cr", "Cache Hits"),
-                            ("out", "Output")):
-            if needle in cell:
+        cell_l = cell.lower()
+        for key, needle in (("in", "base input"), ("w5", "5m cache"),
+                            ("w1h", "1h cache"), ("cr", "cache hits"),
+                            ("out", "output")):
+            if needle in cell_l:
                 col[key] = i
+    # The guard still fires on a genuinely-absent column: every needle must have
+    # matched some header cell, else an index is missing and we refuse rather
+    # than map a wrong column.
     if set(col) != {"in", "w5", "w1h", "cr", "out"}:
         raise ValueError(f"unexpected pricing table header: {header}")
 
@@ -130,13 +139,19 @@ def specific_prefixes(family, version):
 def build_candidates(entries, today):
     """Deterministic prefix plan:
     - `claude-<family>-` from each family's first (newest) unconditional row;
-    - conditional rows always get their specific prefix, dated `through` ->
-      today (rate in force now), `starting <d>` -> that date;
-    - unconditional rows get a specific prefix only when their rates differ
-      from the family rate (retired models on old pricing)."""
+    - a `through <d>` conditional gets its specific prefix dated today (the
+      intro rate is in force right now); a `starting <d>` conditional is a
+      scheduled future increase and is recorded ONLY once its date has arrived
+      (a run on/after `<d>`), never minted in advance — a forecast is not a
+      recorded charge (docs/TELEMETRY-CONTRACT.md);
+    - unconditional rows get a specific prefix when their rates differ from the
+      family rate (retired models on old pricing), OR when the family's newest
+      version would be shadowed by an older sibling's longer specific prefix
+      (e.g. `claude-fable-5` is a string-prefix of `claude-fable-5-1`, so a
+      Fable-5.1 model would otherwise pick up Fable-5's rate)."""
     today_epoch = int(datetime.datetime.combine(
         today, datetime.time(), tzinfo=datetime.timezone.utc).timestamp())
-    family_rates, candidates = {}, []
+    family_rates, family_newest, candidates = {}, {}, []
 
     def epoch(d):
         return int(datetime.datetime.combine(
@@ -146,12 +161,15 @@ def build_candidates(entries, today):
         fam, rates = e["family"], e["rates"]
         if e["condition"] is None and fam not in family_rates:
             family_rates[fam] = rates
+            family_newest[fam] = e
             candidates.append({"prefix": f"claude-{fam}-", "rates": rates,
                                "effective_from": today_epoch})
     for e in entries:
         fam, rates = e["family"], e["rates"]
         if e["condition"] is not None:
             kind, date = e["condition"]
+            if kind == "starting" and date > today:
+                continue  # scheduled increase not yet in effect — do not mint
             eff = today_epoch if kind == "through" else epoch(date)
             for p in specific_prefixes(fam, e["version"]):
                 candidates.append({"prefix": p, "rates": rates,
@@ -159,6 +177,24 @@ def build_candidates(entries, today):
         elif rates != family_rates.get(fam):
             for p in specific_prefixes(fam, e["version"]):
                 candidates.append({"prefix": p, "rates": rates,
+                                   "effective_from": today_epoch})
+    # Anti-shadowing: a family's newest version needs its OWN specific prefix
+    # whenever an older sibling's specific prefix (emitted above) is a proper
+    # string-prefix of it — otherwise longest-prefix matching would hand the
+    # newest models the older sibling's rate.
+    specific_by_family = {}
+    for c in candidates:
+        for fam in FAMILIES:
+            family_prefix = f"claude-{fam}-"
+            if c["prefix"].startswith(family_prefix) \
+                    and c["prefix"] != family_prefix:
+                specific_by_family.setdefault(fam, set()).add(c["prefix"])
+                break
+    for fam, e in family_newest.items():
+        others = specific_by_family.get(fam, set())
+        for np in specific_prefixes(fam, e["version"]):
+            if any(sp != np and np.startswith(sp) for sp in others):
+                candidates.append({"prefix": np, "rates": family_rates[fam],
                                    "effective_from": today_epoch})
     # keep first occurrence per (prefix, effective_from)
     seen, out = set(), []
