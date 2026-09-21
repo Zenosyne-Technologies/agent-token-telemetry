@@ -106,7 +106,7 @@ The mirror exists for retention and reuse — it travels with the repo or the te
 
 ## Schema version
 
-Current: `PRAGMA user_version = 5`. Migrations are additive deltas applied in
+Current: `PRAGMA user_version = 6`. Migrations are additive deltas applied in
 `capture.py`'s `migrate()`, run from `connect()`, and are idempotent — safe to run
 concurrently from multiple hook invocations. Hops run in order and each is gated on its
 own post-condition: a version is stamped only once the shape it promises is verifiably
@@ -123,11 +123,6 @@ heals itself.
   working and the 5m portion is `cache_w - cache_w_1h`) and `pricing.cache_w_1h_usd`
   (the 1h write rate, 2× input vs 1.25× for 5m; NULL = unknown — cost queries must fall
   back to `cache_w_usd`, which reproduces the pre-v4 estimate).
-- **v5 → v6** (v0.10.0) — per-event agent metrics: `events.api_calls` (API calls in
-  the slice, counted after the message.id dedupe) and `events.ctx_tokens` (context
-  size when the slice ended — the input side of its last call: input + cache read +
-  cache write; this is the number Claude Code's own token gauge shows for an agent).
-  NULL on pre-v6 rows = unknown, never backfilled.
 - **v4 → v5** (v0.7.0) — `projects.name`: the human project name. Capture stamps it
   every turn from the kit's PROJECT-INFO.md frontmatter (`project:` key — the kit
   document wins over any other source), resolved via a three-location ladder:
@@ -139,6 +134,11 @@ heals itself.
   `/token-telemetry:enable` registers a user-supplied name when no kit
   document exists at any of the three. NULL = unknown; reports fall back to
   the path basename.
+- **v5 → v6** (v0.10.0) — per-event agent metrics: `events.api_calls` (API calls in
+  the slice, counted after the message.id dedupe) and `events.ctx_tokens` (context
+  size when the slice ended — the input side of its last call: input + cache read +
+  cache write; this is the number Claude Code's own token gauge shows for an agent).
+  NULL on pre-v6 rows = unknown, never backfilled.
 
 No column has ever been renamed or removed. v0.3.0 changed no schema at all — it added
 storage modes. A project-local mirror is byte-for-byte the same schema as the central DB;
