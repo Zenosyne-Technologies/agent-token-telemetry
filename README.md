@@ -202,12 +202,10 @@ per-milestone cost breakdowns and the kit's cost-per-issue closing comment.
 
 ## Design
 
-See `docs/superpowers/specs/2026-07-17-token-telemetry-plugin-design.md` (v0.1.0
-capture design), `docs/TELEMETRY-CONTRACT.md` (the v0.2.0 stability contract:
-consumed columns, pricing table shape, sidecar spec, `PRAGMA user_version`
-discipline), and — kit side — the integration design in the agent-operating-kit
-repo: `docs/superpowers/specs/2026-08-04-cost-telemetry-integration-v0.12.0-design.md`
-with its `templates/docs/agents/token-economics.md` contract mirror.
+See `docs/TELEMETRY-CONTRACT.md` — the stability contract: the columns capture
+consumes, the pricing table shape and its immutability rules, the sidecar spec,
+and the `PRAGMA user_version` discipline. It is the authoritative reference for
+anyone extending capture or reporting.
 
 ## Tests
 
