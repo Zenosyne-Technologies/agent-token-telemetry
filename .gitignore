@@ -3,3 +3,15 @@ __pycache__/
 .claude/telemetry-context.json
 .claude/telemetry-usage.db*
 .DS_Store
+
+# Marvin operating machinery — local only (backed up separately), not for the public repo
+.marvin/
+.claude/
+docs/superpowers/
+# .docs/ estate is local EXCEPT the developer & user handbooks (public product docs)
+.docs/*
+!.docs/handbooks/
+.docs/handbooks/*
+!.docs/handbooks/developer/
+!.docs/handbooks/user/
+docs/issue-log.md

@@ -772,9 +772,9 @@ class TestProjectName(unittest.TestCase):
             f"---\nproject: {name_line}\npm_tool: jira\n---\n# body\n")
 
     def test_name_read_from_kit_frontmatter(self):
-        self.write_info("Example Portal")
+        self.write_info("Example Project")
         self.assertEqual(capture.project_name_from_kit(self.root),
-                         "Example Portal")
+                         "Example Project")
 
     def test_unresolved_placeholder_rejected(self):
         self.write_info("{{PROJECT_NAME}}")
