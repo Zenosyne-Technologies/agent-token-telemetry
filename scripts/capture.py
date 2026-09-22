@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 import settings
+import storage
 
 
 def db_path():
@@ -406,6 +407,17 @@ def get_offset(conn, transcript):
     return row[0] if row else 0
 
 
+def write_cursor(conn, transcript, offset, session_id):
+    """Upsert the per-transcript read cursor — the single home for the cursor
+    write the central write path performs (from both `record` and
+    `sweep_subagents`). `LocalSqliteBackend.cursor_set` delegates here so the
+    seam and the direct callers share one statement and cannot drift."""
+    conn.execute(
+        "INSERT INTO cursors(transcript, offset, session_id) VALUES (?,?,?)"
+        " ON CONFLICT(transcript) DO UPDATE SET offset=excluded.offset",
+        (str(transcript), offset, session_id))
+
+
 # A first capture whose aggregated span exceeds this is a roll-up of
 # pre-telemetry history, not a per-turn delta — marked so windowed reports
 # and the dashboard can keep it out of day/week figures (all-time totals
@@ -506,10 +518,7 @@ def record(conn, project, session_uuid, kind_hint, agent, groups,
         if mirror_path is not None:
             stamp_mirror_meta(conn, project, mirror_path,
                               latest_event_ts(groups))
-        conn.execute(
-            "INSERT INTO cursors(transcript, offset, session_id) VALUES (?,?,?)"
-            " ON CONFLICT(transcript) DO UPDATE SET offset=excluded.offset",
-            (str(transcript), new_offset, session_id))
+        write_cursor(conn, transcript, new_offset, session_id)
 
 
 # At most this many sub-agent transcript files advance per hook firing, so a
@@ -570,11 +579,7 @@ def sweep_subagents(conn, project, session_uuid, transcript, meta,
             session_id = insert_events(conn, *event_args, *meta,
                                        first_capture=(offset == 0),
                                        owner_id=owner_id)
-            conn.execute(
-                "INSERT INTO cursors(transcript, offset, session_id)"
-                " VALUES (?,?,?)"
-                " ON CONFLICT(transcript) DO UPDATE SET offset=excluded.offset",
-                (str(f), new_offset, session_id))
+            write_cursor(conn, f, new_offset, session_id)
             if groups:
                 inserted.append((event_args, offset == 0))
     return inserted
@@ -594,18 +599,21 @@ def mirror_events(root, *args, **kwargs):
     # Refuse rather than resolve: nothing here is worth writing through a link.
     if path.is_symlink():
         raise RuntimeError(f"mirror path is a symlink - refused: {path}")
-    conn = connect(path)
+    # The mirror is a second storage backend on the project-local file; open it
+    # through the same seam as the central write so both share one code path.
+    backend = storage.LocalSqliteBackend(path)
+    backend.open()
     try:
         # Same lock discipline as the central write, for the same reason:
         # parallel firings share this file, and a deferred transaction lets
         # get_or_create's SELECT-then-INSERT race - the losing writer's rows are
         # then dropped by the swallow-all-mirror-errors rule. Measured: 9/10
         # rows landing in 2 of 3 ten-way trials without this.
-        conn.execute("BEGIN IMMEDIATE")
-        with conn:
-            insert_events(conn, *args, **kwargs)
+        backend.conn.execute("BEGIN IMMEDIATE")
+        with backend.conn:
+            backend.write_events(*args, **kwargs)
     finally:
-        conn.close()
+        backend.close()
 
 
 def find_project_root(cwd):
@@ -819,7 +827,9 @@ def main():
         # behaves byte-for-byte as before. current_owner_id() swallows every
         # settings-read error internally, so a malformed file never reaches here.
         owner_id = settings.current_owner_id()
-        conn = connect(db_path())
+        backend = storage.LocalSqliteBackend(db_path())
+        backend.open()
+        conn = backend.conn
         mirror_batch = []
         try:
             # Take the write lock up front so concurrent hook firings on the
@@ -828,7 +838,7 @@ def main():
             # sqlite3.connect(..., timeout=5) in connect() busy-waits for the
             # lock; record()'s `with conn:` commits this transaction on exit.
             conn.execute("BEGIN IMMEDIATE")
-            offset = get_offset(conn, transcript)
+            offset = backend.cursor_get(transcript)
             entries, new_offset = read_new_entries(transcript, offset)
             groups = aggregate(entries)
             # The MAIN transcript always holds main-loop work (kind 0): the
@@ -863,7 +873,7 @@ def main():
                     transcript, meta, agent, owner_id):
                 mirror_batch.append(((*swept, *meta), fc))
         finally:
-            conn.close()
+            backend.close()
         # Only now, with the central transaction committed and its connection
         # closed, is the project-local copy attempted - and any failure of it is
         # logged and dropped: the mirror exists for retention and portability,

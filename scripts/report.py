@@ -16,20 +16,20 @@ import datetime
 import json
 import os
 import re
-import sqlite3
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture
+import storage
 
 
 def open_ro(db):
     """Read-only connection to the telemetry store, or None when absent.
-    The single backend-selection point (see module docstring)."""
-    if not Path(db).exists():
-        return None
-    return sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    The single backend-selection point (see module docstring): it delegates to
+    the storage seam, so a future server-hosted backend plugs in there rather
+    than here. Reports keep running SQLite SQL over the returned connection."""
+    return storage.LocalSqliteBackend(db).open_ro()
 
 
 def has_column(conn, table, column):
