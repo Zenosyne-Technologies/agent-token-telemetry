@@ -4,6 +4,13 @@ Claude Code plugin that records per-turn and per-subagent token usage into a
 central SQLite database — with **zero model-token overhead** (capture runs in
 Stop/SubagentStop hooks, outside the model loop).
 
+Since **v0.14.0** it can also record to an optional **remote backend (Supabase)**
+for a central, multi-machine view, isolated per user by Postgres Row-Level
+Security and reached over stdlib HTTPS with no new dependencies. It is **off by
+default** — local SQLite stays the default and the durable store — and is
+enabled with `/token-telemetry:enable-remote`. See the user handbook for the
+enable/migrate flow and the operator/security guide.
+
 v0.10.0 (schema v6) records **per-event agent metrics** — `api_calls` (how many
 API calls a turn or sub-agent slice contained) and `ctx_tokens` (context size
 when it ended: the last call's input side, i.e. the number Claude Code's own
