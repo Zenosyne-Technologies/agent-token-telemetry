@@ -114,6 +114,7 @@ RETURNS jsonb
 LANGUAGE sql
 STABLE
 SECURITY INVOKER
+SET search_path = ''
 AS $$
   SELECT coalesce(
     jsonb_agg(to_jsonb(t) ORDER BY
@@ -178,6 +179,7 @@ RETURNS jsonb
 LANGUAGE plpgsql
 STABLE
 SECURITY INVOKER
+SET search_path = ''
 AS $$
 DECLARE
   -- Local midnight today, as a UTC epoch (== SQLite 'localtime','start of day').
@@ -321,6 +323,7 @@ RETURNS jsonb
 LANGUAGE sql
 STABLE
 SECURITY INVOKER
+SET search_path = ''
 AS $$
   SELECT jsonb_build_object(
     'events', (SELECT count(*) FROM public.events),

@@ -578,5 +578,28 @@ class TestPostgresEquivalence(unittest.TestCase):
             self.assertEqual(pg[k], ref[k], k)
 
 
+class TestReportsSecurityHardening(unittest.TestCase):
+    """Always-on structural guards on supabase/reports.sql (no Postgres needed).
+    They pin the Supabase security posture its linter checks on a real instance
+    (verified live 2026-09-22): every report function is SECURITY INVOKER — never
+    DEFINER, which would run as the object owner and BYPASS the caller's RLS — and
+    pins search_path (the function_search_path_mutable advisor) so a hijacked
+    search_path cannot resolve an unqualified name to an attacker's object."""
+
+    def test_no_security_definer_in_code(self):
+        # a DEFINER function would run as the owner and bypass the caller's RLS.
+        # Strip SQL comment lines first — the header prose legitimately explains
+        # why DEFINER is avoided, and that mention must not trip this guard.
+        code = "\n".join(l for l in REPORTS_SQL.splitlines()
+                         if not l.lstrip().startswith("--"))
+        self.assertNotIn("SECURITY DEFINER", code)
+
+    def test_every_report_function_is_invoker_and_pins_search_path(self):
+        # the exact INVOKER+pinned-search_path pairing appears once per function
+        # (3); the header's prose mention of "SECURITY INVOKER" won't match this.
+        self.assertEqual(
+            REPORTS_SQL.count("SECURITY INVOKER\nSET search_path = ''"), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
