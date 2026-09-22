@@ -49,6 +49,10 @@ REFRESH_SKEW = 60
 # At most this many backlogged firings are re-sent per hook firing, bounding the
 # catch-up cost after the remote comes back (mirrors capture.SUBAGENT_BATCH).
 OUTBOX_DRAIN_BATCH = 50
+# Rows per bulk-migration upsert request (P8). Chunked so one HTTP body stays
+# bounded and a resumed migration re-sends at most one chunk; every chunk is an
+# idempotent merge-duplicates upsert, so re-running converges with no duplicates.
+MIGRATE_CHUNK = 500
 # Env var that may inject an Auth access token directly (highest precedence, for
 # CI/testing) ahead of the keychain and the 0600 file. Holds a token, not a key.
 SESSION_ENV = "TOKEN_TELEMETRY_SUPABASE_SESSION"
@@ -70,8 +74,10 @@ EVENTS_ON_CONFLICT = (
 # owner-scoped so a re-send is idempotent per owner (own-rows-only). tests/
 # test_schema_sql.py verifies the schema carries a matching constraint for each.
 UPSERT_ON_CONFLICT = {
+    "users": "uuid",
     "projects": "owner_id,path",
     "models": "owner_id,name",
+    "pricing": "owner_id,provider,model_prefix,model_version,effective_from",
     "sessions": "owner_id,uuid",
     "events": EVENTS_ON_CONFLICT,
 }
@@ -153,6 +159,12 @@ class SupabaseBackend(storage.StorageBackend):
         self._outbox_path = (Path(outbox_path) if outbox_path is not None
                              else settings.telemetry_dir() / "outbox.db")
         self._outbox = None
+        # Self-heal latch (req 7): the current user's `users` row is upserted at
+        # most once per process before its first FK-referencing push, so a user
+        # who enabled remote without a full migration still has a valid parent
+        # row and events do not loop in the outbox on the users FK. Reset to
+        # False so a failed attempt retries on the next firing.
+        self._user_synced = False
 
     # --- lifecycle ---
     def open(self):
@@ -242,7 +254,7 @@ class SupabaseBackend(storage.StorageBackend):
         :raises urllib.error.URLError / HTTPError: on a transport/auth failure.
         """
         url = f"{self.base}/auth/v1/token?grant_type=password"
-        _status, raw = self._request(
+        _status, raw, _hdrs = self._request(
             "POST", url, self._auth_headers(), {"email": email,
                                                 "password": password})
         data = json.loads(raw)
@@ -322,6 +334,11 @@ class SupabaseBackend(storage.StorageBackend):
         owner = payload["owner_id"]
         project = payload["project"]
         headers = self._rest_headers(token)
+        # 0. self-heal (req 7): ensure the owner's `users` row exists before any
+        #    FK-referencing row, once per process. A fresh-enabled user (no full
+        #    migration) otherwise has no parent row and every event loops in the
+        #    outbox on the users FK.
+        self._ensure_user_row(headers, owner)
         # 1. projects (upsert on the owner-scoped natural key `(owner_id, path)`)
         self._rest("projects", [{"owner_id": owner, "path": project}], headers,
                    on_conflict=UPSERT_ON_CONFLICT["projects"])
@@ -345,6 +362,98 @@ class SupabaseBackend(storage.StorageBackend):
             event_rows.append(row)
         self._rest("events", event_rows, headers,
                    on_conflict=UPSERT_ON_CONFLICT["events"])
+
+    def _ensure_user_row(self, headers, owner):
+        """Self-heal the owner's remote ``users`` row before FK-referencing rows.
+
+        Idempotent and at most once per process (:attr:`_user_synced`): a user
+        who enabled the remote backend without running the full migration still
+        gets a valid parent row, so events do not loop in the outbox on the
+        ``users`` foreign key (the P7 finding). The row is inserted with
+        ``resolution=ignore-duplicates`` so an existing row — and its real
+        ``created_at`` written by the migration — is never clobbered by this
+        best-effort now-stamp. Name/uuid come from settings; when no full name is
+        on file the row cannot satisfy ``users.name NOT NULL``, so this no-ops
+        (the latch stays False and a later firing retries once a name is set).
+
+        :param headers: the REST headers already built for this push (its Auth
+            bearer is reused; only the ``Prefer`` resolution is overridden).
+        :param owner: the ``owner_id`` stamped on this firing — the users row's
+            ``uuid`` (== ``auth.uid()`` after login, what RLS matches).
+        """
+        if self._user_synced:
+            return
+        s = self._settings if self._settings is not None else settings.read_settings()
+        user = s.get("user") if isinstance(s, dict) else None
+        name = user.get("full_name") if isinstance(user, dict) else None
+        if not name:
+            return
+        uheaders = dict(headers)
+        uheaders["Prefer"] = "resolution=ignore-duplicates,return=minimal"
+        self._rest("users", [{"uuid": owner, "name": name,
+                              "created_at": int(time.time())}], uheaders,
+                   on_conflict=UPSERT_ON_CONFLICT["users"])
+        self._user_synced = True
+
+    # --- bulk migration (P8): FK-ordered chunked upserts + count validation.
+    #     These DELIBERATELY raise on any transport/HTTP error (unlike the
+    #     never-break-a-session write path) so the migration command aborts and
+    #     leaves the collection pointer unflipped and the local DB authoritative.
+    def push_rows(self, table, rows, on_conflict, chunk=None):
+        """Upsert ``rows`` into remote ``table`` in idempotent chunks.
+
+        Every chunk is a ``Prefer: resolution=merge-duplicates`` upsert on
+        ``on_conflict`` (an owner-scoped unique key), so a resumed or re-run
+        migration merges instead of duplicating. All I/O goes through the one
+        TLS-verified :meth:`_request` site. Raises on the FIRST failing chunk so
+        the caller can abort without flipping the pointer.
+
+        :param table: the remote table name.
+        :param rows: a list of JSON-serializable row dicts (already owner-stamped
+            by the caller for every owner-scoped table).
+        :param on_conflict: the upsert conflict target (an owner-scoped unique
+            key from :data:`UPSERT_ON_CONFLICT`).
+        :param chunk: rows per request (defaults to :data:`MIGRATE_CHUNK`).
+        :returns: the number of rows sent.
+        :raises urllib.error.URLError / HTTPError / TimeoutError: on any failure.
+        """
+        if not rows:
+            return 0
+        size = chunk or MIGRATE_CHUNK
+        sent = 0
+        for i in range(0, len(rows), size):
+            batch = rows[i:i + size]
+            # Re-derive the bearer per chunk so a long upload refreshes a token
+            # nearing expiry rather than failing mid-run.
+            headers = self._rest_headers(self._access_token())
+            self._rest(table, batch, headers, on_conflict=on_conflict)
+            sent += len(batch)
+        return sent
+
+    def count_rows(self, table):
+        """Return the number of remote rows in ``table`` visible to the caller.
+
+        Under RLS every authenticated request sees only the caller's OWN rows, so
+        this is the owner-scoped count the migration validates against the local
+        totals before the pointer flip. Uses ``Prefer: count=exact`` and reads the
+        ``Content-Range`` response header (``0-0/<total>``); no table data is
+        transferred beyond a single probe row. Raises on any transport/HTTP error
+        (e.g. a missing table on an unprovisioned remote) so preflight and
+        validation can surface it.
+
+        :param table: the remote table to count.
+        :returns: the owner-scoped row count as an ``int``.
+        :raises urllib.error.URLError / HTTPError / TimeoutError: on any failure.
+        """
+        headers = dict(self._rest_headers(self._access_token()))
+        headers["Prefer"] = "count=exact"
+        headers["Range-Unit"] = "items"
+        headers["Range"] = "0-0"
+        url = f"{self.base}/rest/v1/{table}"
+        _status, _body, resp_headers = self._request("GET", url, headers)
+        cr = resp_headers.get("content-range") or ""
+        total = cr.rsplit("/", 1)[-1] if "/" in cr else ""
+        return int(total) if total.isdigit() else 0
 
     # --- transport (single urlopen site) ---
     def _auth_headers(self):
@@ -381,14 +490,18 @@ class SupabaseBackend(storage.StorageBackend):
             url += f"?on_conflict={on_conflict}"
         self._request("POST", url, headers, rows)
 
-    def _request(self, method, url, headers, body):
+    def _request(self, method, url, headers, body=None):
         """The ONE place a network request is made — so TLS, timeout, and the
         no-secret-in-URL rule are enforced in exactly one auditable spot.
 
         Uses a certificate-verified default TLS context (NEVER an unverified
         one) and a bounded timeout. Only ``https://`` is permitted. Raises
         :class:`urllib.error.URLError` / :class:`~urllib.error.HTTPError` /
-        :class:`TimeoutError` on failure — the caller decides what to swallow."""
+        :class:`TimeoutError` on failure — the caller decides what to swallow.
+
+        :returns: ``(status, body_bytes, response_headers)`` where the headers
+            are a lower-cased-key dict (used by :meth:`count_rows` to read the
+            ``Content-Range`` total); an empty dict when they cannot be read."""
         if not url.lower().startswith("https://"):
             raise RuntimeError("refusing a non-HTTPS Supabase request")
         data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -402,7 +515,12 @@ class SupabaseBackend(storage.StorageBackend):
         with urllib.request.urlopen(req, timeout=REMOTE_TIMEOUT,
                                     context=context) as resp:
             status = getattr(resp, "status", None) or resp.getcode()
-            return status, resp.read()
+            body_bytes = resp.read()
+            try:
+                resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+            except Exception:
+                resp_headers = {}
+            return status, body_bytes, resp_headers
 
     # --- Auth session (GoTrue) ---
     def _load_session(self):
@@ -446,7 +564,7 @@ class SupabaseBackend(storage.StorageBackend):
         """Exchange a refresh token for a fresh Auth session and persist it.
         The refresh token travels in the BODY, never the URL."""
         url = f"{self.base}/auth/v1/token?grant_type=refresh_token"
-        _status, raw = self._request(
+        _status, raw, _hdrs = self._request(
             "POST", url, self._auth_headers(), {"refresh_token": refresh_token})
         data = json.loads(raw)
         session = {
