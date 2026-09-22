@@ -448,5 +448,138 @@ class TestSelfHealUsersRow(Base):
         self.assertNotIn("users", fake.post_tables())
 
 
+class TestConfigureRemote(Base):
+    """The P11 non-network settings writer: it records the URL + publishable-key
+    env-var NAME (mode 0600) and NEVER a secret, only if none exists yet."""
+
+    def test_writes_config_block_0600_with_no_secret(self):
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            rc = remote_migrate.main(
+                ["configure-remote", "--url", URL, "--key-env", KEY_ENV])
+        self.assertEqual(rc, 0)
+        self.assertIn("configured=yes", out.getvalue())
+        cfg = settings.supabase_config()
+        self.assertEqual(cfg["url"], URL)
+        self.assertEqual(cfg["publishable_key_env"], KEY_ENV)
+        # mode 0600
+        import stat as _stat
+        self.assertEqual(
+            _stat.S_IMODE(settings.settings_path().stat().st_mode), 0o600)
+        # the on-disk file holds only the env-var NAME, NEVER the key VALUE —
+        # even though the value is present in the environment under that name.
+        raw = settings.settings_path().read_text()
+        self.assertIn(KEY_ENV, raw)
+        self.assertNotIn(KEY_VALUE, raw)
+
+    def test_defaults_key_env_name_when_omitted(self):
+        rc = remote_migrate.main(["configure-remote", "--url", URL])
+        self.assertEqual(rc, 0)
+        self.assertEqual(settings.supabase_config()["publishable_key_env"],
+                         settings.DEFAULT_SUPABASE_KEY_ENV)
+
+    def test_does_not_overwrite_an_existing_block(self):
+        settings.set_supabase_config("https://original.supabase.co", "ORIG_ENV")
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            rc = remote_migrate.main(
+                ["configure-remote", "--url", URL, "--key-env", KEY_ENV])
+        self.assertEqual(rc, 0)
+        self.assertIn("already_configured=yes", out.getvalue())
+        # original block untouched
+        cfg = settings.supabase_config()
+        self.assertEqual(cfg["url"], "https://original.supabase.co")
+        self.assertEqual(cfg["publishable_key_env"], "ORIG_ENV")
+
+    def test_does_not_flip_active_backend(self):
+        remote_migrate.main(["configure-remote", "--url", URL, "--key-env",
+                             KEY_ENV])
+        # configuring is not switching: collection stays local (absent == local).
+        self.assertNotEqual(
+            settings.read_settings().get("active_backend"), "supabase")
+
+    def test_requires_a_url(self):
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            rc = remote_migrate.main(["configure-remote", "--key-env", KEY_ENV])
+        self.assertEqual(rc, 1)
+        self.assertIsNone(settings.supabase_config())
+
+
+class TestSyncUser(Base):
+    """The explicit ensure-users-row step for the start-fresh enable path. It
+    reuses the validated migrate sync path (`_sync_users` -> `push_rows`), adding
+    no new transport/credential logic."""
+
+    def test_upserts_users_row_reusing_the_validated_path(self):
+        self.seed_local()
+        fake = FakeSupabase()
+        self.login(fake)
+        out = io.StringIO()
+        with mock.patch("urllib.request.urlopen", fake), \
+                mock.patch("sys.stdout", out):
+            rc = remote_migrate.main(["sync-user"])
+        self.assertEqual(rc, 0)
+        self.assertIn("users_row_synced=yes", out.getvalue())
+        # only the users row is pushed, keyed on the reconciled auth uid
+        self.assertEqual(fake.post_tables(), ["users"])
+        self.assertEqual(fake.tables["users"][0]["uuid"], AUTH_UID)
+        self.assertEqual(fake.tables["users"][0]["name"], "Ada Lovelace")
+        # never flips the collection pointer
+        self.assertEqual(settings.read_settings().get("active_backend"), "local")
+
+    def test_fails_without_a_session_and_pushes_nothing(self):
+        self.seed_local()            # config + identity, but NO login
+        fake = FakeSupabase()
+        err = io.StringIO()
+        with mock.patch("urllib.request.urlopen", fake), \
+                mock.patch("sys.stderr", err):
+            rc = remote_migrate.main(["sync-user"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(fake.rest_posts(), [])   # no users row reached the wire
+
+    def test_fails_when_no_full_name_on_file(self):
+        settings.write_settings({"user": {"uuid": "u1"},
+                                 "supabase": {"url": URL,
+                                              "publishable_key_env": KEY_ENV}})
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            rc = remote_migrate.main(["sync-user"])
+        self.assertEqual(rc, 1)
+        self.assertIn("full name", err.getvalue())
+
+
+class TestFlowNeverLeaksSecrets(Base):
+    """Flow-wide proof: neither the publishable key VALUE nor the login password
+    is ever placed in argv, settings.json, or credentials.json by this flow."""
+
+    def test_no_key_value_or_password_in_settings_or_argv(self):
+        # configure (url + env NAME) then log in (password on stdin only)
+        remote_migrate.main(["configure-remote", "--url", URL, "--key-env",
+                             KEY_ENV])
+        fake = FakeSupabase()
+        self.seed_local()   # provides identity for reconcile; config already set
+        self.login(fake)
+        settings_raw = settings.settings_path().read_text()
+        creds_raw = supabase_backend.credentials_path().read_text()
+        for blob in (settings_raw, creds_raw):
+            self.assertNotIn(KEY_VALUE, blob)      # publishable key value
+            self.assertNotIn("hunter2", blob)      # login password
+        # the password only ever appeared in the login request BODY, never a URL
+        for c in fake.calls:
+            self.assertNotIn("hunter2", c["url"])
+            self.assertNotIn(KEY_VALUE, c["url"])
+
+    def test_worker_help_exposes_no_key_or_password_flag(self):
+        # the worker's argv surface offers NO way to pass a key/password value —
+        # only --url and --key-env (a NAME). A key/password flag would be a leak
+        # vector into a process listing.
+        src = (pathlib.Path(__file__).resolve().parent.parent
+               / "scripts" / "remote_migrate.py").read_text()
+        self.assertNotIn("--password", src)
+        self.assertNotIn("--key-value", src)
+        self.assertNotIn('"--key"', src)
+
+
 if __name__ == "__main__":
     unittest.main()

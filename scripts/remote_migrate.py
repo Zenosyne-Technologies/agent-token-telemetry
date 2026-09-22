@@ -11,11 +11,17 @@ value is bound, never interpolated.
 The subcommands split check-from-do so the command never flips the collection
 pointer before a verified full upload:
 
+  configure-remote       write the supabase config block (url + publishable-key
+                         env-var NAME, NEVER a secret) to settings.json mode 0600,
+                         only if one does not already exist (no network)
   login                  acquire+persist an Auth session (email/password read
                          from STDIN as JSON, never argv/logs); reconcile identity
   preflight              verify config + session + remote reachability and that
                          the remote schema (supabase/schema.sql) is applied
   local-counts           local per-table row totals (no network) for display
+  sync-user              upsert the current user's remote users row (reuses the
+                         migrate sync path) so a fresh-enabled user — one who did
+                         NOT run a full migration — still has a valid parent row
   migrate                sync_users FIRST, then FK-ordered chunked owner-stamped
                          upload, then remote-vs-local COUNT validation — prints
                          counts_match; NEVER flips the pointer
@@ -75,6 +81,31 @@ def _backend():
     b = supabase_backend.SupabaseBackend(cfg)
     b.open()
     return b
+
+
+# --- configure-remote (settings writer, no network) -------------------------
+def do_configure_remote(url, key_env):
+    """Write the ``supabase`` config block (url + publishable-key env-var NAME)
+    to ``settings.json`` mode 0600 — **only if one does not already exist**.
+
+    The enable-remote flow's non-network setup step (P11): it records WHERE the
+    remote lives (the project URL) and the NAME of the env var that supplies the
+    low-privilege publishable key. It stores **NO secret** — never the key value,
+    never a password — only the URL and the env-var name. An already-present
+    block is left untouched (so a customized config is never clobbered) and the
+    call reports it rather than overwriting. Does not flip ``active_backend`` —
+    that is the deliberate separate ``set-backend`` step."""
+    existing = settings.supabase_config()
+    if existing is not None:
+        print(f"already_configured=yes url={existing['url']} "
+              f"key_env={existing['publishable_key_env']}")
+        return 0
+    if not url:
+        return fail("configure-remote requires --url")
+    settings.set_supabase_config(url, key_env)  # key_env None -> default NAME
+    cfg = settings.supabase_config()
+    print(f"configured=yes url={cfg['url']} key_env={cfg['publishable_key_env']}")
+    return 0
 
 
 def _audit(db, action, detail):
@@ -256,6 +287,35 @@ def _sync_users(conn, backend, owner):
         supabase_backend.UPSERT_ON_CONFLICT["users"])
 
 
+def do_sync_user(db, backend):
+    """Ensure the current user's remote ``users`` row exists (reqs 12/14, P11).
+
+    The explicit form of the write-path self-heal, for the **start-fresh** enable
+    path (no full migration): a user who turns the remote backend on without
+    uploading their central DB still needs a valid parent ``users`` row before any
+    owner-scoped FK row (a session/event) can reference it. This reuses the exact
+    validated :func:`_sync_users` from the migrate path — merge-duplicates upsert
+    on ``uuid``, name and ``created_at`` from the local users row when present —
+    so no credential/TLS/upload logic is re-implemented here. The NAME is PII and
+    is never echoed; only the owner uuid is printed."""
+    owner = backend.remote_owner_id()
+    if not owner:
+        return fail("no remote owner id (login first)")
+    conn = capture.connect(db)  # schema owner: guarantees the users table exists
+    try:
+        _sync_users(conn, backend, owner)
+    except RuntimeError as e:
+        return fail(str(e))
+    except urllib.error.HTTPError as e:
+        return fail(f"sync_user failed (HTTP {e.code}); users row not synced")
+    except Exception:
+        return fail("sync_user failed: remote unreachable or invalid response")
+    finally:
+        conn.close()
+    print(f"users_row_synced=yes uid={owner}")
+    return 0
+
+
 def do_migrate(db, backend):
     """Sync users first, upload FK-ordered + owner-stamped, then count-validate.
 
@@ -333,12 +393,18 @@ def do_set_backend(db, backend_name):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="remote_migrate.py")
     ap.add_argument("command", choices=[
-        "login", "preflight", "local-counts", "migrate", "set-backend"])
+        "configure-remote", "login", "preflight", "local-counts", "sync-user",
+        "migrate", "set-backend"])
     ap.add_argument("--db", default=None)
     ap.add_argument("--backend", default=None)
+    ap.add_argument("--url", default=None)
+    ap.add_argument("--key-env", dest="key_env", default=None)
     a = ap.parse_args(argv)
     db = a.db or str(capture.db_path())
 
+    # --- no-network subcommands (settings/local only) ---
+    if a.command == "configure-remote":
+        return do_configure_remote(a.url, a.key_env)
     if a.command == "local-counts":
         return do_local_counts(db)
     if a.command == "set-backend":
@@ -355,6 +421,8 @@ def main(argv=None):
             return do_login(backend)
         if a.command == "preflight":
             return do_preflight(backend)
+        if a.command == "sync-user":
+            return do_sync_user(db, backend)
         if a.command == "migrate":
             return do_migrate(db, backend)
     finally:

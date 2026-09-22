@@ -82,3 +82,11 @@ Enable token telemetry for this project:
    subagent is recorded (no tokens are consumed by capture). The marker file can be
    committed to enable it for the whole team. Use `/token-telemetry:info` to check
    status and `/token-telemetry:disable` to turn it off.
+
+10. **Storage backend (local vs remote)** — by default telemetry is stored
+    **locally** (the SQLite DB above; the central/project choice in step 2 is only
+    where that local file lives). If instead the usage should go to a shared
+    **remote (Supabase)** database — the only remote option today, more may follow
+    — run `/token-telemetry:enable-remote`, which configures the remote, logs in,
+    and either migrates the existing local data or starts fresh. The switch is
+    reversible and does not change the per-project capture set up here.
