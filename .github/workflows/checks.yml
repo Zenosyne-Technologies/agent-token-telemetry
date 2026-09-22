@@ -10,3 +10,44 @@ jobs:
       - uses: actions/checkout@v4
       - name: No local home paths in tracked files
         run: bash scripts/check-no-local-paths.sh
+
+  tests:
+    runs-on: ubuntu-latest
+    # A throwaway Postgres so the SQLite<->Postgres report-parity equivalence
+    # tests (tests/test_report_parity.py::TestPostgresEquivalence) actually run
+    # instead of skipping — this is the drift guard between report.py's SQLite
+    # dialect and supabase/reports.sql's Postgres dialect. Mapped to 5433 (not
+    # the default 5432) so it never clashes with anything else on a runner.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: ci_postgres_pw
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # libpq env the tests' psql/createdb/dropdb pick up; PGUSER=postgres is a
+      # superuser (applies schema + bypasses RLS — the SQL aggregation is what
+      # these tests compare; RLS enforcement is the maintainer's live check).
+      PGHOST: localhost
+      PGPORT: "5433"
+      PGUSER: postgres
+      PGPASSWORD: ci_postgres_pw
+      PGDATABASE: postgres
+      # UTC so date(ts,'localtime') aligns across both dialects.
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Postgres client tools (psql/createdb/dropdb)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+      - name: Run the test suite (incl. the SQLite<->Postgres equivalence tests)
+        run: python3 -m unittest discover -s tests
