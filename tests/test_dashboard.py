@@ -1,3 +1,4 @@
+import os
 import pathlib
 import sqlite3
 import sys
@@ -8,6 +9,7 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 import capture
 import dashboard
+import settings
 
 from tests.test_capture import entry
 
@@ -283,6 +285,61 @@ class TestVersionRedirect(unittest.TestCase):
         (self.root / "0.13.0").mkdir()          # no scripts/dashboard.py
         self.assertIsNone(dashboard.newest_sibling_script(
             self.root / "0.11.1" / "scripts" / "dashboard.py"))
+
+
+class TestBackendBanner(unittest.TestCase):
+    """P10 / AOS-114: the dashboard page gets a small backend-awareness banner
+    only when the remote (Supabase) backend is active; the local page (default,
+    or whatever an absent/malformed settings.json reads back as) is served
+    byte-for-byte unchanged."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name) / "telemetry"
+        self._prev = os.environ.get("TOKEN_TELEMETRY_DB")
+        os.environ["TOKEN_TELEMETRY_DB"] = str(self.dir / "usage.db")
+        self.original_html = dashboard.HTML.read_bytes()
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("TOKEN_TELEMETRY_DB", None)
+        else:
+            os.environ["TOKEN_TELEMETRY_DB"] = self._prev
+        self.tmp.cleanup()
+
+    def test_no_settings_file_is_local_no_banner(self):
+        self.assertFalse(settings.settings_path().exists())
+        page = dashboard.dashboard_page()
+        self.assertEqual(page, self.original_html)
+        self.assertNotIn(b'<div class="backend-note"', page)
+
+    def test_malformed_settings_is_local_no_banner_no_crash(self):
+        self.dir.mkdir(parents=True)
+        settings.settings_path().write_text("{ this is not json")
+        page = dashboard.dashboard_page()
+        self.assertEqual(page, self.original_html)
+
+    def test_explicit_local_backend_no_banner(self):
+        settings.write_settings({"active_backend": "local"})
+        page = dashboard.dashboard_page()
+        self.assertEqual(page, self.original_html)
+
+    def test_supabase_backend_shows_banner(self):
+        settings.write_settings({"active_backend": "supabase"})
+        page = dashboard.dashboard_page()
+        self.assertNotEqual(page, self.original_html)
+        self.assertEqual(len(page), len(self.original_html) + len(dashboard._BACKEND_BANNER))
+        self.assertIn(b'<div class="backend-note"', page)
+        self.assertIn(b"/token-telemetry:token-stats", page)
+        # inserted exactly once, ahead of the header it decorates
+        self.assertEqual(page.count(b'<div class="backend-note"'), 1)
+        self.assertLess(page.find(b'<div class="backend-note"'),
+                        page.find(b'<header class="hd">'))
+
+    def test_unknown_backend_value_is_treated_as_local(self):
+        settings.write_settings({"active_backend": "carrier-pigeon"})
+        page = dashboard.dashboard_page()
+        self.assertEqual(page, self.original_html)
 
 
 if __name__ == "__main__":

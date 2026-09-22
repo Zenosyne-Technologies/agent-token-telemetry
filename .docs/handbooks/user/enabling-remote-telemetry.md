@@ -7,7 +7,7 @@ keywords: [enable, remote, supabase, backend, publishable-key, env-var, login, r
 level: project
 audience: user
 module: storage
-sources: [commands/enable-remote.md, commands/enable.md, scripts/remote_migrate.py, scripts/settings.py, scripts/supabase_backend.py]
+sources: [commands/enable-remote.md, commands/enable.md, scripts/remote_migrate.py, scripts/settings.py, scripts/supabase_backend.py, scripts/dashboard.py]
 related: ["[[migrating-to-remote]]", "[[migrating-local-logs-to-central]]"]
 created: 2026-09-22
 updated: 2026-09-22
@@ -106,6 +106,14 @@ waiting to be re-sent if the remote is briefly unreachable (the offline buffer).
 Switching collection is a **pointer flip**, not a data move. It takes effect on
 the **next Claude Code session**, because capture hooks load when Claude Code
 starts — so restart to begin writing to the remote.
+
+## The dashboard, once you're on remote
+
+`/token-telemetry:dashboard` always shows **this machine's local telemetry** —
+it reads the local `usage.db` the same way whichever backend is active. Once
+you switch to remote, the dashboard's header adds a small note saying so and
+pointing you at `/token-telemetry:token-stats` for the central (all-machines)
+view. A full remote dashboard view is planned but not built yet.
 
 ## Going back to local
 

@@ -116,6 +116,17 @@
     backdrop-filter:blur(22px) saturate(160%);
   }
 
+  /* ============ BACKEND NOTE ============ */
+  /* Only present in the markup when the remote (Supabase) backend is active —
+     spliced in server-side by dashboard.py's dashboard_page(); absent entirely
+     on the default local path. */
+  .backend-note{display:flex;align-items:center;gap:10px;margin:0 0 14px;padding:10px 16px;
+    border-radius:14px;background:var(--panel-2);border:1px solid var(--panel-brd);
+    color:var(--ink-2);font-size:.86rem;}
+  .backend-note code{background:var(--track);padding:1px 6px;border-radius:6px;
+    font-family:var(--font-mono);font-size:.85em;}
+  .backend-note-dot{width:8px;height:8px;border-radius:50%;background:var(--accent-2);flex:0 0 auto;}
+
   /* ============ HEADER ============ */
   header.hd{display:flex;flex-wrap:wrap;align-items:flex-end;gap:18px 26px;justify-content:space-between;margin-bottom:22px;}
   .brand{display:flex;flex-direction:column;gap:8px;min-width:0;}

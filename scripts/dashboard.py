@@ -34,11 +34,66 @@ import sqlite3
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture
+import settings
 
 HERE = Path(__file__).resolve().parent
 HTML = HERE / "dashboard.html"
 LOGO = HERE / "dashboard-assets" / "marvin-wordmark.png"
 FAVICON = HERE / "dashboard-assets" / "favicon.png"
+
+# Marker the backend-awareness banner is spliced after (P10 / AOS-114): the
+# dashboard keeps reading the local usage.db unconditionally, this only labels
+# the page so a remote-backend user isn't misled into thinking they're looking
+# at everyone's data. Kept as a plain string splice (not templating) so the
+# local, no-banner page stays the exact same bytes dashboard.html always was.
+_HEADER_MARKER = b'    <header class="hd">'
+_BACKEND_BANNER = (
+    b'    <div class="backend-note" role="note">'
+    b'<span class="backend-note-dot" aria-hidden="true"></span>'
+    b"Showing this machine&rsquo;s local telemetry. The central (all-machines) "
+    b"view is available via <code>/token-telemetry:token-stats</code>; a remote "
+    b"dashboard view is planned."
+    b"</div>\n\n"
+)
+
+
+def _active_backend():
+    """The active collection backend, for the dashboard banner only.
+
+    A single cheap local read of ``settings.json`` (:func:`settings.read_settings`
+    is already total: absent/corrupt/malformed reads back as ``{}``). Wrapped in
+    its own guard anyway so a future change to that contract still can't break
+    page rendering — any problem here is treated as ``"local"``, matching
+    :func:`storage.remote_backend_if_active`'s own fallback. Never makes a
+    network call.
+
+    :returns: ``"supabase"`` or ``"local"``.
+    """
+    try:
+        return settings.read_settings().get("active_backend") or settings.DEFAULT_BACKEND
+    except Exception:
+        return settings.DEFAULT_BACKEND
+
+
+def dashboard_page():
+    """The dashboard HTML to serve, with the backend-awareness banner spliced
+    into the header when the active backend is ``supabase``.
+
+    When the active backend is ``local`` (the default, and whatever an absent or
+    malformed ``settings.json`` reads back as), this returns ``dashboard.html``
+    completely unchanged. The dashboard's own behaviour — reading the local
+    ``usage.db``, every KPI/table/filter — never depends on this; it is a
+    labelling change only.
+
+    :returns: the page bytes to serve.
+    """
+    html = HTML.read_bytes()
+    if _active_backend() != "supabase":
+        return html
+    idx = html.find(_HEADER_MARKER)
+    if idx == -1:
+        return html  # marker not found (unexpected edit) — fail safe, no banner
+    return html[:idx] + _BACKEND_BANNER + html[idx:]
 
 # rolling windows, in days; the period filter maps onto these. Default: week.
 PERIODS = {"day": 1, "week": 7, "month": 30, "year": 365}
@@ -396,7 +451,11 @@ class Handler(BaseHTTPRequestHandler):
         _ACTIVITY[0] = time.time()   # keep-alive: any request defers idle shutdown
         u = urlparse(self.path)
         if u.path in ("/", "/index.html"):
-            return self._send_file(HTML, "text/html; charset=utf-8")
+            try:
+                body = dashboard_page()
+            except OSError:
+                return self._send(404, b"not found", "text/plain")
+            return self._send(200, body, "text/html; charset=utf-8")
         if u.path == "/logo.png":
             return self._send_file(LOGO, "image/png")
         if u.path in ("/favicon.png", "/favicon.ico"):
