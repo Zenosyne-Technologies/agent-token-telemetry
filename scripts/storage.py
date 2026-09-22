@@ -156,3 +156,23 @@ class LocalSqliteBackend(StorageBackend):
 
     def cursor_set(self, transcript, offset, session_id):
         capture.write_cursor(self.conn, transcript, offset, session_id)
+
+
+def remote_backend_if_active(settings_dict=None):
+    """The active remote backend when one is configured, else ``None``.
+
+    The single seam capture's guarded remote hook calls: it returns a ready
+    :class:`~supabase_backend.SupabaseBackend` only when ``active_backend`` is
+    ``supabase`` and its config is present, and ``None`` in every other case
+    (including the default ``local``), so the default capture path is untouched.
+    The import is lazy to keep this module free of a load-time dependency on the
+    remote backend. Total and never-raising.
+
+    :param settings_dict: an already-read settings dict (optional), forwarded so
+        the hot path need not re-read ``settings.json``.
+    """
+    try:
+        import supabase_backend
+        return supabase_backend.active_backend(settings_dict)
+    except Exception:
+        return None

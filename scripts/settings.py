@@ -26,6 +26,14 @@ from pathlib import Path
 # declares the field consumers will branch on.
 DEFAULT_BACKEND = "local"
 
+# The env-var NAME (never the value) that holds the low-privilege Supabase
+# publishable/anon key. The key VALUE is read from this env var at use time and
+# is NEVER persisted to settings.json — only its name is. A per-user Auth JWT
+# (the sensitive credential) lives in a separate mode-0600 credentials file, not
+# here (see supabase_backend.py). Secret / bypass (service-role tier) keys are
+# never supported.
+DEFAULT_SUPABASE_KEY_ENV = "TOKEN_TELEMETRY_SUPABASE_KEY"
+
 
 def telemetry_dir():
     """The telemetry directory — where the usage DB, error log and this file
@@ -150,3 +158,89 @@ def ensure_identity(full_name):
     settings.setdefault("active_backend", DEFAULT_BACKEND)
     write_settings(settings)
     return settings, minted
+
+
+def supabase_config(settings=None):
+    """The ``supabase`` config block if a usable one is set, else ``None``.
+
+    A usable block is a dict carrying a non-empty ``url`` (the project's base
+    URL). ``publishable_key_env`` names the env var holding the transport key
+    and defaults to :data:`DEFAULT_SUPABASE_KEY_ENV`. Never contains a secret —
+    only the URL and the env-var NAME.
+
+    :param settings: an already-read settings dict, to avoid a second file read;
+        omitted, the file is read fresh.
+    :returns: ``{"url": ..., "publishable_key_env": ...}`` or ``None``. Never
+        raises: capture reads this on the hook path.
+    """
+    s = settings if settings is not None else read_settings()
+    cfg = s.get("supabase") if isinstance(s, dict) else None
+    if not isinstance(cfg, dict):
+        return None
+    url = cfg.get("url")
+    if not (isinstance(url, str) and url):
+        return None
+    key_env = cfg.get("publishable_key_env")
+    return {"url": url,
+            "publishable_key_env": (key_env if isinstance(key_env, str)
+                                    and key_env else DEFAULT_SUPABASE_KEY_ENV)}
+
+
+def set_supabase_config(url, publishable_key_env=None):
+    """Persist the Supabase ``url`` and publishable-key env-var NAME (mode 0600).
+
+    The key VALUE is never accepted or stored here — only the name of the env
+    var that supplies it. ``active_backend`` is NOT flipped by this call; the
+    pointer flip to ``supabase`` is a deliberate, separate step (a later phase).
+
+    :param url: the Supabase project base URL (e.g. ``https://ref.supabase.co``).
+    :param publishable_key_env: the env-var name, or ``None`` for the default.
+    :returns: the persisted settings dict.
+    :raises OSError: propagated from :func:`write_settings` on a write failure.
+    """
+    settings = read_settings()
+    settings["supabase"] = {
+        "url": url,
+        "publishable_key_env": publishable_key_env or DEFAULT_SUPABASE_KEY_ENV}
+    write_settings(settings)
+    return settings
+
+
+def set_active_backend(name):
+    """Set the active collection backend pointer (``local`` | ``supabase``).
+
+    :param name: the backend name capture routes writes to.
+    :returns: the persisted settings dict.
+    :raises OSError: propagated from :func:`write_settings` on a write failure.
+    """
+    settings = read_settings()
+    settings["active_backend"] = name
+    write_settings(settings)
+    return settings
+
+
+def record_auth_identity(auth_uid):
+    """Reconcile the local UUIDv4 with the Supabase ``auth.uid()`` after login.
+
+    Hybrid identity (memo §5 decision 6): the local uuid is kept as-is; when the
+    Auth uid differs, BOTH are recorded (``user.auth_uid`` is added) so remote
+    rows can prefer the Auth uid — which is what RLS matches — while local rows
+    keep the original uuid. Idempotent and total: a matching uid records nothing,
+    a missing local identity is left untouched.
+
+    :param auth_uid: the Supabase Auth user id from a successful login.
+    :returns: the effective remote owner id — the Auth uid when known, else the
+        local uuid, else ``None``. Never raises on a read; a write failure
+        propagates so the interactive login flow can surface it.
+    """
+    if not (isinstance(auth_uid, str) and auth_uid):
+        return current_owner_id()
+    settings = read_settings()
+    user = settings.get("user")
+    if not isinstance(user, dict) or not user.get("uuid"):
+        return auth_uid  # no local identity to reconcile against yet
+    if user.get("auth_uid") != auth_uid:
+        user["auth_uid"] = auth_uid
+        settings["user"] = user
+        write_settings(settings)
+    return auth_uid

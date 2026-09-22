@@ -426,14 +426,57 @@ BACKLOG_SPAN_S = 86400
 BACKLOG_NOTE = "backlog-capture"
 
 
+def derive_event_fields(kind_hint, agent, groups, branch=None, commit_sha=None,
+                        issue_key=None, task_size=None, note=None,
+                        first_capture=False):
+    """The pure per-group event-field derivation shared by every storage
+    backend — the SINGLE source of truth for how a `(model, sidechain)` group
+    becomes one event row, with NO storage side effects.
+
+    `insert_events` (local SQLite) and the remote backend both call this, so the
+    two write paths cannot drift into recording different rows (the split-
+    responsibility defect class). It returns a list of ``(model, kind, fields)``
+    where ``fields`` is a scalar-only dict — JSON-serializable, so a remote
+    backend can queue it in an offline outbox unchanged. Column-to-storage
+    mapping (model name → local `model_id`, session → `session_id`) stays with
+    each backend; only the value derivation lives here.
+
+    `first_capture` marks rows whose span exceeds BACKLOG_SPAN_S as backlog
+    roll-ups — but never over a real sidecar note. The sub-agent `agent` label
+    belongs to sub-agent rows only (kind=1): a main-loop row must never wear the
+    name of whatever sub-agent happened to trigger the firing.
+
+    :returns: ``[(model, kind, fields_dict), ...]`` in ``groups`` iteration order.
+    """
+    rows = []
+    for (model, side), g in groups.items():
+        kind = 1 if (kind_hint or side) else 0
+        row_agent = agent if kind else None
+        row_note = note
+        if (row_note is None and first_capture and g["first"] is not None
+                and g["last"] - g["first"] > BACKLOG_SPAN_S):
+            row_note = BACKLOG_NOTE
+        dur = (int((g["last"] - g["first"]) * 1000)
+               if g["first"] is not None else None)
+        ts = int(g["last"]) if g["last"] is not None else int(time.time())
+        rows.append((model, kind, {
+            "ts": ts, "kind": kind, "agent": row_agent,
+            "in_tok": g["in"], "out_tok": g["out"], "cache_r": g["cr"],
+            "cache_w": g["cw"], "cache_w_1h": g.get("cw1h", 0), "dur_ms": dur,
+            "branch": branch, "commit_sha": commit_sha, "issue_key": issue_key,
+            "task_size": task_size, "note": row_note,
+            "api_calls": g.get("calls"), "ctx_tokens": g.get("ctx")}))
+    return rows
+
+
 def insert_events(conn, project, session_uuid, kind_hint, agent, groups,
                   branch=None, commit_sha=None, issue_key=None,
                   task_size=None, note=None, first_capture=False,
                   owner_id=None):
     """One event row per (model, sidechain) group. Caller owns the transaction.
     Returns the session id (the cursor row, written only in the central DB,
-    needs it). `first_capture` marks rows whose span exceeds BACKLOG_SPAN_S as
-    backlog roll-ups — but never over a real sidecar note.
+    needs it). Row values come from :func:`derive_event_fields`, the derivation
+    shared with the remote backend.
 
     `owner_id` (a user uuid from central settings, or None) is stamped ONLY when
     this call CREATES the session row — an existing session, and every pre-v7 DB
@@ -453,30 +496,20 @@ def insert_events(conn, project, session_uuid, kind_hint, agent, groups,
         session_id = conn.execute(
             "INSERT INTO sessions(uuid, project_id) VALUES (?,?)",
             (session_uuid, project_id)).lastrowid
-    for (model, side), g in groups.items():
+    for model, _kind, f in derive_event_fields(
+            kind_hint, agent, groups, branch, commit_sha, issue_key,
+            task_size, note, first_capture):
         model_id = get_or_create(conn, "models", "name", model)
-        kind = 1 if (kind_hint or side) else 0
-        # The agent label belongs to sub-agent rows only: a main-loop row must
-        # never wear the name of whatever sub-agent happened to trigger the
-        # firing (the SubagentStop payload names the agent, but the MAIN
-        # transcript it points at holds orchestrator work).
-        row_agent = agent if kind else None
-        row_note = note
-        if (row_note is None and first_capture and g["first"] is not None
-                and g["last"] - g["first"] > BACKLOG_SPAN_S):
-            row_note = BACKLOG_NOTE
-        dur = (int((g["last"] - g["first"]) * 1000)
-               if g["first"] is not None else None)
-        ts = int(g["last"]) if g["last"] is not None else int(time.time())
         conn.execute(
             "INSERT INTO events(ts, session_id, kind, agent, model_id,"
             " in_tok, out_tok, cache_r, cache_w, cache_w_1h, dur_ms, branch,"
             " commit_sha, issue_key, task_size, note, api_calls, ctx_tokens)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (ts, session_id, kind, row_agent, model_id,
-             g["in"], g["out"], g["cr"], g["cw"], g.get("cw1h", 0), dur,
-             branch, commit_sha, issue_key, task_size, row_note,
-             g.get("calls"), g.get("ctx")))
+            (f["ts"], session_id, f["kind"], f["agent"], model_id,
+             f["in_tok"], f["out_tok"], f["cache_r"], f["cache_w"],
+             f["cache_w_1h"], f["dur_ms"], f["branch"], f["commit_sha"],
+             f["issue_key"], f["task_size"], f["note"],
+             f["api_calls"], f["ctx_tokens"]))
     return session_id
 
 
@@ -824,9 +857,11 @@ def main():
         # The owning user's uuid from central settings.json, read here (with the
         # rest of the enrichment, above the lock) so the hook path never blocks
         # on identity. None = no identity set yet = pre-identity; capture then
-        # behaves byte-for-byte as before. current_owner_id() swallows every
+        # behaves byte-for-byte as before. read_settings() swallows every
         # settings-read error internally, so a malformed file never reaches here.
-        owner_id = settings.current_owner_id()
+        # The one read is shared with the remote-backend gate below.
+        settings_snapshot = settings.read_settings()
+        owner_id = settings.current_owner_id(settings_snapshot)
         backend = storage.LocalSqliteBackend(db_path())
         backend.open()
         conn = backend.conn
@@ -885,6 +920,31 @@ def main():
                                   owner_id=owner_id)
                 except Exception:
                     log_error(f"mirror write failed: {mirror_db_path(root)}")
+        # Optional remote backend (AOS-104 P6, guarded). When — and ONLY when —
+        # the active backend is `supabase`, ALSO push the rows just committed
+        # centrally to the remote store, after the central commit and outside
+        # every local lock, exactly like the mirror. The default `local` backend
+        # makes `remote_backend_if_active` return None, so this whole block is a
+        # single dict lookup and the local write path is byte-for-byte unchanged.
+        # The backend swallows remote failures internally (retaining events in a
+        # local outbox); the try/except here is defense in depth so a session is
+        # never broken. The active-backend DISPATCH proper (routing the sole
+        # write to the remote) is P8; this is the additive write-through only.
+        if mirror_batch:
+            remote = storage.remote_backend_if_active(settings_snapshot)
+            if remote is not None:
+                try:
+                    remote.open()
+                    for args, fc in mirror_batch:
+                        remote.write_events(*args, first_capture=fc,
+                                            owner_id=owner_id)
+                except Exception:
+                    log_error("remote write failed")
+                finally:
+                    try:
+                        remote.close()
+                    except Exception:
+                        pass
     except Exception:
         if enabled:
             log_error()

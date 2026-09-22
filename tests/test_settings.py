@@ -130,6 +130,62 @@ class TestEnsureIdentity(SettingsBase):
         self.assertEqual(s["active_backend"], "supabase")
 
 
+class TestSupabaseConfig(SettingsBase):
+    def test_absent_block_is_none(self):
+        self.assertIsNone(settings.supabase_config())
+
+    def test_set_stores_url_and_key_env_name_only(self):
+        settings.set_supabase_config("https://example.supabase.co")
+        cfg = settings.supabase_config()
+        self.assertEqual(cfg["url"], "https://example.supabase.co")
+        # defaults to the canonical env-var NAME
+        self.assertEqual(cfg["publishable_key_env"],
+                         settings.DEFAULT_SUPABASE_KEY_ENV)
+        # the on-disk file holds only the env-var NAME, never a key value
+        raw = settings.settings_path().read_text()
+        self.assertIn("publishable_key_env", raw)
+
+    def test_set_does_not_flip_active_backend(self):
+        settings.ensure_identity("Ada")  # active_backend defaults to local
+        settings.set_supabase_config("https://example.supabase.co")
+        self.assertEqual(settings.read_settings()["active_backend"], "local")
+
+    def test_custom_key_env_name_is_kept(self):
+        settings.set_supabase_config("https://example.supabase.co", "MY_KEY_VAR")
+        self.assertEqual(settings.supabase_config()["publishable_key_env"],
+                         "MY_KEY_VAR")
+
+    def test_config_without_url_reads_as_none(self):
+        settings.write_settings({"supabase": {"publishable_key_env": "X"}})
+        self.assertIsNone(settings.supabase_config())
+
+    def test_set_active_backend_persists(self):
+        settings.set_active_backend("supabase")
+        self.assertEqual(settings.read_settings()["active_backend"], "supabase")
+
+
+class TestRecordAuthIdentity(SettingsBase):
+    def test_records_auth_uid_and_keeps_local_uuid(self):
+        settings.ensure_identity("Ada")
+        local = settings.current_user()["uuid"]
+        eff = settings.record_auth_identity("auth-xyz")
+        self.assertEqual(eff, "auth-xyz")  # remote rows prefer the Auth uid
+        user = settings.current_user()
+        self.assertEqual(user["uuid"], local)      # local uuid preserved
+        self.assertEqual(user["auth_uid"], "auth-xyz")
+
+    def test_no_local_identity_returns_auth_uid_without_writing_user(self):
+        eff = settings.record_auth_identity("auth-xyz")
+        self.assertEqual(eff, "auth-xyz")
+        self.assertIsNone(settings.current_user())  # nothing to reconcile yet
+
+    def test_empty_auth_uid_is_a_total_noop(self):
+        settings.ensure_identity("Ada")
+        self.assertIsNone(settings.current_user().get("auth_uid"))
+        settings.record_auth_identity("")
+        self.assertIsNone(settings.current_user().get("auth_uid"))
+
+
 class TestNeverPrompts(unittest.TestCase):
     def test_settings_source_has_no_interactive_calls(self):
         src = (pathlib.Path(__file__).resolve().parent.parent
