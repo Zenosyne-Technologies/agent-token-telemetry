@@ -176,10 +176,11 @@ class TestSuccessfulWrite(Base):
                            owner_id="local-uuid")
         rests = [c["url"] for c in rec.rest_calls()]
         self.assertEqual(rests, [
-            f"{URL}/rest/v1/projects?on_conflict=path",
-            f"{URL}/rest/v1/models?on_conflict=name",
-            f"{URL}/rest/v1/sessions?on_conflict=uuid",
-            f"{URL}/rest/v1/events"])
+            f"{URL}/rest/v1/projects?on_conflict=owner_id,path",
+            f"{URL}/rest/v1/models?on_conflict=owner_id,name",
+            f"{URL}/rest/v1/sessions?on_conflict=owner_id,uuid",
+            f"{URL}/rest/v1/events?on_conflict="
+            f"{supabase_backend.EVENTS_ON_CONFLICT}"])
         for c in rec.rest_calls():
             self.assertTrue(c["url"].startswith("https://"))
             self.assertEqual(c["headers"]["apikey"], KEY_VALUE)
@@ -195,6 +196,13 @@ class TestSuccessfulWrite(Base):
         with mock.patch("urllib.request.urlopen", rec):
             b.write_events("/proj", "s1", 0, None, self.groups(),
                            owner_id="local-uuid")
+        # every parent upsert carries owner_id (uniform owner-scoping), so the
+        # owner-scoped unique keys and RLS gate apply to all tables, not just
+        # sessions/events.
+        proj = rec.call_to("/rest/v1/projects")["body"][0]
+        self.assertEqual(proj, {"owner_id": "local-uuid", "path": "/proj"})
+        model = rec.call_to("/rest/v1/models")["body"][0]
+        self.assertEqual(model["owner_id"], "local-uuid")
         sess = rec.call_to("/rest/v1/sessions")["body"][0]
         self.assertEqual(sess["uuid"], "s1")
         self.assertEqual(sess["owner_id"], "local-uuid")

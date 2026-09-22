@@ -8,7 +8,7 @@ level: project
 audience: developer
 module: storage
 sources: [scripts/supabase_backend.py, scripts/settings.py, scripts/capture.py, scripts/storage.py, docs/TELEMETRY-CONTRACT.md]
-related: ["[[storage-backend]]", "[[identity-model]]", "[[capture-pipeline]]"]
+related: ["[[storage-backend]]", "[[identity-model]]", "[[capture-pipeline]]", "[[rls-remote-schema]]"]
 created: 2026-09-22
 updated: 2026-09-22
 ---
@@ -67,16 +67,21 @@ context** (`ssl.create_default_context`; verification is never disabled).
 same discipline as the project mirror. Per firing it:
 
 1. re-sends any backlog (the outbox, below), then
-2. upserts `projects` (on `path`), `models` (on `name`) and `sessions` (on
-   `uuid`, carrying `owner_id`) with `Prefer: resolution=merge-duplicates`, so a
-   re-send is idempotent, then
-3. inserts the firing's `events`.
+2. upserts `projects`, `models`, `sessions` **and** `events` in FK order with
+   `Prefer: resolution=merge-duplicates`, so every step is idempotent.
 
-Remote rows are addressed by **natural key** (path / name / uuid), not the local
-integer ids, which are meaningless across databases; the P7 schema resolves the
-foreign references. Event values come from `capture.derive_event_fields` — the
-**one** derivation shared with the local SQLite insert — so the two write paths
-cannot drift.
+Every table carries `owner_id` and every upsert's `on_conflict` is the
+**owner-scoped** unique key from `supabase/schema.sql`
+(`supabase_backend.UPSERT_ON_CONFLICT`): `(owner_id, path)`, `(owner_id, name)`,
+`(owner_id, uuid)`, and for `events` the full-row-identity key
+(`EVENTS_ON_CONFLICT`). A re-drained outbox firing therefore **merges rather than
+duplicating** — including events, which the remote schema keys `NULLS NOT
+DISTINCT` so nullable columns still dedupe. Rows are addressed by **natural key**
+(path / name / uuid), not the local integer ids, which are meaningless across
+databases; the composite `(owner_id, natural-key)` foreign references are
+resolved by the remote schema (`[[rls-remote-schema]]`). Event values come from
+`capture.derive_event_fields` — the **one** derivation shared with the local
+SQLite insert — so the two write paths cannot drift.
 
 On **any** remote error or timeout the firing is swallowed-and-logged and
 retained in a local **offline outbox** (`outbox.db`, a local queue), then
@@ -110,8 +115,10 @@ the sole authoritative write to the remote and flipping the pointer — is P8.
 
 ## What lives in later phases
 
-RLS policies + the remote Postgres schema are **P7**; remote reads
-(`read_for_report`, `/token-stats` over the remote) are **P9**; the interactive
-login/enable UX and the install "remote" option are **P11**. See
+RLS policies + the remote Postgres schema (P7) are delivered — see
+`[[rls-remote-schema]]` for the own-rows-only policy model, the schema, and the
+maintainer's live-verification steps. Remote reads (`read_for_report`,
+`/token-stats` over the remote) are **P9**; the interactive login/enable UX and
+the install "remote" option are **P11**. See
 `docs/TELEMETRY-CONTRACT.md` and the design memo
 `.docs/researches/2026-09-22-external-db-supabase-design.md` (§1, §6, §9).

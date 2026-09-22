@@ -53,6 +53,29 @@ OUTBOX_DRAIN_BATCH = 50
 # CI/testing) ahead of the keychain and the 0600 file. Holds a token, not a key.
 SESSION_ENV = "TOKEN_TELEMETRY_SUPABASE_SESSION"
 
+# The `events` upsert conflict target — the full row identity, matching the
+# `UNIQUE NULLS NOT DISTINCT (...)` constraint in supabase/schema.sql exactly.
+# Every column named here is present on the event rows _push builds, so a
+# re-drained outbox firing MERGES rather than duplicating (the P6 finding). It is
+# the union of the mirror-dedupe tuple (which includes the model reference) and
+# the v6 per-slice metrics, prefixed by owner_id — the superset that can never
+# false-merge two genuinely-distinct events.
+EVENTS_ON_CONFLICT = (
+    "owner_id,session_uuid,model_name,ts,kind,agent,"
+    "in_tok,out_tok,cache_r,cache_w,cache_w_1h,dur_ms,"
+    "branch,commit_sha,issue_key,task_size,note,api_calls,ctx_tokens")
+
+# Per-table upsert conflict targets — each MUST match a UNIQUE/PRIMARY KEY
+# constraint on the corresponding table in supabase/schema.sql. Every target is
+# owner-scoped so a re-send is idempotent per owner (own-rows-only). tests/
+# test_schema_sql.py verifies the schema carries a matching constraint for each.
+UPSERT_ON_CONFLICT = {
+    "projects": "owner_id,path",
+    "models": "owner_id,name",
+    "sessions": "owner_id,uuid",
+    "events": EVENTS_ON_CONFLICT,
+}
+
 
 def credentials_path():
     """Absolute path to the mode-0600 ``credentials.json`` (Auth tokens) beside
@@ -289,24 +312,30 @@ class SupabaseBackend(storage.StorageBackend):
 
         Remote rows are addressed by NATURAL KEY (path / name / uuid) rather than
         local integer ids, which are meaningless across databases; the P7 schema
-        resolves the foreign references. ``owner_id`` is carried on both
-        ``sessions`` and ``events`` so RLS on ``auth.uid()`` can gate either."""
+        resolves the foreign references. ``owner_id`` is carried on EVERY table so
+        the RLS `auth.uid() = owner_id` gate applies uniformly (own-rows-only),
+        and every upsert's ``on_conflict`` is the OWNER-SCOPED unique key from
+        supabase/schema.sql (:data:`UPSERT_ON_CONFLICT`), so a re-drained outbox
+        firing merges instead of duplicating — including ``events``, keyed on the
+        full-row-identity constraint (:data:`EVENTS_ON_CONFLICT`)."""
         token = self._access_token()
         owner = payload["owner_id"]
         project = payload["project"]
         headers = self._rest_headers(token)
-        # 1. projects (upsert on natural key `path`)
-        self._rest("projects", [{"path": project}], headers, on_conflict="path")
-        # 2. models (upsert on `name`), one row per distinct model this firing
+        # 1. projects (upsert on the owner-scoped natural key `(owner_id, path)`)
+        self._rest("projects", [{"owner_id": owner, "path": project}], headers,
+                   on_conflict=UPSERT_ON_CONFLICT["projects"])
+        # 2. models (upsert on `(owner_id, name)`), one row per distinct model
         models = sorted({r["model"] for r in payload["rows"]})
-        self._rest("models", [{"name": m} for m in models], headers,
-                   on_conflict="name")
-        # 3. sessions (upsert on `uuid`, carrying owner_id + project reference)
+        self._rest("models", [{"owner_id": owner, "name": m} for m in models],
+                   headers, on_conflict=UPSERT_ON_CONFLICT["models"])
+        # 3. sessions (upsert on `(owner_id, uuid)`, carrying project reference)
         self._rest("sessions", [{"uuid": payload["session_uuid"],
                                  "project_path": project, "owner_id": owner}],
-                   headers, on_conflict="uuid")
-        # 4. events (insert; no natural key exists, so a re-send relies on the
-        #    outbox draining exactly once — a landed firing is dropped from it)
+                   headers, on_conflict=UPSERT_ON_CONFLICT["sessions"])
+        # 4. events (upsert on the full-row-identity key so a re-sent firing
+        #    merges rather than duplicating — NULLS NOT DISTINCT on the remote
+        #    side collapses rows whose nullable columns are NULL).
         event_rows = []
         for r in payload["rows"]:
             row = dict(r["fields"])
@@ -314,7 +343,8 @@ class SupabaseBackend(storage.StorageBackend):
             row["model_name"] = r["model"]
             row["owner_id"] = owner
             event_rows.append(row)
-        self._rest("events", event_rows, headers)
+        self._rest("events", event_rows, headers,
+                   on_conflict=UPSERT_ON_CONFLICT["events"])
 
     # --- transport (single urlopen site) ---
     def _auth_headers(self):
