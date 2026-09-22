@@ -6,7 +6,7 @@ summary: The table of contents for one handbook audience — every page in this 
 keywords: [handbook, index, pages, audience]
 level: project
 created: 2026-09-21
-updated: 2026-09-21
+updated: 2026-09-22
 ---
 
 # Handbook Index
@@ -20,3 +20,4 @@ updated: 2026-09-21
 | item | sources | what it covers | status | updated |
 |---|---|---|---|---|
 | [[reading-token-stats]] | `commands/token-stats.md`, `commands/project-stats.md`, `scripts/report.py` | What `/token-stats` shows, the all-time per-project table from `/project-stats`, scoped rollups by issue-key set and their three empty states, seed rates (undated), cache hit rate | active | 2026-09-21 |
+| [[migrating-local-logs-to-central]] | `commands/migrate-to-central.md`, `scripts/manage.py` | Importing a project's local mirror (or a storage-separate export) into the central DB with `/migrate-to-central`, the keep-a-copy default, what switching active collection means, and why re-running is safe | active | 2026-09-22 |

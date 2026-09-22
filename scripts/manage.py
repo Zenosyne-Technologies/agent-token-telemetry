@@ -26,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture
+import migrate_lib
 import settings
 
 SESSIONS = ("(SELECT id FROM sessions WHERE project_id ="
@@ -48,6 +49,16 @@ def common_columns(conn, table, src_schema="src"):
     dst = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
     src = {r[1] for r in conn.execute(f"PRAGMA {src_schema}.table_info({table})")}
     return ", ".join(c for c in dst if c in src)
+
+
+def common_column_list(conn, table, src_schema="src", exclude=()):
+    """The list form of :func:`common_columns`, in destination order, with
+    ``exclude`` names dropped — used by the importer, which must omit synthetic
+    ``id`` columns (they are re-assigned on the destination) and remap the
+    foreign keys that would have pointed at the source's ids."""
+    dst = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+    src = {r[1] for r in conn.execute(f"PRAGMA {src_schema}.table_info({table})")}
+    return [c for c in dst if c in src and c not in exclude]
 
 
 def audit_row(conn, action, project, detail):
@@ -243,14 +254,243 @@ def register_user(db, name):
     return 0
 
 
+def _blocking_diffs(report):
+    """The table diffs that make an import unsafe: columns present in the SOURCE
+    but absent at the DESTINATION. Importing would silently drop that data, so
+    the safeguard aborts instead. Columns present only at the destination are
+    harmless — the source simply has no value for them and the copy leaves them
+    NULL."""
+    return [d for d in report.table_diffs if d.only_in_src]
+
+
+def _describe_diffs(diffs):
+    return "; ".join(
+        f"{d.table}: source-only {list(d.only_in_src)}"
+        + (f", dest-only {list(d.only_in_dst)}" if d.only_in_dst else "")
+        for d in diffs) or "none"
+
+
+def import_check(db, source, project):
+    """Read-only preflight the migrate-to-central command reads before importing.
+
+    Reports, in machine-parseable ``key=value`` lines, whether the source can be
+    imported into the central DB without dropping data (req 12): the two DBs'
+    schema versions, any structure diff, whether the diff is blocking, whether
+    the destination already has the ``users`` table, and whether a central
+    identity is set. Mutates nothing — neither DB is opened read-write."""
+    if not Path(source).exists():
+        return fail(f"source DB does not exist: {source}")
+    src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    try:
+        central_exists = Path(db).exists()
+        if central_exists:
+            dst = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                rep = migrate_lib.compat_report(src, dst, capture.SCHEMA_VERSION)
+            finally:
+                dst.close()
+            blocking = _blocking_diffs(rep)
+            src_ver, dst_ver = rep.src_version, rep.dst_version
+            versions_match = rep.versions_match
+            users_at_dst = rep.users_at_dst
+            diff_desc = _describe_diffs(rep.table_diffs)
+        else:
+            # No central yet: the import creates it fresh at the kit's version,
+            # so nothing can be source-only against it. Identity still governs
+            # whether a name must be captured first.
+            blocking = []
+            src_ver = src.execute("PRAGMA user_version").fetchone()[0]
+            dst_ver = None
+            versions_match = False
+            users_at_dst = False
+            diff_desc = "none (central will be created fresh)"
+    finally:
+        src.close()
+    identity_set = settings.current_user() is not None
+    print(f"source_exists=yes central_exists={'yes' if central_exists else 'no'}")
+    print(f"src_version={src_ver} dst_version="
+          f"{dst_ver if dst_ver is not None else '-'}")
+    print(f"versions_match={'yes' if versions_match else 'no'}")
+    print(f"structure_diff={diff_desc}")
+    print(f"blocking_diff={'yes' if blocking else 'no'}")
+    print(f"users_at_dst={'yes' if users_at_dst else 'no'}")
+    print(f"identity_set={'yes' if identity_set else 'no'}")
+    print(f"compatible={'no' if blocking else 'yes'}")
+    return 0
+
+
+def _project_counts(conn, pid):
+    """(events, sessions) currently in ``conn`` for central project id ``pid``."""
+    if pid is None:
+        return 0, 0
+    sess = ("(SELECT id FROM sessions WHERE project_id = ?)")
+    e = conn.execute(
+        f"SELECT COUNT(*) FROM events WHERE session_id IN {sess}",
+        (pid,)).fetchone()[0]
+    s = conn.execute("SELECT COUNT(*) FROM sessions WHERE project_id = ?",
+                     (pid,)).fetchone()[0]
+    return e, s
+
+
+def import_project(db, source, project, name=None):
+    """Import one project's LOCAL mirror (or export) into the central DB.
+
+    The inverse of :func:`export`: it ATTACHes the source and copies its rows
+    INTO the central store rather than out of it, children after parents
+    (projects -> models -> pricing -> sessions -> events), remapping every
+    foreign key through the natural keys (project ``path``, session ``uuid``,
+    model ``name``) so the source's synthetic ids never collide with the
+    central's. Every copy uses :func:`common_column_list` introspection (shared
+    columns only) and every value is bound, never interpolated. Rows are deduped
+    on the full column tuple, so a re-run adds nothing (contract "Duplicates").
+
+    The import, its moved-row counts and the ``import-project`` audit row are one
+    transaction — any failure rolls the whole thing back and leaves the central
+    DB untouched. ``cursors`` are deliberately NOT imported: they are central
+    authoritative and a mirror's are empty, so importing them could only corrupt
+    the central read state. After the commit the imported project's previously
+    anonymous sessions are retro-linked to the current user (req 13).
+
+    Compatibility safeguard (req 12): aborts before any write when the source
+    carries a column the central DB cannot accept (data would be dropped). A
+    pre-v7 central is auto-migrated to the current schema by the schema-owning
+    ``connect()``, and the ``users`` row is (re)written from the identity — from
+    ``--name`` when given (the command prompts and passes it), else from the
+    central settings already on file.
+
+    :param db: path to the central usage DB (created fresh if absent).
+    :param source: path to the source mirror/export DB to import.
+    :param project: the project ``path`` to import (its row in the source).
+    :param name: the user's full name, passed by the command only when identity
+        must be established/updated; never echoed (PII).
+    :returns: 0 on success, 1 on a clean abort.
+    """
+    if not Path(source).exists():
+        return fail(f"source DB does not exist: {source}")
+
+    src_ro = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    try:
+        src_pid = src_ro.execute(
+            "SELECT id FROM projects WHERE path = ?", (project,)).fetchone()
+    finally:
+        src_ro.close()
+    if src_pid is None:
+        return fail(f"project not found in source: {project}")
+    src_pid = src_pid[0]
+
+    central = capture.connect(db)  # schema owner: creates/migrates to current v7
+    try:
+        # Compatibility safeguard (req 12) on a separate read-only handle to the
+        # source — no writes to it, and the decision is made before any import.
+        src_ro = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+        try:
+            rep = migrate_lib.compat_report(
+                src_ro, central, capture.SCHEMA_VERSION)
+        finally:
+            src_ro.close()
+        blocking = _blocking_diffs(rep)
+        if blocking:
+            return fail("incompatible source schema, refusing to import "
+                        f"(would drop data): {_describe_diffs(blocking)}")
+
+        central.execute("ATTACH DATABASE ? AS src", (str(source),))
+
+        # Identity: establish/update from --name, else read what is on file. The
+        # users row is (re)written so a freshly-migrated central has it too.
+        if name is not None:
+            settings.ensure_identity(name)
+            uid = settings.current_owner_id()
+            uname = name
+        else:
+            user = settings.current_user()
+            uid = user.get("uuid") if user else None
+            uname = user.get("full_name") if user else None
+        if uid is None:
+            return fail("no central identity set; pass --name to establish one")
+        if uname:
+            migrate_lib.ensure_users_row(central, uid, uname)
+
+        pcols = common_column_list(central, "projects", exclude=("id",))
+        mcols = common_column_list(central, "models", exclude=("id",))
+        prcols = common_column_list(central, "pricing")
+        scols = common_column_list(central, "sessions", exclude=("id",))
+        ecols = common_column_list(central, "events")
+        eother = [c for c in ecols if c not in ("session_id", "model_id")]
+
+        with central:
+            # projects: dedup on the natural key `path` (UNIQUE).
+            central.execute(
+                f"INSERT OR IGNORE INTO projects({', '.join(pcols)})"
+                f" SELECT {', '.join('p.' + c for c in pcols)}"
+                " FROM src.projects p WHERE p.path = ?", (project,))
+            central_pid = central.execute(
+                "SELECT id FROM projects WHERE path = ?", (project,)).fetchone()[0]
+            before_e, before_s = _project_counts(central, central_pid)
+
+            # models / pricing: shared reference data, deduped on their natural
+            # keys (models.name UNIQUE; pricing's UNIQUE constraint).
+            central.execute(
+                f"INSERT OR IGNORE INTO models({', '.join(mcols)})"
+                f" SELECT {', '.join(mcols)} FROM src.models")
+            central.execute(
+                f"INSERT OR IGNORE INTO pricing({', '.join(prcols)})"
+                f" SELECT {', '.join(prcols)} FROM src.pricing")
+
+            # sessions: natural key `uuid` (UNIQUE); project_id is remapped to
+            # the central project id (bound), so an existing central session is
+            # kept as-is and a new one lands under the right project.
+            s_select = ("?" if c == "project_id" else f"s.{c}" for c in scols)
+            central.execute(
+                f"INSERT OR IGNORE INTO sessions({', '.join(scols)})"
+                f" SELECT {', '.join(s_select)}"
+                " FROM src.sessions s WHERE s.project_id = ?",
+                (central_pid, src_pid))
+
+            # events: no natural key — remap session_id (via session uuid) and
+            # model_id (via model name), then dedup on the FULL remapped tuple
+            # with null-safe `IS`, so a re-run inserts nothing.
+            insert_cols = ["session_id", "model_id"] + eother
+            select_exprs = ["cs.id", "cm.id"] + [f"e.{c}" for c in eother]
+            dedup = (["ev.session_id IS cs.id", "ev.model_id IS cm.id"]
+                     + [f"ev.{c} IS e.{c}" for c in eother])
+            central.execute(
+                f"INSERT INTO events({', '.join(insert_cols)})"
+                f" SELECT {', '.join(select_exprs)}"
+                " FROM src.events e"
+                " JOIN src.sessions ss ON e.session_id = ss.id"
+                " JOIN sessions cs ON cs.uuid = ss.uuid"
+                " JOIN src.models sm ON e.model_id = sm.id"
+                " JOIN models cm ON cm.name = sm.name"
+                " WHERE ss.project_id = ?"
+                f" AND NOT EXISTS (SELECT 1 FROM events ev"
+                f" WHERE {' AND '.join(dedup)})", (src_pid,))
+
+            after_e, after_s = _project_counts(central, central_pid)
+            moved_e, moved_s = after_e - before_e, after_s - before_s
+            audit_row(central, "import-project", project,
+                      f"{source}; +{moved_e} events, +{moved_s} sessions")
+        central.execute("DETACH DATABASE src")
+
+        # Retro-link the imported project's still-anonymous sessions to the user
+        # (req 13). Separate, idempotent transaction: a second run affects 0 rows.
+        linked = migrate_lib.retro_link(central, uid, project_id=central_pid)
+    finally:
+        central.close()
+    print(f"imported {project} <- {source}: +{moved_e} events,"
+          f" +{moved_s} sessions; retro-linked {linked} sessions")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="manage.py")
     ap.add_argument("command", choices=[
         "list-projects", "counts", "export", "delete", "audit",
-        "clear-mirror-meta", "register-name", "register-user"])
+        "clear-mirror-meta", "register-name", "register-user",
+        "import-check", "import-project"])
     ap.add_argument("--db", default=None)
     ap.add_argument("--project", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--source", default=None)
     ap.add_argument("--action", default=None)
     ap.add_argument("--detail", default="")
     ap.add_argument("--name", default=None)
@@ -260,7 +500,9 @@ def main(argv=None):
             "delete": ("project", "action"), "audit": ("action", "project"),
             "clear-mirror-meta": ("project",),
             "register-name": ("project", "name"),
-            "register-user": ("name",)}
+            "register-user": ("name",),
+            "import-check": ("source", "project"),
+            "import-project": ("source", "project")}
     for arg in need.get(a.command, ()):
         if getattr(a, arg) is None:
             return fail(f"{a.command} requires --{arg}")
@@ -278,6 +520,10 @@ def main(argv=None):
         return clear_mirror_meta(db, a.project)
     if a.command == "register-name":
         return register_name(db, a.project, a.name)
+    if a.command == "import-check":
+        return import_check(db, a.source, a.project)
+    if a.command == "import-project":
+        return import_project(db, a.source, a.project, a.name)
     return register_user(db, a.name)
 
 
