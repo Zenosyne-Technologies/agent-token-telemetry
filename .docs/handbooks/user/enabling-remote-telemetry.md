@@ -8,7 +8,7 @@ level: project
 audience: user
 module: storage
 sources: [commands/enable-remote.md, commands/enable.md, scripts/remote_migrate.py, scripts/settings.py, scripts/supabase_backend.py, scripts/dashboard.py]
-related: ["[[migrating-to-remote]]", "[[migrating-local-logs-to-central]]"]
+related: ["[[operating-remote-telemetry]]", "[[migrating-to-remote]]", "[[migrating-local-logs-to-central]]", "[[reading-token-stats]]"]
 created: 2026-09-22
 updated: 2026-09-22
 ---
@@ -17,13 +17,31 @@ updated: 2026-09-22
 
 By default your telemetry lives in a **local** SQLite database on your laptop.
 Run `/token-telemetry:enable-remote` to instead send it to a **shared remote
-database** — a Supabase project the maintainer runs — so your usage lives
+database** — a Supabase project you or a teammate runs — so your usage lives
 alongside the team's. **Supabase is the only remote option today**; more backends
 may follow.
 
 This is a machine-level storage choice, separate from turning capture on for a
 project (`/token-telemetry:enable`). Switching backends does not change your
 per-project setup, and it is always reversible.
+
+## Remote telemetry, at a glance
+
+Going remote is three steps, each documented on its own page:
+
+1. **Enable** (this page) — point at your Supabase project, apply the schema,
+   log in, and either migrate your existing data or start fresh.
+2. **Migrate** ([[migrating-to-remote]]) — upload your whole central database
+   in one verified pass, if you didn't do it during enable.
+3. **Read** ([[reading-token-stats]]) — `/token-stats` and `/project-stats`
+   show the same numbers whether your data lives locally or remotely; nothing
+   about reading your reports changes once you're on remote.
+
+If you're the one running the Supabase project the team writes to, **you are
+the operator** — [[operating-remote-telemetry]] is the page for you: applying
+and re-applying the schema, proving Row-Level Security actually isolates users,
+the security model in plain terms, and the operational caveats (Postgres
+version, timezone, key rotation) that only matter once the remote is live.
 
 ## Local vs remote
 
@@ -57,15 +75,13 @@ export TOKEN_TELEMETRY_SUPABASE_KEY="<your publishable key>"
 env-var name is recorded. If a remote is already configured, the command leaves
 the existing setting untouched and tells you so.
 
-### 2. Apply the schema and verify RLS (maintainer step)
+### 2. Apply the schema and verify RLS (operator step)
 
 Before anything can be written, the remote tables and their Row-Level Security
-must exist. Whoever runs the Supabase project applies `supabase/schema.sql`, then
-`supabase/reports.sql`, in the Supabase SQL editor, and runs the **two-user plus
-anonymous live verification** that proves each person can see only their own rows.
-See the developer handbooks [[rls-remote-schema]] and [[remote-read-parity]] for
-the exact schema and the verification steps — the automated test suite only checks
-structure, so the isolation check is done by hand.
+must exist. Whoever runs the Supabase project applies the schema and proves
+Row-Level Security actually isolates users — see [[operating-remote-telemetry]]
+for exactly how, including the security model and what data does and doesn't
+leave your machine once it's live.
 
 The command then confirms from your machine that every expected table exists. If
 the schema has not been applied it stops and tells you, rather than writing into a

@@ -3,8 +3,8 @@ title: Reading Token Stats
 audience: user
 module: reporting
 sources: [commands/token-stats.md, commands/project-stats.md, scripts/report.py]
-updated: 2026-09-02
-related: [[enabling-telemetry]]
+updated: 2026-09-22
+related: [[enabling-telemetry]], [[enabling-remote-telemetry]], [[operating-remote-telemetry]]
 ---
 
 # Reading Token Stats
@@ -12,6 +12,13 @@ related: [[enabling-telemetry]]
 Run `/token-telemetry:token-stats` to see a summary of Claude Code usage for
 this machine. If telemetry hasn't been enabled anywhere yet, it will tell you
 so instead of showing empty numbers.
+
+Everything below reads the same whether your telemetry is stored **locally**
+or on the **shared remote** — see [[enabling-remote-telemetry]] if you're not
+sure which one you're on. The one difference worth knowing: if you're on
+remote, "today" is computed against the remote database's own clock, which can
+disagree with your machine's local day if their timezones differ (see
+[[operating-remote-telemetry]]).
 
 ## What it shows
 

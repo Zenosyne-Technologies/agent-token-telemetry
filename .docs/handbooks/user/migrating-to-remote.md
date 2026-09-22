@@ -8,7 +8,7 @@ level: project
 audience: user
 module: storage
 sources: [commands/migrate-to-remote.md, scripts/remote_migrate.py, scripts/supabase_backend.py]
-related: ["[[migrating-local-logs-to-central]]"]
+related: ["[[migrating-local-logs-to-central]]", "[[enabling-remote-telemetry]]", "[[operating-remote-telemetry]]"]
 created: 2026-09-22
 updated: 2026-09-22
 ---
@@ -30,8 +30,9 @@ Two things must already be true, both set up by whoever runs the remote:
 
 - The remote is **configured** on your machine — the project URL is in your
   settings and the access key is in place.
-- The remote **schema has been applied** — the maintainer has run the schema
-  once on the Supabase project.
+- The remote **schema has been applied** — whoever operates the Supabase
+  project has run it once (see [[operating-remote-telemetry]] for exactly how,
+  and how they prove it's actually private before anyone uploads real data).
 
 If either is missing the command stops and tells you, rather than uploading into
 a database that is not ready. It never invents credentials or a schema.
