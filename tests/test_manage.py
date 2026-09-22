@@ -1,7 +1,10 @@
 import contextlib
 import io
+import json
+import os
 import pathlib
 import sqlite3
+import stat
 import sys
 import tempfile
 import unittest
@@ -9,6 +12,7 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 import capture
 import manage
+import settings
 
 from tests.test_capture import entry
 
@@ -125,6 +129,69 @@ class TestManage(unittest.TestCase):
         rc, out = run(["list-projects", "--db", str(self.db)])
         self.assertEqual(rc, 0)
         self.assertIn("| `/proj` | Listed | 1 |", out)
+
+
+class TestRegisterUser(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name) / "telemetry"
+        self.db = self.dir / "usage.db"
+        # register-user writes settings.json beside the DB, keyed off the env.
+        self._prev = os.environ.get("TOKEN_TELEMETRY_DB")
+        os.environ["TOKEN_TELEMETRY_DB"] = str(self.db)
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("TOKEN_TELEMETRY_DB", None)
+        else:
+            os.environ["TOKEN_TELEMETRY_DB"] = self._prev
+        self.tmp.cleanup()
+
+    def users(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute(
+                "SELECT uuid, name, created_at FROM users").fetchall()
+        finally:
+            conn.close()
+
+    def test_mints_uuid_writes_settings_0600_and_upserts_users(self):
+        rc, out = run(["register-user", "--db", str(self.db), "--name", "Ada"])
+        self.assertEqual(rc, 0)
+        self.assertIn("minted", out)
+        # settings.json written 0600 with the minted uuid
+        sp = settings.settings_path()
+        self.assertEqual(stat.S_IMODE(sp.stat().st_mode), 0o600)
+        uid = json.loads(sp.read_text())["user"]["uuid"]
+        # the users row exists, keyed on that uuid
+        rows = self.users()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], uid)
+        self.assertEqual(rows[0][1], "Ada")
+
+    def test_the_name_is_never_echoed_to_stdout(self):
+        # PII discipline: the full name must not land in command output.
+        _, out = run(["register-user", "--db", str(self.db),
+                      "--name", "Ada Lovelace"])
+        self.assertNotIn("Ada Lovelace", out)
+
+    def test_rerun_keeps_uuid_and_created_at_updates_name(self):
+        run(["register-user", "--db", str(self.db), "--name", "Ada"])
+        first = self.users()[0]
+        rc, out = run(["register-user", "--db", str(self.db),
+                       "--name", "Ada L."])
+        self.assertEqual(rc, 0)
+        self.assertIn("unchanged", out)  # uuid not re-minted
+        second = self.users()[0]
+        self.assertEqual(len(self.users()), 1)          # still one row (upsert)
+        self.assertEqual(second[0], first[0])           # same uuid
+        self.assertEqual(second[2], first[2])           # created_at preserved
+        self.assertEqual(second[1], "Ada L.")           # name updated
+
+    def test_requires_a_name(self):
+        rc, out = run(["register-user", "--db", str(self.db)])
+        self.assertEqual(rc, 1)
+        self.assertIn("requires --name", out)
 
 
 if __name__ == "__main__":

@@ -1992,5 +1992,157 @@ class TestStorageDelete(StorageMaintenanceCase):
              self.rows(self.db, "SELECT COUNT(*) FROM projects")), before)
 
 
+import settings as _settings
+
+
+class TestOwnerIdStampingUnit(unittest.TestCase):
+    """owner_id is stamped only when the session row is CREATED, and only when
+    the column exists — an existing session and a pre-v7 DB are left as before."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = pathlib.Path(self.tmp.name) / "usage.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def owner_of(self, conn, uuid):
+        return conn.execute(
+            "SELECT owner_id FROM sessions WHERE uuid=?", (uuid,)).fetchone()[0]
+
+    def test_new_session_gets_owner_id_when_set(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        conn.execute(
+            "INSERT INTO users(uuid, name, created_at) VALUES ('u1','Ada',1)")
+        with conn:
+            capture.insert_events(conn, "/p", "s1", 0, None,
+                                  capture.aggregate([entry()]), owner_id="u1")
+        self.assertEqual(self.owner_of(conn, "s1"), "u1")
+
+    def test_new_session_owner_id_null_when_unset(self):
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        with conn:
+            capture.insert_events(conn, "/p", "s1", 0, None,
+                                  capture.aggregate([entry()]), owner_id=None)
+        self.assertIsNone(self.owner_of(conn, "s1"))
+
+    def test_existing_session_is_not_re_stamped(self):
+        # A session created pre-identity keeps NULL owner_id even once identity
+        # is set — retro-linking existing sessions is a later phase, not here.
+        conn = capture.connect(self.db)
+        self.addCleanup(conn.close)
+        with conn:
+            capture.insert_events(conn, "/p", "s1", 0, None,
+                                  capture.aggregate([entry()]), owner_id=None)
+        conn.execute(
+            "INSERT INTO users(uuid, name, created_at) VALUES ('u1','Ada',1)")
+        with conn:
+            capture.insert_events(conn, "/p", "s1", 0, None,
+                                  capture.aggregate([entry(inp=7)]),
+                                  owner_id="u1")
+        self.assertIsNone(self.owner_of(conn, "s1"))
+
+    def test_pre_v7_db_without_owner_id_column_still_captures(self):
+        # A DB whose v7 hop never landed (no owner_id column) must not break
+        # when identity is set — it falls back to the two-column insert.
+        build_v6_db(self.db)
+        conn = _sqlite3.connect(self.db)  # NOT capture.connect: keep it at v6
+        self.addCleanup(conn.close)
+        self.assertNotIn(
+            "owner_id",
+            {r[1] for r in conn.execute("PRAGMA table_info(sessions)")})
+        with conn:
+            capture.insert_events(conn, "/p", "s-new", 0, None,
+                                  capture.aggregate([entry()]), owner_id="u1")
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE uuid='s-new'").fetchone()[0], 1)
+
+
+class TestOwnerIdStampingMain(unittest.TestCase):
+    """End-to-end through main(): identity comes from settings.json beside the
+    DB, capture never prompts, and a malformed settings file never breaks it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.proj = self.root / "proj"
+        (self.proj / ".claude").mkdir(parents=True)
+        (self.proj / ".claude" / "telemetry").touch()  # opt in
+        self.transcript = self.root / "sess.jsonl"
+        self.teldir = self.root / "telemetry"
+        self.db = self.teldir / "usage.db"
+        os.environ["TOKEN_TELEMETRY_DB"] = str(self.db)
+        self._stdin = sys.stdin
+
+    def tearDown(self):
+        sys.stdin = self._stdin
+        os.environ.pop("TOKEN_TELEMETRY_DB", None)
+        self.tmp.cleanup()
+
+    def run_main(self, session_id="sess-1"):
+        sys.stdin = io.StringIO(json.dumps({
+            "session_id": session_id,
+            "transcript_path": str(self.transcript),
+            "cwd": str(self.proj),
+            "hook_event_name": "Stop",
+        }))
+        capture.main()
+
+    def owner_ids(self):
+        conn = _sqlite3.connect(self.db)
+        try:
+            return conn.execute(
+                "SELECT uuid, owner_id FROM sessions").fetchall()
+        finally:
+            conn.close()
+
+    def write_settings(self, obj_or_text):
+        self.teldir.mkdir(parents=True, exist_ok=True)
+        sp = self.teldir / "settings.json"
+        if isinstance(obj_or_text, str):
+            sp.write_text(obj_or_text)
+        else:
+            sp.write_text(json.dumps(obj_or_text))
+
+    def test_new_session_stamped_when_identity_set(self):
+        self.write_settings({"user": {"uuid": "u-42", "full_name": "Ada"},
+                             "active_backend": "local"})
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.owner_ids(), [("sess-1", "u-42")])
+
+    def test_owner_id_null_when_no_identity(self):
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        self.assertEqual(self.owner_ids(), [("sess-1", None)])
+
+    def test_malformed_settings_never_breaks_capture(self):
+        self.write_settings("{ not valid json at all")
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()  # must not raise, and must still record the event
+        self.assertEqual(self.owner_ids(), [("sess-1", None)])
+
+    def test_capture_reads_no_stdin_beyond_the_hook_json(self):
+        # If capture ever tried to prompt for a name, it would block reading a
+        # closed stdin here. A StringIO with only the hook JSON proves the whole
+        # path is file-driven and non-interactive.
+        self.write_settings({"user": {"uuid": "u-9", "full_name": "Ada"}})
+        write_jsonl(self.transcript, [entry()])
+        self.run_main()
+        # stdin is fully consumed and capture returned without further reads.
+        self.assertEqual(sys.stdin.read(), "")
+        self.assertEqual(self.owner_ids(), [("sess-1", "u-9")])
+
+
+class TestCaptureNeverPrompts(unittest.TestCase):
+    def test_capture_source_has_no_interactive_calls(self):
+        src = (pathlib.Path(__file__).resolve().parent.parent
+               / "scripts" / "capture.py").read_text()
+        self.assertNotIn("input(", src)
+        self.assertNotIn("getpass", src)
+
+
 if __name__ == "__main__":
     unittest.main()

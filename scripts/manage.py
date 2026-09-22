@@ -12,6 +12,7 @@ prompts hold NO raw SQL and their permission grants pin to this one script:
   delete --project P --action delete|delete-after-export --detail D
   clear-mirror-meta --project P     forget a project-level copy (bookkeeping)
   register-name --project P --name N
+  register-user --name N            mint/reuse the central identity, upsert users
 
 DBs are opened through capture.connect() (the schema owner) for writes. Shared
 table copies introspect the COMMON columns of source and destination, so an
@@ -25,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture
+import settings
 
 SESSIONS = ("(SELECT id FROM sessions WHERE project_id ="
             " (SELECT id FROM projects WHERE path = ?))")
@@ -210,11 +212,42 @@ def register_name(db, project, name):
     return 0
 
 
+def register_user(db, name):
+    """Establish the central identity and upsert the matching ``users`` row.
+
+    Mints the uuid once (:func:`settings.ensure_identity` — stable thereafter),
+    writes ``settings.json`` mode ``0600``, then upserts ``users(uuid, name,
+    created_at)`` keyed on uuid: a new uuid inserts with ``created_at`` = now, an
+    existing one only updates ``name`` (``created_at`` is never rewritten). The
+    name is bound as an argument, never interpolated into SQL, and is treated as
+    PII — it is not echoed to stdout.
+
+    :param db: path to the central usage DB.
+    :param name: the user's full name.
+    :returns: 0 on success.
+    """
+    _, minted = settings.ensure_identity(name)
+    uid = settings.current_owner_id()
+    conn = capture.connect(db)  # creating the row pre-capture is the point
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO users(uuid, name, created_at)"
+                " VALUES (?, ?, strftime('%s','now'))"
+                " ON CONFLICT(uuid) DO UPDATE SET name=excluded.name",
+                (uid, name))
+    finally:
+        conn.close()
+    print(f"identity registered (uuid {'minted' if minted else 'unchanged'});"
+          " users row upserted")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="manage.py")
     ap.add_argument("command", choices=[
         "list-projects", "counts", "export", "delete", "audit",
-        "clear-mirror-meta", "register-name"])
+        "clear-mirror-meta", "register-name", "register-user"])
     ap.add_argument("--db", default=None)
     ap.add_argument("--project", default=None)
     ap.add_argument("--out", default=None)
@@ -226,7 +259,8 @@ def main(argv=None):
     need = {"counts": ("project",), "export": ("project", "out"),
             "delete": ("project", "action"), "audit": ("action", "project"),
             "clear-mirror-meta": ("project",),
-            "register-name": ("project", "name")}
+            "register-name": ("project", "name"),
+            "register-user": ("name",)}
     for arg in need.get(a.command, ()):
         if getattr(a, arg) is None:
             return fail(f"{a.command} requires --{arg}")
@@ -242,7 +276,9 @@ def main(argv=None):
         return audit(db, a.action, a.project, a.detail)
     if a.command == "clear-mirror-meta":
         return clear_mirror_meta(db, a.project)
-    return register_name(db, a.project, a.name)
+    if a.command == "register-name":
+        return register_name(db, a.project, a.name)
+    return register_user(db, a.name)
 
 
 if __name__ == "__main__":

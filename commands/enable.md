@@ -51,7 +51,34 @@ Enable token telemetry for this project:
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/manage.py" register-name --project "<root>" --name "<name>"
    ```
 
-8. Tell the user: telemetry is enabled for this project. **Restart warning — always state it**: capture hooks load at Claude Code session start, so if the token-telemetry plugin was installed during THIS session (or this is the first enable after installing), nothing is recorded until Claude Code restarts — restart now to start capturing. Every completed turn and
+8. **Identity (who this usage belongs to)** — telemetry can attribute new
+   sessions to a person (schema v7, `users` + `sessions.owner_id`). Identity is
+   stored **centrally**, once per machine, in `~/.claude/telemetry/settings.json`
+   (a `{"user": {"uuid": …, "full_name": …}, "active_backend": "local"}` file
+   written mode `0600`) — **never in the repo**, so a name cannot be committed.
+   The uuid is minted once and stays stable; capture only *reads* this file to
+   stamp `owner_id` on new sessions and never prompts.
+   - First read the current identity: `cat ~/.claude/telemetry/settings.json`
+     (adjust the directory to `$TOKEN_TELEMETRY_DB`'s if that override is set;
+     the file may not exist yet).
+   - **A `full_name` is already present** → identity is set; do NOT re-prompt.
+     State that usage is attributed to the name on file and that they can update
+     it by re-running enable and choosing to change it (offer that choice via
+     AskUserQuestion; on "keep", skip the write).
+   - **No identity yet, or the user chose to update** → ask for their full name
+     (AskUserQuestion, free text via Other), then run:
+
+   ```
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/manage.py" register-user --name "<full name>"
+   ```
+
+   This mints the uuid if absent (stable thereafter — a re-run never re-mints),
+   writes `settings.json` (0600), and upserts the `users` row. The name is
+   **PII**: it lives only in that 0600 file and the local DB — never echo it into
+   a commit, an issue, a URL, or a log. Skipping this step entirely is fine —
+   capture then leaves `owner_id` NULL (pre-identity) and works exactly as before.
+
+9. Tell the user: telemetry is enabled for this project. **Restart warning — always state it**: capture hooks load at Claude Code session start, so if the token-telemetry plugin was installed during THIS session (or this is the first enable after installing), nothing is recorded until Claude Code restarts — restart now to start capturing. Every completed turn and
    subagent is recorded (no tokens are consumed by capture). The marker file can be
    committed to enable it for the whole team. Use `/token-telemetry:info` to check
    status and `/token-telemetry:disable` to turn it off.

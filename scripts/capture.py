@@ -15,6 +15,8 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+import settings
+
 
 def db_path():
     return Path(os.environ.get("TOKEN_TELEMETRY_DB",
@@ -414,17 +416,31 @@ BACKLOG_NOTE = "backlog-capture"
 
 def insert_events(conn, project, session_uuid, kind_hint, agent, groups,
                   branch=None, commit_sha=None, issue_key=None,
-                  task_size=None, note=None, first_capture=False):
+                  task_size=None, note=None, first_capture=False,
+                  owner_id=None):
     """One event row per (model, sidechain) group. Caller owns the transaction.
     Returns the session id (the cursor row, written only in the central DB,
     needs it). `first_capture` marks rows whose span exceeds BACKLOG_SPAN_S as
-    backlog roll-ups — but never over a real sidecar note."""
+    backlog roll-ups — but never over a real sidecar note.
+
+    `owner_id` (a user uuid from central settings, or None) is stamped ONLY when
+    this call CREATES the session row — an existing session, and every pre-v7 DB
+    that has no `owner_id` column, is left exactly as before (NULL = pre-identity,
+    never backfilled here). Reading the column set first means an identity-less
+    capture and a stranded pre-v7 DB both take the unchanged two-column INSERT."""
     project_id = get_or_create(conn, "projects", "path", project)
     row = conn.execute(
         "SELECT id FROM sessions WHERE uuid=?", (session_uuid,)).fetchone()
-    session_id = row[0] if row else conn.execute(
-        "INSERT INTO sessions(uuid, project_id) VALUES (?,?)",
-        (session_uuid, project_id)).lastrowid
+    if row:
+        session_id = row[0]
+    elif owner_id is not None and "owner_id" in table_columns(conn, "sessions"):
+        session_id = conn.execute(
+            "INSERT INTO sessions(uuid, project_id, owner_id) VALUES (?,?,?)",
+            (session_uuid, project_id, owner_id)).lastrowid
+    else:
+        session_id = conn.execute(
+            "INSERT INTO sessions(uuid, project_id) VALUES (?,?)",
+            (session_uuid, project_id)).lastrowid
     for (model, side), g in groups.items():
         model_id = get_or_create(conn, "models", "name", model)
         kind = 1 if (kind_hint or side) else 0
@@ -480,12 +496,13 @@ def stamp_mirror_meta(conn, project, mirror_path, ts):
 def record(conn, project, session_uuid, kind_hint, agent, groups,
            transcript, new_offset, branch=None, commit_sha=None,
            issue_key=None, task_size=None, note=None, mirror_path=None,
-           first_capture=False):
+           first_capture=False, owner_id=None):
     with conn:
         session_id = insert_events(conn, project, session_uuid, kind_hint,
                                    agent, groups, branch, commit_sha,
                                    issue_key, task_size, note,
-                                   first_capture=first_capture)
+                                   first_capture=first_capture,
+                                   owner_id=owner_id)
         if mirror_path is not None:
             stamp_mirror_meta(conn, project, mirror_path,
                               latest_event_ts(groups))
@@ -521,7 +538,7 @@ def subagent_label(jsonl_path):
 
 
 def sweep_subagents(conn, project, session_uuid, transcript, meta,
-                    hook_agent):
+                    hook_agent, owner_id=None):
     """Capture new usage from the session's sub-agent transcript files —
     per-file cursors, one kind=1 event batch per file, labeled from its
     meta.json. Bounded by SUBAGENT_BATCH per firing. Wraps its own BEGIN
@@ -551,7 +568,8 @@ def sweep_subagents(conn, project, session_uuid, transcript, meta,
             event_args = (project, session_uuid, 1,
                           subagent_label(f) or hook_agent, groups)
             session_id = insert_events(conn, *event_args, *meta,
-                                       first_capture=(offset == 0))
+                                       first_capture=(offset == 0),
+                                       owner_id=owner_id)
             conn.execute(
                 "INSERT INTO cursors(transcript, offset, session_id)"
                 " VALUES (?,?,?)"
@@ -795,6 +813,12 @@ def main():
         # Read once, before the write lock: the central transaction stamps the
         # mirror metadata (below) and the same decision gates the mirror write.
         project_mode = read_storage_mode(root) == STORAGE_PROJECT
+        # The owning user's uuid from central settings.json, read here (with the
+        # rest of the enrichment, above the lock) so the hook path never blocks
+        # on identity. None = no identity set yet = pre-identity; capture then
+        # behaves byte-for-byte as before. current_owner_id() swallows every
+        # settings-read error internally, so a malformed file never reaches here.
+        owner_id = settings.current_owner_id()
         conn = connect(db_path())
         mirror_batch = []
         try:
@@ -828,7 +852,7 @@ def main():
                 record(conn, *event_args, transcript, new_offset, *meta,
                        mirror_path=(mirror_db_path(root)
                                     if project_mode and groups else None),
-                       first_capture=(offset == 0))
+                       first_capture=(offset == 0), owner_id=owner_id)
                 if groups:
                     mirror_batch.append(((*event_args, *meta), offset == 0))
             else:
@@ -836,7 +860,7 @@ def main():
             stamp_project_name(conn, root, kit_name)
             for swept, fc in sweep_subagents(
                     conn, str(root), hook.get("session_id") or "unknown",
-                    transcript, meta, agent):
+                    transcript, meta, agent, owner_id):
                 mirror_batch.append(((*swept, *meta), fc))
         finally:
             conn.close()
@@ -847,7 +871,8 @@ def main():
         if mirror_batch and project_mode:
             for args, fc in mirror_batch:
                 try:
-                    mirror_events(root, *args, first_capture=fc)
+                    mirror_events(root, *args, first_capture=fc,
+                                  owner_id=owner_id)
                 except Exception:
                     log_error(f"mirror write failed: {mirror_db_path(root)}")
     except Exception:
