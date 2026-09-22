@@ -172,6 +172,13 @@ def remote_backend_if_active(settings_dict=None):
         the hot path need not re-read ``settings.json``.
     """
     try:
+        if settings_dict is None:
+            import settings
+            settings_dict = settings.read_settings()
+        # Cheap dict lookup first: the default ``local`` path returns here without
+        # importing the remote backend (and thus ``ssl``/``urllib``) at all.
+        if (settings_dict.get("active_backend") or "local") != "supabase":
+            return None
         import supabase_backend
         return supabase_backend.active_backend(settings_dict)
     except Exception:
