@@ -9,11 +9,12 @@ It is a home for code that already exists, not a rewrite: every method delegates
 to the proven ``capture`` functions (``connect``/``migrate``/``insert_events``/
 ``get_offset``/``write_cursor``) so the bytes written and read are identical.
 
-A future remote backend (Supabase, a later phase) implements the same interface.
-The read path is still SQL-coupled — reports run SQLite-dialect SQL over the
-connection :meth:`LocalSqliteBackend.open_ro` returns — so a named,
-backend-neutral read abstraction (``read_for_report``) is deliberately **not**
-introduced here; it arrives with the remote read-parity phase.
+The remote backend (Supabase) implements the same interface. The read path was
+SQL-coupled at P3 (reports ran SQLite-dialect SQL over the connection
+:meth:`LocalSqliteBackend.open_ro` returns); the remote read-parity phase (P9)
+added the named, backend-neutral :meth:`StorageBackend.read_for_report` seam, so
+a report can be served by server-side aggregation (the remote backend's RPC) or
+by running the local SQL — same Python shape either way.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -87,6 +88,19 @@ class StorageBackend(ABC):
     def cursor_set(self, transcript, offset, session_id):
         """Upsert the read cursor for ``transcript``."""
 
+    # --- read path (report) ---
+    @abstractmethod
+    def read_for_report(self, report, project_path=None):
+        """Return the aggregated data for one named report, in the EXACT Python
+        shape ``report.py``'s matching ``fetch_*`` produces, so the same
+        ``render_*`` renders it identically regardless of backend.
+
+        ``report`` is one of ``"project-stats"`` / ``"token-stats"`` / ``"info"``.
+        ``project_path`` scopes the ``"info"`` this-project count. This is the
+        named, backend-neutral read seam deferred by P3 and delivered by the
+        remote read-parity phase: :class:`LocalSqliteBackend` runs the report SQL
+        itself; a remote backend calls its own server-side aggregation (RPC)."""
+
 
 class LocalSqliteBackend(StorageBackend):
     """The local SQLite store — today's only backend.
@@ -156,6 +170,29 @@ class LocalSqliteBackend(StorageBackend):
 
     def cursor_set(self, transcript, offset, session_id):
         capture.write_cursor(self.conn, transcript, offset, session_id)
+
+    # --- read path ---
+    def read_for_report(self, report, project_path=None):
+        """Run the report SQL over a fresh read-only connection and return the
+        SAME structure ``report.py``'s ``fetch_*`` returns (``report`` imported
+        lazily to avoid an import cycle — ``report`` imports ``storage``). Returns
+        ``None`` when the store does not exist. This is the local server-side
+        aggregation path; it delegates to the ONE definition of each report's SQL
+        in ``report.py`` so the local read stays byte-for-byte what it was."""
+        import report as report_mod
+        conn = self.open_ro()
+        if conn is None:
+            return None
+        try:
+            if report == "project-stats":
+                return report_mod.fetch_project_stats(conn)
+            if report == "token-stats":
+                return report_mod.fetch_token_stats(conn)
+            if report == "info":
+                return report_mod.fetch_info_central(conn, project_path)
+        finally:
+            conn.close()
+        raise ValueError(f"unknown report {report!r}")
 
 
 def remote_backend_if_active(settings_dict=None):

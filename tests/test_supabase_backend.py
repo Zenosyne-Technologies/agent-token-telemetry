@@ -145,15 +145,18 @@ class TestContract(Base):
 
     def test_capabilities_are_honest(self):
         caps = self.backend().capabilities()
+        # P9 delivers server-side aggregation via the reports.sql RPC.
         self.assertEqual(
             (caps.server_side_aggregation, caps.owns_cursors, caps.multi_user,
              caps.supports_upsert, caps.writable),
-            (False, False, True, True, True))
+            (True, False, True, True, True))
 
-    def test_reads_and_schema_are_deferred_honestly(self):
+    def test_schema_is_deferred_and_no_local_read_connection(self):
         b = self.backend()
-        self.assertIsNone(b.open_ro())       # reads are P9
-        self.assertIsNone(b.schema_version())  # remote schema is P7
+        # Aggregation runs REMOTELY via RPC (P9), so there is still no local
+        # read-only SQL connection to hand back.
+        self.assertIsNone(b.open_ro())
+        self.assertIsNone(b.schema_version())  # remote schema is provisioned P7
         self.assertIsNone(b.ensure_schema())
 
     def test_cursor_methods_refuse(self):

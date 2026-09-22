@@ -705,6 +705,37 @@ def render_storage_status(d):
 
 # ------------------------------------------------------------------------ info
 
+def fetch_info_central(conn, project_path):
+    """The DB-derived portion of ``/info`` — the ``central`` dict plus this
+    project's event count — as one plain dict. Factored out of :func:`fetch_info`
+    so it is the SINGLE definition of the info aggregation, shared by the local
+    render, the storage seam's ``read_for_report("info")``, and the cross-dialect
+    golden test. ``project_path`` scopes ``events_here`` to one project (the
+    caller's resolved project root)."""
+    events, first_day, last_day = conn.execute(
+        "SELECT COUNT(*), MIN(date(ts,'unixepoch','localtime')),"
+        " MAX(date(ts,'unixepoch','localtime')) FROM events").fetchone()
+    # Latest rate already in force — a pre-inserted future-dated row (e.g.
+    # a published price change) must not masquerade as the current rate.
+    pricing_rows, latest = conn.execute(
+        "SELECT COUNT(*), MAX(CASE WHEN effective_from <="
+        " strftime('%s','now') THEN effective_from END) FROM pricing"
+    ).fetchone()
+    events_here = conn.execute(
+        "SELECT COUNT(*) FROM events e"
+        " JOIN sessions s ON s.id = e.session_id"
+        " JOIN projects p ON p.id = s.project_id WHERE p.path = ?",
+        (project_path,)).fetchone()[0]
+    return {
+        "schema": conn.execute("PRAGMA user_version").fetchone()[0],
+        "events": events, "first_day": first_day, "last_day": last_day,
+        "projects": conn.execute(
+            "SELECT COUNT(*) FROM projects").fetchone()[0],
+        "pricing_rows": pricing_rows, "latest_rate_from": latest,
+        "events_here": events_here,
+    }
+
+
 def fetch_info(conn, db, cwd):
     """Everything the status block needs, as one plain dict."""
     root = capture.find_project_root(cwd)
@@ -735,27 +766,9 @@ def fetch_info(conn, db, cwd):
             d["sidecar"] = "unreadable"
 
     if conn is not None:
-        events, first_day, last_day = conn.execute(
-            "SELECT COUNT(*), MIN(date(ts,'unixepoch','localtime')),"
-            " MAX(date(ts,'unixepoch','localtime')) FROM events").fetchone()
-        # Latest rate already in force — a pre-inserted future-dated row (e.g.
-        # a published price change) must not masquerade as the current rate.
-        pricing_rows, latest = conn.execute(
-            "SELECT COUNT(*), MAX(CASE WHEN effective_from <="
-            " strftime('%s','now') THEN effective_from END) FROM pricing"
-        ).fetchone()
-        d["central"] = {
-            "schema": conn.execute("PRAGMA user_version").fetchone()[0],
-            "events": events, "first_day": first_day, "last_day": last_day,
-            "projects": conn.execute(
-                "SELECT COUNT(*) FROM projects").fetchone()[0],
-            "pricing_rows": pricing_rows, "latest_rate_from": latest,
-        }
-        d["events_here"] = conn.execute(
-            "SELECT COUNT(*) FROM events e"
-            " JOIN sessions s ON s.id = e.session_id"
-            " JOIN projects p ON p.id = s.project_id WHERE p.path = ?",
-            (str(root),)).fetchone()[0]
+        c = fetch_info_central(conn, str(root))
+        d["events_here"] = c.pop("events_here")
+        d["central"] = c
 
     err = Path(db).parent / "error.log"
     if err.exists():
@@ -845,6 +858,36 @@ def render_info(d):
     return "\n".join(out)
 
 
+# --------------------------------------------------------------- remote routing
+
+# Reports that the remote backend can serve through server-side aggregation
+# (its RPC). `storage-status` describes the LOCAL store (the durable outbox +
+# cursor DB that stays local even under a remote backend) and `--scope` is a
+# local-project git/rowid rollup, so both always take the local path below.
+REMOTE_REPORTS = ("info", "project-stats", "token-stats")
+
+
+def render_remote_report(command, remote, db, cwd):
+    """Render one report from the active remote backend's server-side
+    aggregation. Reuses the SAME ``render_*`` functions as the local path — only
+    the data source differs — because ``remote.read_for_report`` returns the
+    identical Python shape as the local ``fetch_*`` (that equivalence is what the
+    cross-dialect golden test guards). For ``info``, the local-filesystem portion
+    (plugin/sidecar/error-log/mirror) is read locally exactly as before and only
+    the DB-derived ``central`` block + this-project count come from the remote."""
+    if command == "project-stats":
+        return render_project_stats(remote.read_for_report("project-stats") or [])
+    if command == "token-stats":
+        return render_token_stats(remote.read_for_report("token-stats"))
+    # info: local bits (conn=None) overlaid with the remote central aggregation.
+    d = fetch_info(None, db, cwd)
+    central = remote.read_for_report("info", project_path=d["root"])
+    if central is not None:
+        d["events_here"] = central.pop("events_here")
+        d["central"] = central
+    return render_info(d)
+
+
 # ------------------------------------------------------------------------- CLI
 
 def main(argv=None):
@@ -859,6 +902,25 @@ def main(argv=None):
                          " instead of the normal command output")
     args = ap.parse_args(argv)
     db = args.db or capture.db_path()
+
+    # Remote read parity: when a remote backend is active, the three aggregation
+    # reports show the CENTRAL (remote) view via server-side aggregation. The
+    # local path below is untouched — byte-for-byte identical — for the default
+    # `local` backend and for `--scope`/`storage-status`, which stay local.
+    remote = storage.remote_backend_if_active()
+    if (remote is not None and args.scope is None
+            and args.command in REMOTE_REPORTS):
+        try:
+            print(render_remote_report(args.command, remote, db, args.cwd))
+        except Exception:
+            print("The remote telemetry backend could not be read right now"
+                  " (it is unreachable or not yet provisioned). The local"
+                  " store is unaffected; try again, or check"
+                  " `/token-telemetry:info`.")
+        finally:
+            remote.close()
+        return 0
+
     conn = open_ro(db)
     try:
         if args.scope is not None:

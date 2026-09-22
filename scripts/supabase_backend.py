@@ -23,9 +23,13 @@ Security model (design memo §1/§6, architect decisions §9):
   - **Identity:** own-rows-only. Remote rows carry ``owner_id`` = the reconciled
     Supabase ``auth.uid()`` (hybrid identity — memo §5 decision 6).
 
-Reads and the remote schema/RLS are later phases (P7/P9): this backend is
-write-only and honest about it (``server_side_aggregation=False``,
-``open_ro()`` → ``None``).
+The remote schema/RLS is P7. Read parity is P9 (this file's ``read_for_report``):
+the reports are aggregated SERVER-SIDE by hand-written, ``SECURITY INVOKER``
+Postgres functions in ``supabase/reports.sql`` (so RLS applies and a caller sees
+only their OWN rows), invoked over the same TLS-verified PostgREST transport as
+the writes (``POST /rest/v1/rpc/<fn>``). ``server_side_aggregation`` is therefore
+``True``; ``open_ro()`` stays ``None`` because there is no LOCAL read-only SQL
+connection — the aggregation runs remotely, not over a handed-back cursor.
 """
 import json
 import os
@@ -182,6 +186,43 @@ class SupabaseBackend(storage.StorageBackend):
         connection to hand back, so this is honestly ``None``."""
         return None
 
+    # --- read path (P9): server-side aggregation via the reports.sql RPC ---
+    def read_for_report(self, report, project_path=None):
+        """Return one report's aggregated data by calling its ``SECURITY INVOKER``
+        Postgres function over PostgREST RPC, mapped into the EXACT Python shape
+        ``report.py``'s matching ``fetch_*`` returns — so the shared ``render_*``
+        renders remote and local identically (the cross-dialect golden test
+        guards that the two SQL dialects agree on this shape).
+
+        The function is ``SECURITY INVOKER`` and runs under the caller's Auth JWT,
+        so RLS restricts every row to the caller's OWN data (own-rows-only). Raises
+        on any transport/HTTP/auth error (unlike the never-break-a-session write
+        path): a report command is not the capture hook, and ``report.py`` renders
+        a friendly degradation message rather than a stack trace."""
+        if report == "project-stats":
+            return _map_project_stats(self._rpc("report_project_stats"))
+        if report == "token-stats":
+            return _map_token_stats(self._rpc("report_token_stats"))
+        if report == "info":
+            return _map_info(self._rpc("report_info",
+                                       {"p_project_path": project_path}))
+        raise ValueError(f"unknown report {report!r}")
+
+    def _rpc(self, fn, params=None):
+        """Invoke a ``reports.sql`` function via ``POST /rest/v1/rpc/<fn>`` and
+        return its parsed JSON result. Auth is header-based (publishable key +
+        the per-user Auth Bearer), so the JWT — and thus ``auth.uid()`` for the
+        RLS the function honors — is the caller's; no secret ever enters the URL.
+        Reuses the single TLS-verified :meth:`_request` site."""
+        token = self._access_token()
+        headers = {"apikey": self._publishable_key(),
+                   "Authorization": f"Bearer {token}",
+                   "Content-Type": "application/json",
+                   "Accept": "application/json"}
+        url = f"{self.base}/rest/v1/rpc/{fn}"
+        _status, raw, _hdrs = self._request("POST", url, headers, params or {})
+        return json.loads(raw) if raw else None
+
     def close(self):
         """Close the local outbox connection if one is open."""
         if self._outbox is not None:
@@ -191,11 +232,12 @@ class SupabaseBackend(storage.StorageBackend):
                 self._outbox = None
 
     def capabilities(self):
-        """Honest flags: RLS gives per-user isolation and PostgREST upserts, but
-        this phase is write-only (reads/aggregation are P9) and cursors stay
-        local and authoritative (never remote)."""
+        """Honest flags: RLS gives per-user isolation, PostgREST upserts, and —
+        as of P9 — server-side report aggregation via the ``reports.sql`` RPC
+        (``server_side_aggregation=True``). Cursors stay local and authoritative
+        (never remote), so this backend owns none."""
         return storage.Caps(
-            server_side_aggregation=False, owns_cursors=False, multi_user=True,
+            server_side_aggregation=True, owns_cursors=False, multi_user=True,
             supports_upsert=True, writable=True)
 
     # --- schema / compatibility ---
@@ -624,6 +666,101 @@ class SupabaseBackend(storage.StorageBackend):
         """How many firings are currently queued for re-send (0 when drained)."""
         conn = self._outbox_conn()
         return conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+
+
+# The remote schema mirrors the SQLite v7 shape (supabase/schema.sql). The remote
+# has no PRAGMA user_version, so `/info`'s schema line reflects that modeled shape
+# — a store property, NOT a cross-dialect aggregation, so the golden test compares
+# every other central field but excludes this one.
+REMOTE_SCHEMA_SHAPE = 7
+
+
+def _i(v):
+    """Coerce an RPC JSON number to ``int`` (JSON may hand back a float for an
+    integral value), preserving ``None``. Keeps the mapped shape's types equal to
+    what SQLite's ``fetch_*`` returns so ``render_*`` output cannot drift."""
+    return None if v is None else int(v)
+
+
+def _f(v):
+    """Coerce an RPC JSON number to ``float`` (SQLite returns floats for cost /
+    percentage columns), preserving ``None``."""
+    return None if v is None else float(v)
+
+
+def _map_project_stats(data):
+    """Map ``report_project_stats``'s JSON array into the list-of-dicts
+    :func:`report.fetch_project_stats` returns (keyed by ``report.STATS_KEYS``).
+    The RPC returns raw ``path``/``name``; the basename fallback stays in the
+    renderer, exactly as the local path leaves it."""
+    out = []
+    for r in (data or []):
+        out.append({
+            "path": r.get("path"), "name": r.get("name"),
+            "sessions": _i(r.get("sessions")), "events": _i(r.get("events")),
+            "input": _i(r.get("input")), "output": _i(r.get("output")),
+            "cache_read": _i(r.get("cache_read")),
+            "cache_write": _i(r.get("cache_write")),
+            "classic_in": _f(r.get("classic_in")),
+            "classic_out": _f(r.get("classic_out")),
+            "cached_r": _f(r.get("cached_r")), "cached_w": _f(r.get("cached_w")),
+            "rate_from": _i(r.get("rate_from")),
+            "unpriced_events": _i(r.get("unpriced_events")),
+            "first_seen": r.get("first_seen"),
+            "last_activity": r.get("last_activity")})
+    return out
+
+
+def _map_token_stats(data):
+    """Map ``report_token_stats``'s JSON object into the dict
+    :func:`report.fetch_token_stats` returns. Tuples/positions and column types
+    match the SQLite path so the shared renderer is source-agnostic. The
+    ``by_project`` basename fallback is applied here, exactly as the SQLite fetch
+    does in Python (``nm or Path(path).name``)."""
+    data = data or {}
+
+    def toks(v):
+        v = v or [0, 0, 0, 0, 0]
+        return (_i(v[0]), _i(v[1]), _i(v[2]), _i(v[3]), _i(v[4]))
+
+    by_project = []
+    for path, nm, *rest in (data.get("by_project") or []):
+        label = nm or Path(path).name
+        by_project.append((label, _i(rest[0]), _i(rest[1]), _i(rest[2]),
+                           _i(rest[3]), _i(rest[4])))
+    return {
+        "today": toks(data.get("today")),
+        "week": toks(data.get("week")),
+        "backlog_excluded": _i(data.get("backlog_excluded")) or 0,
+        "by_project": by_project,
+        "by_agent": [(a, _i(i), _i(o), _i(n))
+                     for a, i, o, n in (data.get("by_agent") or [])],
+        "by_model": [(nm, tier, _i(i), _i(o), _f(cost), _i(rf))
+                     for nm, tier, i, o, cost, rf
+                     in (data.get("by_model") or [])],
+        "by_kind": [(k, _i(i), _i(o), _f(pct))
+                    for k, i, o, pct in (data.get("by_kind") or [])],
+        "by_tier": [(t, _i(i), _i(o), _i(n))
+                    for t, i, o, n in (data.get("by_tier") or [])],
+        "by_issue": [(k, _i(i), _i(o), _i(cr), _i(cw), _i(n))
+                     for k, i, o, cr, cw, n in (data.get("by_issue") or [])],
+    }
+
+
+def _map_info(data):
+    """Map ``report_info``'s JSON object into the dict
+    :func:`report.fetch_info_central` returns (``schema`` set from the modeled
+    remote shape — the remote has no ``user_version``)."""
+    data = data or {}
+    return {
+        "schema": REMOTE_SCHEMA_SHAPE,
+        "events": _i(data.get("events")) or 0,
+        "first_day": data.get("first_day"), "last_day": data.get("last_day"),
+        "projects": _i(data.get("projects")) or 0,
+        "pricing_rows": _i(data.get("pricing_rows")) or 0,
+        "latest_rate_from": _i(data.get("latest_rate_from")),
+        "events_here": _i(data.get("events_here")) or 0,
+    }
 
 
 def active_backend(settings_dict=None):
