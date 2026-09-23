@@ -112,53 +112,44 @@ Pricing history is insert-only (`docs/TELEMETRY-CONTRACT.md` §Pricing table,
 "History is never mutated"), so a bad row minted from the parsed page is
 **permanent**. A security review found four ways a hostile or merely broken
 page could abuse that: `pricing_update.py` bounds all four before any row
-reaches the database. The backdated-`starting` fix shipped with its own bug
-(F1), found by a later validation pass and corrected — see below; the claim
-"refuses cleanly rather than silently doing the wrong thing" was false until
-that correction landed, so this section states the corrected behavior only.
+reaches the database.
 
 **Backdated `starting` rows (`filter_backdated_starting()`).** An in-force
 `starting <d>` row is normally minted dated `d`, however far back that is —
 "starting January 1, 1970" would mint `effective_from = 0`, re-pricing every
-event of that prefix back to the epoch. `filter_backdated_starting()` now
-names every `(family, version)` whose in-force `starting` row is more than
-`BACKDATE_MAX_DAYS` (365) days before the run date — it no longer removes
-entries from the page (see F1 below) — and `run_update()` passes that set to
-`build_candidates()`, which skips ONLY that row's `INSERT`. This is a
-per-entry refusal, not a whole-run refusal: the rest of the page still mints
-normally, and the run report prints a `BACKDATED-STARTING WARNING` line
-naming the family, version, refused date and the reason ("not recorded; the
-version's existing rows are unchanged"). A future `starting` (`d > today`) is
-untouched here — it is never minted anyway (`in_force()`).
+event of that prefix back to the epoch. The refusal is **per row**, and only
+for `starting` rows:
 
-There is deliberately no other bound: an earlier version of this rule also
-refused a `starting <d>` earlier than the latest `effective_from` already
-recorded for the version's own prefix(es). That rule was removed entirely —
-in steady state, the DB already holds later rows for a prefix once a real
-increase has landed (the increase minted them when it first arrived), so the
-rule refused the SAME legitimate increase on every scheduled run after the
-first. An arrived increase within 365 days now mints at its date even when
-later rows already exist for that prefix; `INSERT OR IGNORE` keeps a re-run
-at an already-recorded date a no-op.
+- `filter_backdated_starting()` names each in-force `starting` row dated more
+  than `BACKDATE_MAX_DAYS` (365) days before the run date, by its
+  `row_key()` — `(family, version, condition)`, one page row, never a whole
+  version. `through` rows and unconditional rows are never named, whatever
+  their date; a future `starting` (`d > today`) is never minted anyway
+  (`in_force()`).
+- `build_candidates()` decides in-force status from the **unfiltered** page,
+  exactly as before AOS-143, then skips only the named rows. Every other row
+  of the same version still mints: a newer arrived `starting` increase at its
+  own date, an in-force `through` intro dated today. A version with any
+  in-force conditional, refused or not, keeps its unconditional base rate
+  suppressed, so a refusal never reverts a real increase to the base rate.
+- The family default takes the newest version's latest surviving in-force
+  row. When every in-force row of that version was refused, no family row is
+  minted and the family default keeps its last recorded rate.
+- `run_update()` drops the warning for a refused row that
+  `already_recorded()` finds in the DB — every prefix holds a row at that
+  date with identical rates, minted when the increase first arrived — so a
+  weekly re-run over an old, recorded increase is silent. Any other refused
+  row prints one `BACKDATED-STARTING WARNING` line and the run proceeds: "a
+  starting row dated `<d>` is more than 365 days old and was not recorded;
+  the rows already recorded for `<version>` are unchanged".
 
-**F1: a refusal must not change in-force status.** The first cut of this
-fix removed a refused `starting` entry from the list `build_candidates()`
-sees, which also made that entry stop counting as an in-force conditional
-for its version — so the version's UNCONDITIONAL rate (the pre-increase base
-rate) was no longer suppressed, and got minted dated today instead, silently
-reverting the real increase. Combined with the now-removed "latest recorded
-row" rule, this was a time bomb: the real DB already holds later rows for a
-prefix once an increase has landed, so that rule refused the SAME legitimate
-increase on every scheduled run after the first — and each of those refusals
-reverted the increase back to the pre-increase rate. The fix is that
-`build_candidates()` always decides in-force status from the unfiltered page
-— exactly as it did before AOS-143 — and only consults the refused-versions
-set to skip an INSERT: a refused conditional still suppresses its version's
-unconditional rate, and the family default still takes the newest version's
-in-force rate, minting nothing when *that* rate's row is refused (its own
-row is absent from the candidate list, so the family-default lookup finds
-none). Nothing that was suppressed before AOS-143 becomes mintable because
-of a refusal.
+So an arrived increase within 365 days mints at its date even when later rows
+already exist for that prefix, and even when the page still lists an older,
+refused increase for the same version; `INSERT OR IGNORE` keeps a re-run at
+an already-recorded date a no-op. There is no other bound on `starting`
+dates: refusing a date earlier than a prefix's latest recorded row would
+refuse every legitimate increase on the run after it arrived, because the
+increase itself recorded that later row.
 
 **Unbounded rate magnitude (`MAX_RATE_USD`, in `parse_models()`).**
 `money()` stays a permissive regex match on purpose — magnitude enforcement

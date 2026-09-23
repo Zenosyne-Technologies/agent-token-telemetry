@@ -273,7 +273,19 @@ def in_force(condition, today):
     return date >= today if kind == "through" else date <= today
 
 
-def build_candidates(entries, today, refused_versions=frozenset()):
+def row_key(entry):
+    """The identity of one parsed page row for the backdate bound:
+    ``(family, version, condition)``. Two rows of the same version differ by
+    their condition (``None`` or ``('through'|'starting', date)``), so a
+    refusal keyed on this names exactly one row, never a whole version.
+
+    :param entry: one :func:`parse_models` entry.
+    :returns: the hashable row key.
+    """
+    return (entry["family"], entry["version"], entry["condition"])
+
+
+def build_candidates(entries, today, refused_rows=frozenset()):
     """Deterministic prefix plan — mint only the rate IN FORCE today, per
     listed version (docs/TELEMETRY-CONTRACT.md §Pricing table):
 
@@ -298,16 +310,21 @@ def build_candidates(entries, today, refused_versions=frozenset()):
       :func:`stale_intros`), no family row is minted either — the family
       default keeps its last recorded rate, like the version itself.
 
-    ``refused_versions`` (AOS-143 correction, F1) names every ``(family,
-    version)`` whose in-force ``starting`` row :func:`filter_backdated_starting`
-    refused as too old to trust: refusal skips ONLY that row's INSERT here —
-    IN-FORCE STATUS IS STILL DECIDED FROM THE PAGE, exactly as before AOS-143.
-    A refused conditional still suppresses its version's unconditional rate
-    (the version stays in ``conditioned`` below), and if the refused row is
-    the family's newest version's in-force rate, no family default row is
-    minted either (its ``rows`` lookup below finds none) — the family default
-    keeps its last recorded rate, like the version itself. Nothing that was
-    suppressed before AOS-143 becomes mintable because of a refusal.
+    ``refused_rows`` (AOS-143 correction) names, by :func:`row_key`, every
+    in-force ``starting`` row :func:`filter_backdated_starting` refused as
+    dated more than :data:`BACKDATE_MAX_DAYS` days back. The refusal is PER
+    ROW: IN-FORCE STATUS IS STILL DECIDED FROM THE UNFILTERED PAGE, exactly as
+    before AOS-143, and then each candidate row is skipped only if it is
+    itself a refused row — every other row of the same version (a newer
+    arrived ``starting`` increase, an in-force ``through`` intro) mints as
+    it would without the bound. A version with any in-force conditional
+    (refused or not) stays in ``conditioned`` below, so its unconditional
+    base rate stays suppressed. The family default takes the newest
+    version's latest SURVIVING in-force row; if every in-force row of that
+    version was refused, no family row is minted (its ``rows`` lookup below
+    finds none) and the family default keeps its last recorded rate, like
+    the version itself. Nothing that was suppressed before AOS-143 becomes
+    mintable because of a refusal.
 
     Ordering: on a ``(prefix, effective_from)`` collision the first candidate
     wins. In-force conditionals are listed before unconditional rows (and an
@@ -318,7 +335,7 @@ def build_candidates(entries, today, refused_versions=frozenset()):
 
     :param entries: :func:`parse_models` output, in page order.
     :param today: the run date (UTC).
-    :param refused_versions: ``{(family, version)}`` set — see above. Empty
+    :param refused_rows: set of :func:`row_key` values — see above. Empty
         by default so callers that never refuse a row (most tests) are
         unaffected.
     :returns: candidate dicts ``{prefix, rates, effective_from}``, family
@@ -335,8 +352,8 @@ def build_candidates(entries, today, refused_versions=frozenset()):
     for e in entries:
         if not in_force(e["condition"], today):
             continue
-        if e["condition"][0] == "starting" and version(e) in refused_versions:
-            continue  # F1: skip only the INSERT; version stays `conditioned`
+        if row_key(e) in refused_rows:
+            continue  # skip only this row; its version stays `conditioned`
         kind, date = e["condition"]
         eff = today_epoch if kind == "through" else _epoch(date)
         for p in specific_prefixes(e["family"], e["version"]):
@@ -439,41 +456,36 @@ def future_only_newest(entries, today):
 
 
 def filter_backdated_starting(entries, today):
-    """Identify every in-force ``starting <d>`` entry whose date ``d`` is too
+    """Identify every in-force ``starting <d>`` ROW whose date ``d`` is too
     old to trust (AOS-143 parser bounds, corrected): an in-force ``starting``
     row is normally minted dated ``d`` however far back
     (:func:`build_candidates`), which would re-price every event of that
     prefix back to ``d`` — permanently, since pricing history is
     insert-only. Refused when ``d`` is more than :data:`BACKDATE_MAX_DAYS`
-    days before ``today``. A future ``starting`` (``d > today``) is left
-    alone — it is never minted anyway (:func:`in_force`), so it cannot be
-    backdated.
+    days before ``today``. The bound applies to ``starting`` rows ONLY: a
+    ``through`` row (an intro) is never refused, whatever its date, and an
+    unconditional row is never refused. A future ``starting`` (``d > today``)
+    is left alone — it is never minted anyway (:func:`in_force`).
 
-    This is a REFUSAL TO MINT, not a removal from the page: the caller
-    (:func:`run_update`) still passes every entry, unfiltered, to
-    :func:`build_candidates`, which decides in-force status from the page
-    exactly as before AOS-143 and only skips the INSERT for a version named
-    here — see :func:`build_candidates` for why (F1: a refusal must not make
-    a suppressed pre-increase/post-intro rate mintable, nor revert a real
-    increase already on record).
+    This is a PER-ROW refusal to mint, not a removal from the page and not a
+    refusal of the version: the caller (:func:`run_update`) still passes every
+    entry, unfiltered, to :func:`build_candidates`, which decides in-force
+    status from the page exactly as before AOS-143 and only skips the rows
+    named here — a newer arrived ``starting`` row or an in-force intro of the
+    same version still mints.
 
     There is deliberately no other bound: a ``starting`` date equal to or
     earlier than a prefix's already-recorded rows is a NORMAL steady-state
     re-run — the increase was minted when it first arrived, and ``INSERT OR
     IGNORE`` (:func:`apply`) makes every later run at the same date a no-op.
-    An earlier rule that also refused a ``starting`` row older than the
-    prefix's latest recorded row was removed: in steady state, the real DB
-    already holds later rows for a prefix once an increase has landed, so
-    that rule refused every LEGITIMATE increase on the very next scheduled
-    run after it arrived.
 
     :param entries: :func:`parse_models` output, in page order.
     :param today: the run date (UTC).
-    :returns: ``(refused_versions, warnings)`` — ``refused_versions`` a
-        ``{(family, version)}`` set naming every version whose in-force
-        ``starting`` row is refused (:func:`build_candidates` takes this),
-        and one ``(family, version, date, reason)`` tuple per refusal, in
-        page order.
+    :returns: ``(refused_rows, warnings)`` — ``refused_rows`` the set of
+        :func:`row_key` values of the refused rows (:func:`build_candidates`
+        takes this), and one ``(family, version, date, rates)`` tuple per
+        refused row, in page order (:func:`run_update` drops the ones
+        already recorded, :func:`render` words the rest).
     """
     cutoff = today - datetime.timedelta(days=BACKDATE_MAX_DAYS)
     refused, warnings = set(), []
@@ -483,12 +495,33 @@ def filter_backdated_starting(entries, today):
             continue
         date = cond[1]
         if date < cutoff:
-            refused.add((e["family"], e["version"]))
-            warnings.append((e["family"], e["version"], date,
-                             f"more than {BACKDATE_MAX_DAYS} days before"
-                             f" today ({today.isoformat()}); not recorded;"
-                             " the version's existing rows are unchanged"))
+            refused.add(row_key(e))
+            warnings.append((e["family"], e["version"], date, e["rates"]))
     return refused, warnings
+
+
+def already_recorded(conn, family, version, date, rates):
+    """Whether a refused ``starting`` row is already in the DB exactly as the
+    page lists it: every specific prefix of ``(family, version)`` holds a row
+    dated ``date`` with identical rates. Such a row was minted when the
+    increase first arrived; refusing it now is a no-op, not a loss, so
+    :func:`run_update` prints no BACKDATED-STARTING WARNING for it.
+
+    :param conn: an open telemetry DB connection.
+    :param family: the row's model family (lowercase).
+    :param version: the row's version string.
+    :param date: the row's ``starting`` date.
+    :param rates: the row's parsed rate dict (:data:`RATE_KEYS`).
+    :returns: ``True`` only when every prefix has an identical row.
+    """
+    for p in specific_prefixes(family, version):
+        row = conn.execute(
+            "SELECT in_usd, out_usd, cache_r_usd, cache_w_usd, cache_w_1h_usd"
+            " FROM pricing WHERE provider=? AND model_prefix=?"
+            " AND effective_from=?", (PROVIDER, p, _epoch(date))).fetchone()
+        if row is None or dict(zip(RATE_KEYS, row)) != rates:
+            return False
+    return True
 
 
 def plan(conn, candidates):
@@ -563,8 +596,10 @@ def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
     :param today: the run date (UTC).
     :param stale: :func:`stale_intros` output — one STALE-PRICE WARNING line
         per version whose only listed rate is an expired intro.
-    :param backdated: :func:`filter_backdated_starting` warnings output —
-        one BACKDATED-STARTING WARNING line per refused ``starting`` row.
+    :param backdated: ``(family, version, date, rates)`` tuples — the
+        :func:`filter_backdated_starting` warnings :func:`run_update` kept
+        (refused rows not already recorded); one BACKDATED-STARTING WARNING
+        line each.
     :param future_only: :func:`future_only_newest` output — one FUTURE-RATE
         WARNING line per family whose newest version's only rate has not
         started yet.
@@ -590,10 +625,13 @@ def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
                 " force after it; nothing was minted, so events for it keep"
                 " the last recorded rate until the page publishes a"
                 " post-intro rate."]
-    for fam, ver, date, reason in backdated:
-        out += ["", f"BACKDATED-STARTING WARNING: Claude {fam.capitalize()}"
-                f" {ver} (`{specific_prefixes(fam, ver)[0]}`) — its"
-                f" `starting {date.isoformat()}` row was refused: {reason}."]
+    for fam, ver, date, _rates in backdated:
+        name = f"Claude {fam.capitalize()} {ver}"
+        out += ["", f"BACKDATED-STARTING WARNING: {name}"
+                f" (`{specific_prefixes(fam, ver)[0]}`) — a starting row dated"
+                f" {date.isoformat()} is more than {BACKDATE_MAX_DAYS} days"
+                " old and was not recorded; the rows already recorded for"
+                f" {name} are unchanged."]
     for fam, ver, date in future_only:
         out += ["", f"FUTURE-RATE WARNING: Claude {fam.capitalize()} {ver}"
                 f" (`{specific_prefixes(fam, ver)[0]}`) — its only listed"
@@ -614,10 +652,13 @@ def run_update(conn, entries, today, source=URL):
 
     Two bounds (AOS-143) can refuse work before any write reaches the DB: an
     in-force ``starting`` row too old to trust has its INSERT skipped, named
-    by :func:`filter_backdated_starting` (a per-entry refusal, warned not
-    fatal — the rest of the run proceeds, and :func:`build_candidates` still
-    decides in-force status from the unfiltered page, so a refusal never
-    makes a suppressed rate mintable); a candidate count over
+    by :func:`filter_backdated_starting` (a per-ROW refusal, warned not
+    fatal — every other row, including a newer increase of the same version,
+    proceeds, and :func:`build_candidates` still decides in-force status from
+    the unfiltered page, so a refusal never makes a suppressed rate
+    mintable; a refused row already recorded with identical rates
+    (:func:`already_recorded`) is a no-op and is not warned); a candidate
+    count over
     :data:`MAX_CANDIDATES` refuses the WHOLE run atomically
     (:class:`PricingRefused`, nothing planned or applied).
 
@@ -632,8 +673,9 @@ def run_update(conn, entries, today, source=URL):
     :raises PricingRefused: the candidate count exceeds
         :data:`MAX_CANDIDATES`; nothing was planned or applied.
     """
-    refused_versions, backdated = filter_backdated_starting(entries, today)
-    raw_candidates = build_candidates(entries, today, refused_versions)
+    refused_rows, backdated = filter_backdated_starting(entries, today)
+    backdated = [w for w in backdated if not already_recorded(conn, *w)]
+    raw_candidates = build_candidates(entries, today, refused_rows)
     if len(raw_candidates) > MAX_CANDIDATES:
         raise PricingRefused(
             "Pricing refresh REFUSED — nothing written: this run would mint"

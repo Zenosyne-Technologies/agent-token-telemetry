@@ -2,7 +2,7 @@
 insert-only (docs/TELEMETRY-CONTRACT.md §Pricing table), so a bad row minted
 from the parsed pricing page is permanent. These tests bound what a single
 page/run can mint: a `starting <d>` row cannot be minted more than a year
-back or before a prefix's latest recorded rate (warned, not fatal); a
+back (a per-row refusal, warned unless already recorded, not fatal); a
 non-finite or absurd rate refuses the WHOLE run; more than 500 candidate rows
 refuses the WHOLE run; and no raw, unsanitized page text ever reaches an
 error message. Fixture DBs and in-test HTML only — never the network."""
@@ -130,8 +130,9 @@ class TestBackdatedStarting(Base):
         self.assertIn("BACKDATED-STARTING WARNING", report)
         self.assertIn("Claude Sonnet 5", report)
         self.assertIn("1970-01-01", report)
-        self.assertIn("not recorded; the version's existing rows are"
-                      " unchanged", report)
+        self.assertIn("a starting row dated 1970-01-01 is more than 365"
+                      " days old and was not recorded; the rows already"
+                      " recorded for Claude Sonnet 5 are unchanged", report)
         self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
         self.assertIn("0 row(s) inserted", report)
 
@@ -181,7 +182,9 @@ class TestBackdatedStarting(Base):
         # from the page (F1), so the version stays "conditioned": the $3
         # base rate must NOT be minted (that would silently revert the real
         # increase), and the family default must not mint either, since the
-        # newest version's in-force rate this run is the refused row.
+        # newest version's in-force rate this run is the refused row. The
+        # refused row is already recorded with identical rates, so the run
+        # is a no-op for it and prints no BACKDATED-STARTING WARNING.
         arrived = datetime.date(2026, 9, 1)
         self.f.price("claude-sonnet-5", INCREASE_RATES, _epoch(arrived))
         self.f.price("claude-sonnet-", INCREASE_RATES, _epoch(arrived))
@@ -190,7 +193,7 @@ class TestBackdatedStarting(Base):
         today = datetime.date(2027, 9, 2)   # 366 days after the increase
         entries = pricing_update.parse_models(INCREASE_FIXTURE.read_text())
         report = pricing_update.run_update(self.f.conn, entries, today, "t")
-        self.assertIn("BACKDATED-STARTING WARNING", report)
+        self.assertNotIn("BACKDATED-STARTING WARNING", report)
         # nothing changed for the refused version or its family default: the
         # pre-increase $3 rate was never (re-)minted, and the already-
         # recorded $4 rows are untouched. (The fixture's third, unconditional
@@ -232,14 +235,11 @@ class TestBackdatedStarting(Base):
         drop = _entry("sonnet", "5", ("starting", datetime.date(1970, 1, 1)))
         refused, warnings = pricing_update.filter_backdated_starting(
             [keep, drop], today)
-        self.assertEqual(refused, {("sonnet", "5")})
-        self.assertEqual(len(warnings), 1)
-        fam, ver, date, reason = warnings[0]
-        self.assertEqual((fam, ver, date),
-                         ("sonnet", "5", datetime.date(1970, 1, 1)))
-        self.assertIn("365", reason)
-        self.assertIn("not recorded; the version's existing rows are"
-                      " unchanged", reason)
+        self.assertEqual(refused, {pricing_update.row_key(drop)})
+        self.assertEqual(
+            refused, {("sonnet", "5", ("starting", datetime.date(1970, 1, 1)))})
+        self.assertEqual(warnings, [("sonnet", "5", datetime.date(1970, 1, 1),
+                                     drop["rates"])])
 
     def test_future_starting_is_left_alone_not_bound_checked(self):
         # A future `starting` is never minted anyway (in_force) — the bound
@@ -266,6 +266,151 @@ class TestBackdatedStarting(Base):
                     entries, today)
                 self.assertEqual(bool(refused), expect_refused)
                 self.assertEqual(bool(warnings), expect_refused)
+
+
+def _rates(i):
+    """A full rate dict scaled from input rate ``i`` (same shape the page
+    parses to)."""
+    return {"in_usd": float(i), "out_usd": i * 5.0, "cache_r_usd": i / 10,
+            "cache_w_usd": i * 1.25, "cache_w_1h_usd": i * 2.0}
+
+
+class TestPerRowRefusal(Base):
+    """AOS-143 correction (G1/G2/INFO): the 365-day bound is decided PER
+    ROW, and only for `starting` rows. In-force status still comes from the
+    unfiltered page; each candidate row is then skipped only if it is itself
+    a `starting` row dated more than 365 days back. A version whose page
+    carries an old increase footnote AND a newer arrived increase mints the
+    newer one; an in-force intro (`through`) row is never refused; and an
+    old row already recorded with identical rates is a silent no-op."""
+
+    TODAY = datetime.date(2026, 9, 23)
+    OLD = TODAY - datetime.timedelta(days=400)        # 2025-08-19
+    RECENT = datetime.date(2026, 9, 1)                # 22 days back
+    INTRO_END = datetime.date(2026, 12, 31)
+
+    def _resolve(self, prefix):
+        row = self.f.conn.execute(
+            "SELECT in_usd, effective_from FROM pricing WHERE model_prefix=?"
+            " AND effective_from<=? ORDER BY effective_from DESC LIMIT 1",
+            (prefix, _epoch(self.TODAY))).fetchone()
+        return row and (row[0], row[1])
+
+    def _two_increases(self):
+        return [_entry("sonnet", "5", None, _rates(3)),
+                _entry("sonnet", "5", ("starting", self.OLD), _rates(4)),
+                _entry("sonnet", "5", ("starting", self.RECENT), _rates(5))]
+
+    def _warnings(self, report):
+        return [ln for ln in report.splitlines()
+                if ln.startswith("BACKDATED-STARTING WARNING")]
+
+    def test_recent_increase_mints_beside_an_old_refused_one_recorded_db(self):
+        # val143b C1: the DB already holds the old $4 increase; the page
+        # keeps its footnote and adds the next increase ($5, Sep 1 2026).
+        # Main mints $5 @Sep 1 on the version and $5 @today on the family —
+        # so must this branch; the stale $4 must not keep governing.
+        self.f.price("claude-sonnet-5", _rates(4), _epoch(self.OLD))
+        self.f.price("claude-sonnet-", _rates(4), _epoch(self.OLD))
+        report = pricing_update.run_update(
+            self.f.conn, self._two_increases(), self.TODAY, "t")
+        self.assertEqual(self._resolve("claude-sonnet-5"),
+                         (5.0, _epoch(self.RECENT)))
+        self.assertEqual(self._resolve("claude-sonnet-"),
+                         (5.0, _epoch(self.TODAY)))
+        self.assertIn("2 row(s) inserted", report)
+        # the old row is already recorded with identical rates: no warning
+        self.assertEqual(self._warnings(report), [])
+
+    def test_recent_increase_mints_beside_an_old_refused_one_fresh_db(self):
+        # val143b C2: fresh DB. Only the old row is refused; the base $3 stays
+        # suppressed (a conditional is in force for the version).
+        report = pricing_update.run_update(
+            self.f.conn, self._two_increases(), self.TODAY, "t")
+        self.assertEqual(
+            [(r[1], r[6]) for r in self.f.pricing_rows("claude-sonnet-5")],
+            [(5.0, _epoch(self.RECENT))])
+        self.assertEqual(self._resolve("claude-sonnet-"),
+                         (5.0, _epoch(self.TODAY)))
+        warns = self._warnings(report)
+        self.assertEqual(len(warns), 1)
+        self.assertIn(
+            f"a starting row dated {self.OLD.isoformat()} is more than 365"
+            " days old and was not recorded; the rows already recorded for"
+            " Claude Sonnet 5 are unchanged", warns[0])
+        self.assertNotIn(self.RECENT.isoformat(), warns[0])
+
+    def test_build_candidates_skips_only_the_refused_row(self):
+        refused, _ = pricing_update.filter_backdated_starting(
+            self._two_increases(), self.TODAY)
+        cands = pricing_update.build_candidates(
+            self._two_increases(), self.TODAY, refused)
+        own = [(c["rates"]["in_usd"], c["effective_from"]) for c in cands
+               if c["prefix"] == "claude-sonnet-5"]
+        self.assertEqual(own, [(5.0, _epoch(self.RECENT))])
+
+    def test_in_force_intro_row_is_never_refused(self):
+        # val143b B1/B2 (pins mutant V26): an in-force `through` intro on a
+        # version that also lists a starting row 400 days back. Only the
+        # starting row is refused; the intro mints today on the version and
+        # the family, and the base $3 stays suppressed.
+        for with_base in (False, True):
+            with self.subTest(with_base=with_base):
+                self.tearDown()
+                self.setUp()
+                entries = ([_entry("sonnet", "5", None, _rates(3))]
+                           if with_base else [])
+                entries += [
+                    _entry("sonnet", "5", ("through", self.INTRO_END),
+                           _rates(2)),
+                    _entry("sonnet", "5", ("starting", self.OLD), _rates(4))]
+                report = pricing_update.run_update(
+                    self.f.conn, entries, self.TODAY, "t")
+                self.assertEqual(
+                    [(r[1], r[6])
+                     for r in self.f.pricing_rows("claude-sonnet-5")],
+                    [(2.0, _epoch(self.TODAY))])
+                self.assertEqual(self._resolve("claude-sonnet-"),
+                                 (2.0, _epoch(self.TODAY)))
+                self.assertEqual(len(self._warnings(report)), 1)
+
+    def test_old_through_row_is_not_bound_checked(self):
+        # The bound applies to `starting` rows only: a `through` row dated
+        # far back (an intro that ended long ago) is never refused/warned.
+        old_intro = self.TODAY - datetime.timedelta(days=900)
+        entries = [_entry("sonnet", "5", None, _rates(3)),
+                   _entry("sonnet", "5", ("through", old_intro), _rates(2))]
+        refused, warnings = pricing_update.filter_backdated_starting(
+            entries, self.TODAY)
+        self.assertEqual((refused, warnings), (set(), []))
+        report = pricing_update.run_update(
+            self.f.conn, entries, self.TODAY, "t")
+        self.assertEqual(self._warnings(report), [])
+        self.assertEqual(self._resolve("claude-sonnet-5"),
+                         (3.0, _epoch(self.TODAY)))
+
+    def test_weekly_rerun_over_already_recorded_old_row_prints_no_warning(self):
+        # Steady state: the increase was recorded when it arrived; a year+
+        # later the page still carries it. Every weekly re-run is a no-op for
+        # that row — no warning, since it IS recorded.
+        self.f.price("claude-sonnet-5", _rates(4), _epoch(self.OLD))
+        entries = [_entry("sonnet", "5", None, _rates(3)),
+                   _entry("sonnet", "5", ("starting", self.OLD), _rates(4))]
+        for week in range(3):
+            today = self.TODAY + datetime.timedelta(days=7 * week)
+            report = pricing_update.run_update(self.f.conn, entries, today,
+                                               "t")
+            self.assertEqual(self._warnings(report), [], today)
+            self.assertIn("0 row(s) inserted", report)
+
+    def test_old_row_recorded_with_different_rates_still_warns(self):
+        # Only an IDENTICAL recorded row (same prefix, date and rates) is a
+        # silent no-op; a differing one is genuinely not recorded -> warns.
+        self.f.price("claude-sonnet-5", _rates(7), _epoch(self.OLD))
+        entries = [_entry("sonnet", "5", ("starting", self.OLD), _rates(4))]
+        report = pricing_update.run_update(
+            self.f.conn, entries, self.TODAY, "t")
+        self.assertEqual(len(self._warnings(report)), 1)
 
 
 class TestValueBounds(Base):

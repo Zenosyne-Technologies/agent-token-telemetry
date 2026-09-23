@@ -404,23 +404,32 @@ and has since been corrected — see below.
 
 - **Backdated `starting`.** An in-force `starting <d>` row is normally minted dated `d`
   however far back — `starting January 1, 1970` would mint `effective_from = 0`,
-  re-pricing that prefix's entire history. A `starting <d>` entry more than 365 days
-  before today is refused (its own WARNING line, naming the version, date and reason;
-  the rest of the run proceeds normally): "not recorded; the version's existing rows
-  are unchanged". Refusal skips ONLY that entry's `INSERT` — in-force status is still
-  decided from the page, exactly as it was before AOS-143, so a refused `starting` row
-  still suppresses its version's unconditional rate, and the family default still keys
-  off the newest version's in-force rate, minting nothing when *that* rate's row is
-  refused. Nothing that was suppressed before AOS-143 becomes mintable because of a
-  refusal. An earlier version of this rule also refused a `starting <d>` earlier than
-  the latest `effective_from` already recorded for the version's own prefix(es); that
-  rule was removed entirely, because in steady state the DB already holds later rows
-  for a prefix once a real increase has landed (the increase minted them when it first
-  arrived), so it refused every LEGITIMATE increase on the very next scheduled run —
-  and, combined with the in-force bug above, silently reverted the increase to the
-  pre-increase base rate. An arrived increase within 365 days mints at its date even
-  when later rows already exist for that prefix; `INSERT OR IGNORE` keeps a re-run at
-  an already-recorded date a no-op.
+  re-pricing that prefix's entire history. The refusal is **per row**, and applies to
+  `starting` rows only:
+  1. In-force status is decided from the unfiltered page, exactly as before AOS-143:
+     it picks each version's in-force rows, and a version with any in-force conditional
+     keeps its unconditional base rate suppressed — whether or not that conditional is
+     later refused.
+  2. Each candidate row is then skipped only if it is itself a `starting` row dated more
+     than 365 days before today. Refusal skips ONLY that row's `INSERT`: every other row
+     of the same version still mints — a newer arrived `starting` increase at its own
+     date, an in-force `through` intro dated today. A `through` row is never refused,
+     whatever its date.
+  3. The family default takes the newest version's latest surviving in-force row; when
+     every in-force row of that version was refused, no family row is minted and the
+     family default keeps its last recorded rate. Nothing that was suppressed before
+     AOS-143 becomes mintable because of a refusal.
+  4. A refused row that is already in the database — every one of its prefixes holds a
+     row at that date with identical rates, minted when the increase first arrived — is
+     a no-op and prints no warning. Any other refused row prints one
+     `BACKDATED-STARTING WARNING` line and the run proceeds: "a starting row dated `<d>`
+     is more than 365 days old and was not recorded; the rows already recorded for
+     `<version>` are unchanged".
+
+  An arrived increase within 365 days mints at its date even when later rows already
+  exist for that prefix, and even when the page also lists an older, refused `starting`
+  row for the same version; `INSERT OR IGNORE` keeps a re-run at an already-recorded
+  date a no-op. There is no other bound on `starting` dates.
 - **Unbounded rate magnitude.** `money()`'s regex match is deliberately permissive about
   digit count — a several-hundred-digit rate cell overflows `float()` to `inf` with no
   exception raised. Every parsed rate is checked: non-finite, over $10,000/MTok, or (for
