@@ -2,7 +2,7 @@
 title: Reading Token Stats
 audience: user
 module: reporting
-sources: [commands/token-stats.md, commands/project-stats.md, scripts/report.py, commands/pricing-update.md]
+sources: [commands/token-stats.md, commands/project-stats.md, scripts/report.py, commands/pricing-update.md, commands/schedule-pricing.md, scripts/pricing_update.py]
 updated: 2026-09-23
 related: [[enabling-telemetry]], [[enabling-remote-telemetry]], [[operating-remote-telemetry]]
 ---
@@ -84,6 +84,38 @@ rate for a given model — this means the published pricing page no longer
 lists a current rate for it (its introductory-rate period has ended and
 nothing has replaced it yet). Nothing changes for that model until the page
 is updated; its reports keep using the last rate that was recorded.
+
+## Backfilling estimated pricing windows
+
+While refreshing rates, `/token-telemetry:pricing-update` can also notice
+that some of a model's past usage was recorded using an estimated rate —
+borrowed from a closely related model — before that model's own official
+rate became available. When this happens, the command shows you exactly
+which past events would change, the cost before and after, and asks which of
+the changes you want to apply.
+
+- A **bundle** is the smallest group of models that has to be corrected
+  together for a fix to be complete. Sometimes correcting one model's
+  estimate only works if a closely related model is corrected in the same
+  step, so those are offered as a single option — you accept or skip the
+  whole bundle, never part of it.
+- You choose which bundles, if any, to apply; nothing is pre-selected. Every
+  apply you approve goes through Claude Code's own permission prompt before
+  anything is written to your telemetry data — that approval happens in the
+  same session, every time.
+- If none of what's on offer can be safely applied, the command shows you
+  why and asks nothing further — there is nothing to approve in that case.
+- This never happens automatically or in the background — see below for
+  what the weekly scheduled refresh does instead.
+
+## Scheduled pricing refreshes never backfill
+
+If you've registered `/token-telemetry:schedule-pricing` to run weekly in
+the background, that scheduled run only refreshes rates going forward — it
+never applies a pricing backfill, since nobody is present to approve it. If
+your weekly schedule was registered before this safeguard existed, run
+`/token-telemetry:schedule-pricing` again to re-register it so it explicitly
+passes the flag that guarantees this.
 
 ## Names shown are cleaned up for display
 

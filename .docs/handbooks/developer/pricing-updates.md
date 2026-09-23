@@ -243,6 +243,24 @@ reports "backfill available". Local central DB only — the remote backend's
 pricing is not touched. `tests/test_backfill.py` pins the rules, including
 fault-injected rollback paths.
 
+### Backfill argv validation
+
+Before any parsing or DB access, `main()` runs two checks directly over raw
+`sys.argv`, independent of argparse. `_reject_combined_backfill_flags()`
+refuses the whole run — exit 2, "Backfill REFUSED" — if `--backfill-plan` and
+`--backfill-apply` both appear anywhere on the command line.
+`_reject_option_shaped_backfill_apply()` rejects, by position, any token
+after `--backfill-apply` that is not a well-formed pricing prefix
+(`is_pricing_prefix()`) — including another flag such as `--db=other.db` —
+so a malformed or option-looking argument is refused with exit 2 before any
+DB is opened. Because `--backfill-apply` uses `nargs="+"` and consumes every
+remaining raw argument as a candidate prefix, `--db`/`--html` MUST be given
+BEFORE `--backfill-apply` on the command line; anything after it is checked
+only as a prefix, never as another flag. Argparse's own
+`add_mutually_exclusive_group()` enforces the same
+`--backfill-plan`/`--backfill-apply` exclusivity a second, independent way —
+the raw-argv check is defence in depth, not the only gate.
+
 ## Testing: the golden no-cost-change test
 
 `tests/pricing_golden.py` records, per (page fixture or inline entry list,
