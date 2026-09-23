@@ -240,7 +240,7 @@ class TestCompatSafeguard(ImportBase):
         self.assertEqual(self.count("events"), before)
         self.assertEqual(
             self.count("projects",
-                       conn=sqlite3.connect(f"file:{self.central}?mode=ro")), 1)
+                       conn=sqlite3.connect(f"file:{self.central}?mode=ro", uri=True)), 1)
 
     def test_missing_users_table_is_auto_migrated(self):
         # A genuinely pre-v7 central: the import must migrate it to v7 (creating
