@@ -116,6 +116,11 @@ the changes you want to apply.
   why and asks nothing further — there is nothing to approve in that case.
 - This never happens automatically or in the background — see below for
   what the weekly scheduled refresh does instead.
+- Between runs, the dashboard's own-price banner shows a one-line
+  "Backfill available" reminder with the bundle count and combined cost
+  change from the last check, for as long as that check still matches your
+  data (local backend only). It only points you back here; it never applies
+  anything — see [[enabling-remote-telemetry]], "Backfill available".
 
 ## Scheduled pricing refreshes never backfill
 

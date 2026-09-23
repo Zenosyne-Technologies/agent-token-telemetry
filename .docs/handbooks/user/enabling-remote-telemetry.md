@@ -2,12 +2,12 @@
 doc: Enabling Remote Telemetry
 type: handbook
 status: active
-summary: How to turn on the shared remote (Supabase) storage backend with `/token-telemetry:enable-remote` — choosing local vs remote, setting the project URL and the publishable-key env-var NAME (the key value is never entered in chat), applying the schema and running the RLS live-verification, logging in, ensuring your remote identity, then migrating your existing data or starting fresh, how to switch back, and the dashboard's own-price warning banner.
-keywords: [enable, remote, supabase, backend, publishable-key, env-var, login, rls, migrate, start-fresh, reversible, telemetry, dashboard, price-warning-banner, estimated-rate]
+summary: How to turn on the shared remote (Supabase) storage backend with `/token-telemetry:enable-remote` — choosing local vs remote, setting the project URL and the publishable-key env-var NAME (the key value is never entered in chat), applying the schema and running the RLS live-verification, logging in, ensuring your remote identity, then migrating your existing data or starting fresh, how to switch back, and the dashboard's own-price warning banner with its "backfill available" line.
+keywords: [enable, remote, supabase, backend, publishable-key, env-var, login, rls, migrate, start-fresh, reversible, telemetry, dashboard, price-warning-banner, estimated-rate, backfill-available]
 level: project
 audience: user
 module: storage
-sources: [commands/enable-remote.md, commands/enable.md, scripts/remote_migrate.py, scripts/settings.py, scripts/supabase_backend.py, scripts/dashboard.py, scripts/dashboard.html]
+sources: [commands/enable-remote.md, commands/enable.md, scripts/remote_migrate.py, scripts/settings.py, scripts/supabase_backend.py, scripts/dashboard.py, scripts/dashboard.html, scripts/backfill_summary.py]
 related: ["[[operating-remote-telemetry]]", "[[migrating-to-remote]]", "[[migrating-local-logs-to-central]]", "[[reading-token-stats]]"]
 created: 2026-09-22
 updated: 2026-09-23
@@ -151,6 +151,35 @@ own. It splits what it finds into two groups:
 Either way, the banner points you at `/token-telemetry:pricing-update` to
 refresh the pricing table. It disappears once every model you've logged has
 its own price.
+
+### "Backfill available"
+
+The banner can also carry one more line, even when no model is listed above
+it:
+
+> Backfill available: 2 bundles, -$272.46 — run /token-telemetry:pricing-update to review and confirm (plan computed 3 hours ago).
+
+It means the last time `/token-telemetry:pricing-update` checked (see
+[[reading-token-stats]], "Backfilling estimated pricing windows"), some past
+usage was still priced at an estimate that the model's own, later-published
+rate could correct. It tells you how many bundles are on offer, the combined
+cost change if you applied all of them, and how old that check is.
+
+- **The dashboard never applies anything.** There is no button for it. Run
+  `/token-telemetry:pricing-update`, review the plan, pick the bundles you
+  want, and approve Claude Code's permission prompt — only then is anything
+  written.
+- **It never goes stale silently.** The line is only shown while your pricing
+  table and the relevant past usage are exactly as they were when that check
+  ran. A pricing refresh, an applied backfill, or imported older usage hides
+  it until the next check; new usage you record today does not.
+- **It stays hidden when there is nothing reliable to show** — no check has
+  run yet, the check found nothing to offer, or its saved result is missing
+  or damaged. That is never an error; the rest of the page is unaffected.
+- **Not shown on the remote backend.** Backfill only corrects your local
+  telemetry database, so while remote is your active backend the dashboard
+  hides this line rather than suggest a correction the remote store can't
+  receive.
 
 ## Going back to local
 

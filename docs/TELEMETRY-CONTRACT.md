@@ -315,6 +315,34 @@ Limitation: the backfill writes the **local** central DB only; the remote (Supab
 backend's `pricing` table is not touched, and carrying such rows there is future work
 (remote pricing sync).
 
+**Dashboard plan summary (`backfill-plan.json`).** A plan can take tens of seconds on
+a large DB, so the dashboard never computes one. Every `--backfill-plan` run (markdown
+or `--json`) over the DB the dashboard reads (`$TOKEN_TELEMETRY_DB`, else
+`~/.claude/telemetry/usage.db`; a `--db` pointing at any other file writes nothing)
+writes a summary sidecar beside it, `backfill-plan.json`:
+`{version: 1, computedAt: <epoch s>, bundles: <offered rows, candidates + confirm-only>,
+deltaText: <the plan's "everything offered" signed delta, e.g. "-$272.46", or null>,
+fingerprint: <64 hex>}`. A successful `--backfill-apply` on that DB deletes it. It is
+written atomically (a fresh `O_EXCL|O_NOFOLLOW` 0600 temp file, then rename), never
+through a symlink (a symlink or non-regular file at that name is refused and left
+alone), and only when the fingerprint taken just before the plan equals the one taken
+just after it. Writing it never changes the plan's stdout or exit code; a failure
+prints one note to stderr. **Staleness is keyed to a fingerprint, not an age:** SHA-256
+over every `pricing` row plus count / rowid / `ts` / `model_id` / token aggregates of
+the events dated before the plan horizon — the latest first-row `effective_from` of any
+non-family-default prefix (no backfill row can re-price an event at or after its
+prefix's first own row, so later events cannot change a plan). The dashboard recomputes
+it on each `/api/data` (only when a valid, non-empty summary exists) and shows the
+banner's "Backfill available: N bundle(s), <delta> — run
+`/token-telemetry:pricing-update` to review and confirm (plan computed <age>)." line
+only on an exact match: a pricing refresh, an apply, an import or deletion of pre-horizon
+events all hide it until the next plan, while ordinary new capture does not. A missing,
+unreadable, oversized, corrupt, wrongly-typed, symlinked or stale summary yields no
+line, never an error. The dashboard never applies a backfill and offers no control that
+does. **Remote backend:** the plan and apply cover the local DB only, so the remote
+(Supabase) backend cannot supply a plan — the line is always hidden while
+`active_backend` is `supabase`; `supabase/reports.sql` has no counterpart.
+
 **`effective_from = 0` is the seed marker, not a timestamp.** The v0.2.0 migration
 seeds four rows (`claude-fable-`, `claude-opus-`, `claude-sonnet-`, `claude-haiku-`,
 `source='seed-v0.2.0'`) at `effective_from = 0` so they price *all* history until a

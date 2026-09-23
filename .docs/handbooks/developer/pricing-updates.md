@@ -7,7 +7,7 @@ keywords: [pricing, pricing-update, parse_models, build_candidates, immutability
 level: project
 audience: developer
 module: pricing-update
-sources: [scripts/pricing_update.py, commands/pricing-update.md, commands/schedule-pricing.md, docs/TELEMETRY-CONTRACT.md, tests/pricing_golden.py, tests/test_pricing_bounds.py, scripts/dashboard.py, scripts/dashboard.html, tests/test_dashboard_client.py, tests/dashboard_dom_harness.js, tests/test_backfill.py]
+sources: [scripts/pricing_update.py, commands/pricing-update.md, commands/schedule-pricing.md, docs/TELEMETRY-CONTRACT.md, tests/pricing_golden.py, tests/test_pricing_bounds.py, scripts/dashboard.py, scripts/dashboard.html, tests/test_dashboard_client.py, tests/dashboard_dom_harness.js, tests/test_backfill.py, scripts/backfill_summary.py, tests/test_backfill_banner.py]
 related: ["[[capture-pipeline]]", "[[remote-read-parity]]"]
 created: 2026-09-22
 updated: 2026-09-23
@@ -404,6 +404,30 @@ see `commands/schedule-pricing.md`), headless, or no-question-tool run only
 reports "backfill available". Local central DB only — the remote backend's
 pricing is not touched. `tests/test_backfill.py` pins the rules, including
 fault-injected rollback paths.
+
+### Dashboard "backfill available" line (AOS-149)
+
+`scripts/backfill_summary.py` owns a small sidecar, `backfill-plan.json`
+beside the dashboard's DB. `main()`'s `--backfill-plan` branch takes
+`fingerprint()` before and after `backfill_plan()` and, via
+`_cache_plan_summary()`, writes `{version, computedAt, bundles, deltaText,
+fingerprint}` only when both match and the DB is the dashboard's
+(`is_dashboard_db()`); a successful `--backfill-apply` calls
+`_clear_plan_summary()`. Neither touches stdout or the exit code. The writer
+is atomic and symlink-safe (`O_EXCL|O_NOFOLLOW` 0600 temp + `os.replace`, a
+non-regular target refused). `fingerprint()` hashes every pricing row plus
+aggregates of the events before the plan horizon (latest first-row date of
+any non-family-default prefix), so it is cheap and ordinary new capture never
+invalidates it. `dashboard.backfill_line()` → `backfill_summary.banner_line()`
+validates the file strictly (`read()`: size cap, `O_NOFOLLOW`, exact types,
+`DELTA_RE`), recomputes the fingerprint, and returns the pre-formatted line or
+`None` — never raising; always `None` on the supabase backend. It rides in
+`priceWarning.backfill`; `renderPriceWarning()` sets it with `textContent`
+into `#price-warn-backfill-msg` and shows the banner for it alone. Contract:
+docs/TELEMETRY-CONTRACT.md, "Dashboard plan summary". Tests:
+`tests/test_backfill_banner.py` and the node-gated
+`TestBackfillLinePageRender` / backfill cases in
+`tests/test_dashboard_client.py`.
 
 ### Backfill argv validation
 
