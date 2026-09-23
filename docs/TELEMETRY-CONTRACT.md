@@ -402,6 +402,20 @@ rows it should not; `pricing_update.py` refuses on four axes, before any row rea
 database. The first fix shipped had its own bug (F1, found in a later validation pass)
 and has since been corrected — see below.
 
+**Three distinct exit codes, so the command's manual fallback can never bypass a
+bound (AOS-143 correction, F1).** A plain refresh run (no `--backfill-*` flag) ends in
+one of: `EXIT_BOUNDS_REFUSED` (1) — the page read and parsed fine but violated a bound
+below; `EXIT_FETCH_FAILED` (2) — the page (or `--html` file) could not be read at all;
+`EXIT_OTHER_ERROR` (3) — the page read fine but its structure did not parse (layout
+changed, table/column not found) or another unexpected error occurred. The command's
+manual fallback (`commands/pricing-update.md`) runs **only** on `EXIT_FETCH_FAILED` —
+the first fix shipped let a bound refusal (both the rate-bounds and the row-count
+checks below) share the same exit code as a fetch/layout failure, so the fallback's
+own unbounded manual read would run for exactly the pages these bounds exist to
+refuse. A structural parse failure gets its own code too, and also never falls back:
+a page that fetched fine but did not parse as expected cannot be told apart from one
+altered in transit, so it is never handed to the fallback either.
+
 - **Backdated `starting`.** An in-force `starting <d>` row is normally minted dated `d`
   however far back — `starting January 1, 1970` would mint `effective_from = 0`,
   re-pricing that prefix's entire history. The refusal is **per row**, and applies to
@@ -430,25 +444,39 @@ and has since been corrected — see below.
   exist for that prefix, and even when the page also lists an older, refused `starting`
   row for the same version; `INSERT OR IGNORE` keeps a re-run at an already-recorded
   date a no-op. There is no other bound on `starting` dates.
-- **Unbounded rate magnitude.** `money()`'s regex match is deliberately permissive about
-  digit count — a several-hundred-digit rate cell overflows `float()` to `inf` with no
-  exception raised. Every parsed rate is checked: non-finite, over $10,000/MTok, or (for
-  `in_usd`/`out_usd` only — cache rates keep no lower bound) $0 or below, refuses the
-  **whole run** (nothing written, single transaction, exit 2 — the existing
-  fetch/parse-failure code, since the check lives in `parse_models()` before any DB
-  connection is opened). A number immediately followed by an exponent marker (`e`/`E`,
-  optional sign, digits — scientific notation, e.g. `$1e309`) is treated as malformed by
-  `money()` itself and refuses the whole run the same way, rather than silently
-  truncating to its mantissa (`$1e309` used to mint `$1`).
+- **Unbounded rate magnitude, and malformed numeric tokens (AOS-143, corrected).**
+  `money()` matches the WHOLE contiguous `$`-prefixed numeric-ish token (digits, commas,
+  dots, exponent markers, signs) and requires it to be a plain decimal number — ASCII
+  digits with at most one `.` — or refuses. A thousands separator (`$1,500`), more than
+  one decimal point (`$4.00.00`), or any exponent marker, complete (`$1e309`) or dangling
+  after a bare `.` (`$1.e3`), is refused outright rather than silently truncated to its
+  leading digits (`$1,500`/`$1e309`/`$1.e3` used to mint `$1`). A well-formed number that
+  survives that check is still bounded in `parse_models()`: non-finite (a several-hundred-
+  digit rate cell overflows `float()` to `inf` with no exception raised), over
+  $10,000/MTok, or — for `in_usd`/`out_usd` only, cache rates keep no lower bound — under
+  $0.01/MTok. Any of these refuses the **whole run** atomically (nothing written, single
+  transaction, `EXIT_BOUNDS_REFUSED`).
 - **Unbounded row count.** A page listing thousands of model rows would mint thousands
   of candidate pricing rows in one run. More than 500 candidate rows in one run refuses
-  the whole run atomically (nothing planned or applied; exit 1).
-- **Raw page text in error messages.** The two parse-failure messages that embed page
-  text (an unrecognized header, an unparseable rate cell) strip ASCII control characters
-  and DEL, the C1 control range (U+0080-U+009F, including U+0085 NEL and U+009B — the
-  8-bit form of CSI, usable to start a terminal escape sequence without a 7-bit ESC
-  byte), and Unicode bidi-control characters, and cap length, before the message is ever
-  constructed.
+  the whole run atomically (nothing planned or applied; `EXIT_BOUNDS_REFUSED`, the same
+  code the rate-bounds checks above use — both are the script REFUSING a page bound, a
+  different failure mode from either a fetch or a structural parse failure).
+- **Raw page text and fetch-error text in printed messages.** The two parse-failure
+  messages that embed page text (an unrecognized header, an unparseable rate cell), and
+  now `main()`'s fetch-failure message too (its exception text can carry an attacker- or
+  MITM-controlled raw HTTP status line — AOS-143 correction), strip ASCII control
+  characters and DEL, the C1 control range (U+0080-U+009F, including U+0085 NEL and
+  U+009B — the 8-bit form of CSI, usable to start a terminal escape sequence without a
+  7-bit ESC byte), and Unicode bidi-control characters (U+200E LRM, U+200F RLM, U+061C
+  ALM, U+202A-U+202E, U+2066-U+2069 — the first three were missing from the original
+  strip set), and cap length, before the message is ever constructed.
+- **Unbounded per-row warning lines (AOS-143, corrected).** A STALE-PRICE,
+  BACKDATED-STARTING or FUTURE-RATE warning is not a candidate row, so the 500-row cap
+  above does not bound how many of them one run can print — the command prints stdout
+  "verbatim" into the agent's context, so an adversarial or just very large page could
+  otherwise print thousands of warning lines. Each category is capped at 20 lines plus
+  one "... and N more" summary line (`WARNING_CAP`); the rows/family defaults themselves
+  are unaffected.
 
 A model the page does not list is priced by the longest matching prefix, unchanged:
 an unlisted point release of a listed version (e.g. `claude-opus-5-5` while the page

@@ -2,8 +2,8 @@
 doc: Pricing Updates
 type: handbook
 status: active
-summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, minting only the rate in force today per listed version (with warnings for an expired intro or a future-only-newest version), the own-price-vs-estimate definitions, the dashboard's own-price warning banner (AOS-135) that now surfaces them with its node-gated client tests, the consent-gated backfill of estimated events, the narrow exceptions to the pricing table's immutability contract, and the AOS-143 parser bounds (backdated-starting refusal, rate-magnitude and row-count caps, sanitized error text) that keep a hostile or broken page from minting permanent bad rows.
-keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning, future-rate-warning, backdated-starting-warning, parser-bounds, max-rate-usd, max-candidates, dashboard, price-warning-banner, node-gated-tests, require-node, backfill, backfill-plan, backfill-apply]
+summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, minting only the rate in force today per listed version (with warnings for an expired intro or a future-only-newest version), the own-price-vs-estimate definitions, the dashboard's own-price warning banner (AOS-135) that now surfaces them with its node-gated client tests, the consent-gated backfill of estimated events, the narrow exceptions to the pricing table's immutability contract, and the AOS-143 parser bounds (backdated-starting refusal, malformed-token rejection, rate-magnitude/floor and row-count caps, capped per-row warnings, three distinct exit codes so the command's manual fallback can never bypass a bound, sanitized error and fetch-failure text) that keep a hostile or broken page from minting permanent bad rows.
+keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning, future-rate-warning, backdated-starting-warning, parser-bounds, max-rate-usd, min-inout-rate-usd, max-candidates, warning-cap, exit-bounds-refused, exit-fetch-failed, exit-other-error, dashboard, price-warning-banner, node-gated-tests, require-node, backfill, backfill-plan, backfill-apply]
 level: project
 audience: developer
 module: pricing-update
@@ -33,8 +33,9 @@ cache"`, `"cache hits"`, `"output"`). Anthropic's page has shipped the same
 columns under both Title Case ("Base Input Tokens") and sentence case ("Base
 input tokens"); a case-sensitive match failed to find the table at all the
 moment the casing changed on a page that was otherwise unchanged, and the
-script exited 2 (its fetch/parse-failure code) with nothing actually wrong
-with the data.
+script exited with its structural-parse-failure code (`EXIT_OTHER_ERROR`,
+AOS-143 correction — a "table not found" is a parse failure, not a fetch
+one) with nothing actually wrong with the data.
 
 The guard stays strict where it matters: `if set(col) != {"in", "w5", "w1h",
 "cr", "out"}: raise ValueError(...)` still fires when a column is genuinely
@@ -151,41 +152,73 @@ dates: refusing a date earlier than a prefix's latest recorded row would
 refuse every legitimate increase on the run after it arrived, because the
 increase itself recorded that later row.
 
-**Unbounded rate magnitude (`MAX_RATE_USD`, in `parse_models()`).**
-`money()` stays a permissive regex match on purpose — magnitude enforcement
-lives in one place, `parse_models()`, so every caller (including a future
-non-HTML source) shares the same check. A rate cell with several hundred
-digits overflows Python's `float()` to `inf` with **no exception raised**;
-`parse_models()` rejects any rate that is non-finite, exceeds `MAX_RATE_USD`
-($10,000/MTok), or — for `in_usd`/`out_usd` only, cache rates keep no lower
-bound — is $0 or below, for **any** of the five columns. `money()` itself
-also now refuses a number immediately followed by an exponent marker
-(`e`/`E`, optional sign, digits — scientific notation, e.g. `$1e309`) by
-returning `None` (the same as no match) instead of silently truncating to
-its mantissa (`$1e309` used to mint `$1`). Any of these refuses the **whole
-run** — the `ValueError` propagates out of `parse_models` before `main()`
-ever opens the database connection, so nothing is written, and the script
-exits 2 (its existing fetch/parse-failure code).
+**Three distinct exit codes (AOS-143, corrected, F1).** A plain refresh run
+ends in `EXIT_BOUNDS_REFUSED` (1, the page violated a bound below — never
+falls back), `EXIT_FETCH_FAILED` (2, the page/file could not be read at
+all — the ONLY code `commands/pricing-update.md`'s manual fallback runs
+for), or `EXIT_OTHER_ERROR` (3, the page read fine but did not structurally
+parse, or another unexpected error — also never falls back). The first
+AOS-143 fix shipped let a bound refusal share `EXIT_FETCH_FAILED`'s
+predecessor code with a genuine fetch/layout failure, so the command's own
+fallback text — which has none of these bounds — would run for exactly the
+pages the bounds exist to refuse; `main()` now catches `PricingRefused`
+around `parse_models()` itself (not just around `run_update()`'s row-count
+check) so every bound refusal, wherever it is raised, gets the same
+non-falling-back code.
+
+**Unbounded rate magnitude, and malformed numeric tokens (`MAX_RATE_USD`,
+`MIN_INOUT_RATE_USD`, in `parse_models()`; malformed-token rejection in
+`money()` itself, AOS-143 corrected).** `money()` matches the WHOLE
+contiguous `$`-prefixed numeric-ish run (digits, commas, dots, exponent
+markers, signs) and requires it to be a plain decimal number — ASCII digits
+with at most one `.` — raising `PricingRefused` otherwise: a thousands
+separator (`$1,500`), more than one decimal point (`$4.00.00`), or any
+exponent marker, complete (`$1e309`) or dangling after a bare `.`
+(`$1.e3`), used to be silently truncated to its leading digits (minting
+`$1`) instead of refusing the malformed cell outright. A well-formed number
+that survives that check is still bounded in `parse_models()`: a rate cell
+with several hundred digits overflows Python's `float()` to `inf` with **no
+exception raised**; `parse_models()` rejects any rate that is non-finite,
+exceeds `MAX_RATE_USD` ($10,000/MTok), or — for `in_usd`/`out_usd` only,
+cache rates keep no lower bound — is under `MIN_INOUT_RATE_USD`
+($0.01/MTok; the old bound was "$0 or below" only, so a near-zero rate such
+as $0.0000001 still minted). Any of these refuses the **whole run**
+atomically (`PricingRefused`, `EXIT_BOUNDS_REFUSED`) before `main()` ever
+opens the database connection.
 
 **Unbounded row count (`MAX_CANDIDATES`, in `run_update()`).** A page listing
 thousands of rows would mint thousands of candidate pricing rows in one run.
 `run_update()` checks `len(build_candidates(...))` against `MAX_CANDIDATES`
 (500) **before** calling `plan()`/`apply()` — over the cap raises
 `PricingRefused` and nothing is planned or applied. `main()` catches
-`PricingRefused`, prints its message, and exits 1; this is a distinct failure
-mode from the fetch/parse-failure exit 2, since the page parsed fine — the
-result was just too large to trust in one run.
+`PricingRefused`, prints its message, and exits with `EXIT_BOUNDS_REFUSED` —
+the same code the rate-bounds checks above use, since both are the script
+REFUSING a page bound, a different failure mode from either a fetch or a
+structural parse failure.
 
-**Raw page text in error messages (`_safe_error_text()`).** The two
-parse-failure messages that embed page text — "unexpected pricing table
-header" and "unparseable rate cell in row" — used to interpolate the raw
-cell text (and, for the header, a raw Python list of raw cells) directly into
-the exception message that `main()` prints to stderr on a parse failure.
-`_safe_error_text()` strips ASCII control characters and DEL (U+0000-U+001F,
-U+007F), the C1 control range (U+0080-U+009F — including U+0085 NEL and
-U+009B, the 8-bit form of CSI, usable to start a terminal escape sequence
-without a 7-bit `ESC` byte) and Unicode bidi-control characters (which can
-visually reorder or spoof the printed text), then caps the result to 200
+**Unbounded per-row warning lines (`WARNING_CAP`, in `render()`, AOS-143
+corrected).** A STALE-PRICE, BACKDATED-STARTING or FUTURE-RATE warning is
+not a candidate row, so `MAX_CANDIDATES` above does not bound how many of
+them one run can print, and the command prints stdout "verbatim" into the
+agent's context. `_capped_warnings()` renders at most `WARNING_CAP` (20)
+lines per category, plus one "... and N more" summary line when there are
+more — independently for each of the three categories.
+
+**Raw page text and fetch-error text in printed messages
+(`_safe_error_text()`).** The two parse-failure messages that embed page
+text — "unexpected pricing table header" and "unparseable rate cell in
+row" — used to interpolate the raw cell text (and, for the header, a raw
+Python list of raw cells) directly into the exception message that
+`main()` prints to stderr on a parse failure; `main()`'s fetch-failure
+message now goes through the same sanitizer too (AOS-143 correction — its
+exception text can carry an attacker- or MITM-controlled raw HTTP status
+line, e.g. `HTTP/1.1 500 Oops\x1b]0;pwned\x07`). `_safe_error_text()`
+strips ASCII control characters and DEL (U+0000-U+001F, U+007F), the C1
+control range (U+0080-U+009F — including U+0085 NEL and U+009B, the 8-bit
+form of CSI, usable to start a terminal escape sequence without a 7-bit
+`ESC` byte) and Unicode bidi-control characters — U+200E LRM, U+200F RLM,
+U+061C ALM, U+202A-U+202E, U+2066-U+2069 (the first three were missing from
+the original strip set, AOS-143 correction) — then caps the result to 200
 characters — a header row is a Python list, whose `str()` has no length
 limit on its own, so even a single absurdly long or many-celled header
 prints a short, bounded message.

@@ -88,8 +88,42 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-plan
   plan's figure for the same set); exit 1 means nothing was written (its
   output says why). Never write backfill rows by hand.
 
-**Fallback — only when the script exits non-zero** (exit 2 = the page layout
-changed or the fetch failed; its stderr says which). Then do it manually:
+**The plain refresh run above ends in one of three distinct exit codes**
+(AOS-143 correction, F1) — check which one before doing anything else:
+
+- **exit 2 — fetch failed** (network down, timeout, HTTP error; stderr says
+  which). This is the **ONLY** code that reaches the fallback below.
+- **exit 1 — REFUSED** (the page read and parsed fine but violated a parser
+  bound: a malformed or out-of-range rate, or over 500 candidate rows in one
+  run; stdout says which). **Report the REFUSED message verbatim and STOP —
+  never run the fallback for this.** The bound exists precisely so a bad or
+  hostile page cannot mint a permanent bad row; the fallback below has none
+  of these bounds, so falling back here would defeat the bound entirely.
+- **exit 3 — other error** (the page fetched fine but its structure did not
+  parse as expected — table/column not found, or an unexpected error;
+  stderr says which). **Report it verbatim and STOP — never run the fallback
+  for this either.** A page whose structure changed unexpectedly cannot be
+  told apart from one that was altered in transit, so it is never handed to
+  the fallback's unbounded manual read.
+
+**Fallback — only on exit 2 (fetch failed).** Then do it manually, applying
+every one of the script's own bounds by hand — never insert a row the script
+itself would refuse:
+
+- A rate must be a **plain decimal number**, e.g. `$3`, `$3.75`, `$0.30`,
+  `$0.08` — never a thousands separator (`$1,500`), more than one decimal
+  point (`$4.00.00`), or scientific notation (`$1e309`, `$1.e3`).
+- `in_usd`/`out_usd` must be **between $0.01 and $10,000 per MTok inclusive**
+  (cache rates keep no floor, same $10,000 ceiling).
+- A `starting <date>` row may be recorded **only if `<date>` is within the
+  last 365 days** (today inclusive) — an older scheduled-increase date is
+  never recorded by hand either.
+- Mint **at most 500 rows** in one run, total, across every family and
+  version.
+
+If any published rate or date would violate one of these, do not insert
+anything for it — report it as refused, the same way the script would, and
+move on to the rest of the page.
 
 1. Fetch **https://platform.claude.com/docs/en/about-claude/pricing** and read
    per-million-token rates for **ALL published model families** (not just
