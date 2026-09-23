@@ -215,10 +215,19 @@ function snapGroup(key) {
 function snapshot(label, error) {
   const msg = byId.get("price-warn-msg");
   const modal = byId.get("conn-modal");
+  const head = byId.get("price-warn-head");
+  const bf = byId.get("price-warn-backfill"), bfMsg = byId.get("price-warn-backfill-msg");
   return {
     label, error: error || null,
     boxHidden: bannerRoot.hidden,
+    headHidden: head ? head.hidden : null,
     msg: msg ? msg.textContent : null,
+    // AOS-149 "backfill available" line
+    backfill: {
+      hidden: bf ? bf.hidden : null,
+      text: bfMsg ? bfMsg.textContent : null,
+      elementChildren: bfMsg ? bfMsg.childElementCount : null,
+    },
     estimated: snapGroup("estimated"),
     unpriced: snapGroup("unpriced"),
     // every shipped banner node still attached to its shipped parent

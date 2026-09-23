@@ -49,6 +49,11 @@ argparse mutually-exclusive group — so a pre-approved `--html ...` prefix
 match can never reach a backfill apply or plan, regardless of what other
 flags precede or follow it.
 
+A `--backfill-plan` run over the dashboard's own DB also caches a tiny summary
+of the plan (bundle count, combined delta, computed-at, fingerprint) for the
+dashboard's own-price banner, and a successful `--backfill-apply` clears it —
+see `scripts/backfill_summary.py`. Neither changes stdout or the exit code.
+
 Backend seam: DB work goes through capture.connect() (the schema owner);
 parsing and planning are pure functions over plain data, reusable unchanged
 when other database backends arrive.
@@ -1699,6 +1704,78 @@ def backfill_apply(conn, prefixes, today):
     return "\n".join(out)
 
 
+# ------------------------------------------------- dashboard plan summary
+#
+# The dashboard's own-price banner shows a one-line "backfill available" note
+# from a cached summary of the last plan (AOS-149, scripts/backfill_summary.py)
+# instead of computing a plan on page load. The cache is best-effort: it never
+# changes this script's stdout or exit code, and any failure only leaves the
+# dashboard without the line.
+
+def _summary_fingerprint(conn):
+    """:func:`backfill_summary.fingerprint` of ``conn``, or ``None`` on any
+    error (the summary is then simply not written)."""
+    try:
+        import backfill_summary
+        return backfill_summary.fingerprint(conn)
+    except Exception:   # noqa: BLE001 - best-effort cache, never fatal
+        return None
+
+
+def _cache_plan_summary(db, plan_, fp_before, fp_after, computed_at=None):
+    """Write the dashboard's plan summary for a ``--backfill-plan`` run.
+
+    Written only when the plan ran against the dashboard's own DB
+    (``capture.db_path()``) and the DB state did not change while the plan
+    was computing (``fp_before == fp_after``, both non-``None``) — a summary
+    is never keyed to a fingerprint the plan did not actually see. A write
+    failure prints one note to stderr and is otherwise ignored.
+
+    :param db: the DB path the plan ran against.
+    :param plan_: :func:`backfill_plan` output.
+    :param fp_before: fingerprint taken just before the plan.
+    :param fp_after: fingerprint taken just after the plan.
+    :param computed_at: epoch seconds to stamp (default: now).
+    :returns: ``True`` when the summary was written.
+    """
+    try:
+        import backfill_summary
+        if fp_before is None or fp_before != fp_after:
+            return False
+        if not backfill_summary.is_dashboard_db(db):
+            return False
+        comb = plan_.get("combined")
+        delta = (_usd_change(comb["cost_now"], comb["cost_after"])[2]
+                 if comb is not None else None)
+        at = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp()
+                 if computed_at is None else computed_at)
+        backfill_summary.write(backfill_summary.summarize(plan_, delta),
+                               fp_before, at)
+        return True
+    except Exception as exc:   # noqa: BLE001 - best-effort cache
+        print("note: the dashboard's backfill summary was not updated"
+              f" ({type(exc).__name__}).", file=sys.stderr)
+        return False
+
+
+def _clear_plan_summary(db):
+    """Remove the dashboard's plan summary after a successful
+    ``--backfill-apply`` on the dashboard's own DB (the applied rows change
+    the pricing table, so the old summary no longer describes it). Never
+    raises.
+
+    :param db: the DB path the apply ran against.
+    :returns: ``True`` when a summary file was removed.
+    """
+    try:
+        import backfill_summary
+        if not backfill_summary.is_dashboard_db(db):
+            return False
+        return backfill_summary.clear()
+    except Exception:   # noqa: BLE001 - best-effort cache
+        return False
+
+
 def _fetch_page(url, timeout_s=FETCH_TIMEOUT_S, max_bytes=FETCH_MAX_BYTES):
     """Fetch ``url`` under a hard wall-clock deadline covering connect AND
     the full body read together, with a hard cap on the response body size
@@ -2020,13 +2097,16 @@ def main(argv=None):
         import storage
         conn = storage.LocalSqliteBackend(db).open_ro()
         try:
+            fp_before = _summary_fingerprint(conn)
             p = backfill_plan(conn, today)
+            fp_after = _summary_fingerprint(conn)
         finally:
             conn.close()
         if args.json:
             print(json.dumps(_json_plan(p), indent=2, sort_keys=True))
         else:
             print(render_backfill_plan(p))
+        _cache_plan_summary(db, p, fp_before, fp_after)
         return 0
     if args.backfill_apply:
         conn = capture.connect(db)
@@ -2037,6 +2117,7 @@ def main(argv=None):
             return 1
         finally:
             conn.close()
+        _clear_plan_summary(db)
         return 0
     # Fetching (network, or --html file for tests) is kept in its own try
     # block, distinct from parsing below (AOS-143 correction, F1): a fetch

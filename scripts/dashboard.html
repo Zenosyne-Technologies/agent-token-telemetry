@@ -141,8 +141,10 @@
     border-radius:14px;background:var(--panel-2);border:1px solid var(--panel-brd);
     color:var(--ink-2);font-size:.86rem;}
   .price-warn:not([hidden]){display:flex;}
-  .price-warn-head{display:flex;align-items:flex-start;gap:10px;}
+  .price-warn-head{align-items:flex-start;gap:10px;}
+  .price-warn-head:not([hidden]){display:flex;}
   .price-warn-dot{width:8px;height:8px;border-radius:50%;background:var(--warn);flex:0 0 auto;margin-top:6px;}
+  .price-warn-dot.backfill{background:var(--accent-2);}
   .price-warn code{background:var(--track);padding:1px 6px;border-radius:6px;
     font-family:var(--font-mono);font-size:.85em;}
   .price-warn-group{flex-direction:column;gap:4px;}
@@ -409,13 +411,20 @@
          renderPriceWarning()). All display text is pre-formatted server-side;
          the renderer only builds DOM nodes via createElement/textContent —
          no innerHTML anywhere in this element's subtree. Stays empty and
-         hidden when every logged model has its own price; the empty path
-         never removes any of these shipped nodes, only clears each list's
-         rows and re-hides, so it stays correct across repeated refreshes. -->
+         hidden when every logged model has its own price and no backfill is
+         available; the empty path never removes any of these shipped nodes,
+         only clears each list's rows and re-hides, so it stays correct
+         across repeated refreshes. #price-warn-backfill (AOS-149) is the
+         optional "backfill available" line from the cached plan summary —
+         text only; the dashboard never applies a backfill. -->
     <div class="price-warn" id="price-warn" hidden role="note" aria-live="polite">
-      <div class="price-warn-head">
+      <div class="price-warn-head" id="price-warn-head">
         <span class="price-warn-dot" aria-hidden="true"></span>
         <span id="price-warn-msg"></span>
+      </div>
+      <div class="price-warn-head" id="price-warn-backfill" hidden>
+        <span class="price-warn-dot backfill" aria-hidden="true"></span>
+        <span id="price-warn-backfill-msg"></span>
       </div>
       <div class="price-warn-group" id="price-warn-estimated" hidden>
         <h4 class="price-warn-subhead" id="price-warn-estimated-head"></h4>
@@ -817,8 +826,8 @@
 
   // ---- own-price warning (AOS-135 S3) ----
   // Every string here (heading, group labels, per-model event/date/cost
-  // text) is pre-formatted server-side by dashboard.py's
-  // build_price_warning() — this function does no arithmetic and no string
+  // text, and the optional AOS-149 backfill line) is pre-formatted
+  // server-side by dashboard.py's build_price_warning() — this function does no arithmetic and no string
   // formatting, only DOM construction. Every node is built with
   // createElement + textContent, never innerHTML / insertAdjacentHTML /
   // outerHTML / document.write, so a hostile model name can never be
@@ -858,14 +867,22 @@
     const box=$("price-warn");
     const est=(pw && pw.estimated) || [];
     const unp=(pw && pw.unpriced) || [];
+    // AOS-149: the "backfill available" line, a server-formatted string or
+    // null; anything else renders as no line. Text only — the dashboard only
+    // names the command, it never applies a backfill.
+    const bf=(pw && typeof pw.backfill==="string") ? pw.backfill : "";
     renderGroup("price-warn-estimated","price-warn-estimated-list","price-warn-estimated-head", pw&&pw.estimatedHeading, est);
     renderGroup("price-warn-unpriced","price-warn-unpriced-list","price-warn-unpriced-head", pw&&pw.unpricedHeading, unp);
-    if(!est.length && !unp.length){
+    $("price-warn-backfill-msg").textContent=bf;
+    $("price-warn-backfill").hidden=!bf;
+    const listed=est.length>0 || unp.length>0;
+    $("price-warn-head").hidden=!listed;
+    if(!listed && !bf){
       box.hidden=true;
       $("price-warn-msg").textContent="";
       return;
     }
-    $("price-warn-msg").textContent = `${pw.heading} ${pw.note}`;
+    $("price-warn-msg").textContent = listed ? `${pw.heading} ${pw.note}` : "";
     box.hidden=false;
   }
 

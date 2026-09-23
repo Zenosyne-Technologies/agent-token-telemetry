@@ -35,6 +35,7 @@ from urllib.parse import urlparse, parse_qs
 import sqlite3
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import backfill_summary
 import capture
 import report
 import settings
@@ -336,7 +337,33 @@ def _warn_events(n):
     return f"{n} event" if n == 1 else f"{n} events"
 
 
-def build_price_warning(detail):
+def backfill_line(conn, now):
+    """The own-price banner's "backfill available" line (AOS-149), or ``None``.
+
+    Read from the cached plan summary ``pricing_update.py --backfill-plan``
+    writes (:func:`backfill_summary.banner_line`) — never a plan computed
+    here, which can take tens of seconds. Shown only when that summary is
+    valid, offers at least one bundle, and its fingerprint still matches this
+    DB's pricing table and plan-relevant events; a missing, corrupt or stale
+    summary yields ``None`` (no line, never an error). Always ``None`` while
+    the remote (Supabase) backend is active: the backfill plan and apply work
+    on the local DB only (docs/TELEMETRY-CONTRACT.md §Pricing table, "Third
+    narrow case"), so this line is not offered for the remote store.
+
+    The dashboard only reports that a backfill is available and names the
+    command; it never applies one (the apply stays behind the interactive
+    ``/token-telemetry:pricing-update`` flow and its permission prompt).
+
+    :param conn: read-only connection to the dashboard's DB.
+    :param now: current epoch seconds.
+    :returns: the pre-formatted line, or ``None``.
+    """
+    if _active_backend() == "supabase":
+        return None
+    return backfill_summary.banner_line(conn, now)
+
+
+def build_price_warning(detail, backfill=None):
     """Server-formatted content for the dashboard's own-price warning banner
     (AOS-135 S3). Takes :func:`fetch_price_warning`'s per-model rows and
     returns only ready-to-show strings, plus the two-group split the banner
@@ -358,11 +385,18 @@ def build_price_warning(detail):
     covers: ``"$2.70 for 1 priced event; 2 unpriced, not counted"``, so the
     unpriced events are never silently summed as $0.
 
+    The banner may also carry one pre-formatted ``backfill`` line
+    (:func:`backfill_line`, AOS-149); it shows even when no model is listed,
+    since a backfill is offered precisely for models that now DO have their
+    own price.
+
     :param detail: :func:`fetch_price_warning`'s return value.
+    :param backfill: the "backfill available" line, or ``None`` for none.
     :returns: ``{heading, note, estimatedHeading, unpricedHeading, estimated,
-        unpriced}`` — ``estimated``/``unpriced`` are lists of ``{model,
-        modelName, eventsText, dateRangeText, costText}``; both empty when
-        ``detail`` is empty (the banner then stays hidden).
+        unpriced, backfill}`` — ``estimated``/``unpriced`` are lists of
+        ``{model, modelName, eventsText, dateRangeText, costText}``;
+        ``backfill`` is a string or ``None``. The banner stays hidden when
+        both lists are empty and ``backfill`` is ``None``.
     """
     estimated, unpriced = [], []
     for it in detail:
@@ -392,6 +426,7 @@ def build_price_warning(detail):
         "unpricedHeading": "No price at all",
         "estimated": estimated,
         "unpriced": unpriced,
+        "backfill": backfill if isinstance(backfill, str) and backfill else None,
     }
 
 
@@ -652,7 +687,9 @@ def build_data(conn, q):
         # build_price_warning().
         "modelsWithoutOwnPrice": models_without_own_price,
         "modelsWithoutOwnPriceDetail": price_warning_detail,
-        "priceWarning": build_price_warning(price_warning_detail),
+        # backfill (AOS-149): the cached-plan "backfill available" line.
+        "priceWarning": build_price_warning(price_warning_detail,
+                                            backfill_line(conn, now)),
         "generatedAt": now,
     }
 

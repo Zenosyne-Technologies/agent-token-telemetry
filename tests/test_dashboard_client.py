@@ -170,6 +170,30 @@ SEQUENCE = [("empty", PW_EMPTY), ("full", PW_FULL), ("empty", PW_EMPTY),
 
 CELL_CLASSES = ["price-warn-model", "price-warn-id", "", "", ""]
 
+# AOS-149: the "backfill available" line, as dashboard.backfill_line formats it.
+BF = ("Backfill available: 2 bundles, -$272.46 — run "
+      "/token-telemetry:pricing-update to review and confirm (plan computed "
+      "3 hours ago).")
+PW_BF_ONLY = dashboard.build_price_warning([], BF)
+PW_FULL_BF = dashboard.build_price_warning(EST + UNP, BF)
+BF_SEQUENCE = [("empty", PW_EMPTY), ("backfill-only", PW_BF_ONLY),
+               ("full+backfill", PW_FULL_BF), ("full", PW_FULL),
+               ("backfill-only", PW_BF_ONLY), ("empty", PW_EMPTY),
+               ("estimated+backfill", dashboard.build_price_warning(EST, BF))]
+
+
+def assert_backfill_state(tc, snap, pw, where):
+    """The backfill line shows exactly ``pw["backfill"]`` as plain text
+    (no element children) when it is a non-empty string, and is hidden and
+    empty otherwise; the model-list head is hidden when no model is listed."""
+    bf = pw.get("backfill") if isinstance(pw.get("backfill"), str) else None
+    listed = bool(pw.get("estimated")) or bool(pw.get("unpriced"))
+    tc.assertEqual(snap["backfill"]["hidden"], not bf, f"{where}: backfill visibility")
+    tc.assertEqual(snap["backfill"]["text"], bf or "", f"{where}: backfill text")
+    tc.assertEqual(snap["backfill"]["elementChildren"], 0,
+                   f"{where}: backfill line holds markup, not text")
+    tc.assertEqual(snap["headHidden"], not listed, f"{where}: model-list head visibility")
+
 
 def expected_rows(items):
     """What each ``<li>`` must hold: five text-only spans in this order."""
@@ -196,8 +220,13 @@ class TestPriceWarningRendererBehaviour(_NodeTestCase):
         self.assertTrue(snap["structureIntact"],
                         f"{where}: a shipped #price-warn node was removed")
         est, unp = pw["estimated"], pw["unpriced"]
-        if not est and not unp:
+        assert_backfill_state(self, snap, pw, where)
+        bf = pw.get("backfill") if isinstance(pw.get("backfill"), str) else None
+        if not est and not unp and not bf:
             self.assertTrue(snap["boxHidden"], f"{where}: banner shown when empty")
+            self.assertEqual(snap["msg"], "", where)
+        elif not est and not unp:
+            self.assertFalse(snap["boxHidden"], f"{where}: backfill-only banner hidden")
             self.assertEqual(snap["msg"], "", where)
         else:
             self.assertFalse(snap["boxHidden"], f"{where}: banner hidden")
@@ -235,6 +264,31 @@ class TestPriceWarningRendererBehaviour(_NodeTestCase):
         ids = [r["cells"][1]["text"] for r in snap["unpriced"]["rows"]]
         for h in HOSTILE:
             self.assertIn(h, ids)
+
+    def test_backfill_line_sequence(self):
+        # AOS-149: shown alone (no model listed), alongside the lists, and
+        # hidden again, across repeated renders of the same shipped nodes.
+        out = run_harness({"mode": "direct", "steps": [pw for _, pw in BF_SEQUENCE]})
+        self.assertEqual(len(out["snapshots"]), len(BF_SEQUENCE))
+        for snap, (name, pw) in zip(out["snapshots"], BF_SEQUENCE):
+            self.assert_state(snap, name, pw)
+
+    def test_backfill_line_hostile_text_renders_as_exact_text(self):
+        steps = [dashboard.build_price_warning(UNP, h) for h in HOSTILE]
+        out = run_harness({"mode": "direct", "steps": steps})
+        for snap, pw, h in zip(out["snapshots"], steps, HOSTILE):
+            self.assert_state(snap, "hostile backfill", pw)
+            self.assertEqual(snap["backfill"]["text"], h)
+
+    def test_backfill_non_string_renders_no_line(self):
+        steps = [dict(PW_EMPTY, backfill=v) for v in (123, {"x": 1}, ["a"], True, "")]
+        out = run_harness({"mode": "direct", "steps": steps})
+        for snap in out["snapshots"]:
+            self.assertIsNone(snap["error"])
+            self.assertEqual(snap["violations"], [])
+            self.assertTrue(snap["boxHidden"])
+            self.assertTrue(snap["backfill"]["hidden"])
+            self.assertEqual(snap["backfill"]["text"], "")
 
     def test_mixed_model_row_says_what_its_cost_covers(self):
         out = run_harness({"mode": "direct", "steps": [PW_EST]})
@@ -342,6 +396,122 @@ class TestDashboardPageRender(_NodeTestCase):
         self.assertTrue(any("innerHTML write on #price-warn" in v for v in out["violations"]),
                         out["violations"])
         self.assertTrue(any(s["modalShown"] for s in out["snapshots"]))
+
+
+class TestBackfillLinePageRender(_NodeTestCase):
+    """AOS-149, end to end: a real ``pricing_update.py --backfill-plan`` run
+    writes the plan summary next to a fixture DB whose model, agent and
+    project names are hostile; ``dashboard.build_data`` then produces the
+    ``/api/data`` payload for each cache state — present, absent, stale
+    (a pricing row added after the plan) and corrupt — and the page's own
+    ``load()`` -> ``renderAll()`` renders them in sequence under the throwing
+    fake DOM. The line must appear only when the summary is present and
+    fresh, as literal text, and no state may raise into the "Connection
+    lost" modal."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        import contextlib
+        import io
+        from unittest import mock
+        import backfill_summary
+        import pricing_update
+        tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmp.cleanup)
+        db = pathlib.Path(tmp.name) / "usage.db"
+        env = mock.patch.dict(os.environ, {"TOKEN_TELEMETRY_DB": str(db)})
+        env.start()
+        cls.addClassCleanup(env.stop)
+        now = int(time.time())
+
+        def ins(model, ts, mid, project="/proj", agent=None):
+            conn = capture.connect(db)
+            groups = capture.aggregate([entry(
+                model=model, inp=100000, out=20000, cr=50000, cw=10000,
+                cw1h=4000, mid=mid,
+                ts=time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(ts)))])
+            with conn:
+                capture.insert_events(conn, project, "s1", 0, agent, groups)
+            conn.close()
+
+        def price(prefix, eff):
+            conn = capture.connect(db)
+            with conn:
+                conn.execute(
+                    "INSERT INTO pricing(provider, model_prefix, in_usd, out_usd,"
+                    " cache_r_usd, cache_w_usd, cache_w_1h_usd, effective_from,"
+                    " source) VALUES ('anthropic',?,4,20,0.4,5,8,?,'test')",
+                    (prefix, eff))
+            conn.close()
+
+        # claude-opus-5-5 ran at the family-default estimate before its own
+        # row existed -> one offerable bundle; hostile names stay unpriced.
+        ins("claude-opus-5-5", now - 3 * 86400, "a", agent=HOSTILE[3])
+        ins("claude-opus-5-5", now - 3 * 86400 + 60, "a2")
+        price("claude-opus-5-5", now - 86400)
+        for i, h in enumerate(HOSTILE):
+            ins(h, now - 100 - i, f"h{i}", agent=h, project=f"/p/{h}")
+
+        def payload():
+            ro = dashboard.sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            ro.row_factory = dashboard.sqlite3.Row
+            try:
+                return dashboard.build_data(ro, {"period": ["week"]})
+            finally:
+                ro.close()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert pricing_update.main(["--backfill-plan"]) == 0
+        cache = backfill_summary.cache_path()
+        assert cache.parent == pathlib.Path(tmp.name), cache
+        saved = cache.read_bytes()
+        cls.present = payload()
+        cache.unlink()
+        cls.absent = payload()
+        cache.write_bytes(b'{"version": 1, "bundles": "<img src=x>"')
+        cls.corrupt = payload()
+        cache.write_bytes(saved)
+        price("claude-sonnet-5", now - 60)
+        cls.stale = payload()
+        assert isinstance(cls.present["priceWarning"]["backfill"], str), cls.present
+        assert cls.present["priceWarning"]["unpriced"], cls.present
+
+    def test_present_absent_stale_corrupt_sequence(self):
+        seq = [("present", self.present), ("absent", self.absent),
+               ("present", self.present), ("stale", self.stale),
+               ("corrupt", self.corrupt), ("present", self.present)]
+        out = run_harness({"mode": "page", "steps": [p for _, p in seq]})
+        self.assertEqual(out["violations"], [])
+        self.assertEqual(len(out["snapshots"]), len(seq))
+        for snap, (name, p) in zip(out["snapshots"], seq):
+            where = f"{snap['label']} ({name})"
+            self.assertFalse(snap["modalShown"], f"{where}: -> 'Connection lost'")
+            self.assertTrue(snap["structureIntact"], where)
+            pw = p["priceWarning"]
+            assert_backfill_state(self, snap, pw, where)
+            if name == "present":
+                self.assertTrue(snap["backfill"]["text"].startswith(
+                    "Backfill available: 1 bundle, -$"), snap["backfill"])
+                self.assertIn("/token-telemetry:pricing-update", snap["backfill"]["text"])
+            else:
+                self.assertIsNone(pw["backfill"], name)
+                self.assertTrue(snap["backfill"]["hidden"], where)
+            ids = {r["cells"][1]["text"] for r in snap["unpriced"]["rows"]}
+            for h in HOSTILE:
+                self.assertIn(h, ids, where)
+
+    def test_guard_is_live_backfill_line_via_innerHTML_is_caught(self):
+        # Negative control: render the line through innerHTML instead of
+        # textContent — the throwing fake DOM must catch it.
+        src = DASHBOARD_HTML.read_text()
+        needle = '$("price-warn-backfill-msg").textContent=bf;'
+        self.assertEqual(src.count(needle), 1)
+        out = run_harness({"mode": "page", "steps": [self.present]},
+                          src.replace(needle, '$("price-warn-backfill-msg").innerHTML=bf;'))
+        self.assertTrue(any("innerHTML write on #price-warn-backfill-msg" in v
+                            for v in out["violations"]), out["violations"])
+        self.assertTrue(out["snapshots"][0]["modalShown"])
 
 
 class TestBannerCostMatchesPageFormatter(_NodeTestCase):
