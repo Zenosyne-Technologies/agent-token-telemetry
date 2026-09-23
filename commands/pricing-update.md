@@ -1,6 +1,6 @@
 ---
 description: Refresh the pricing table from Anthropic's currently published rates
-allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py":*), WebFetch, AskUserQuestion
+allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py"), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-plan:*), WebFetch, AskUserQuestion
 argument-hint: "[--unattended]"
 ---
 
@@ -68,6 +68,15 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-plan
   ```
   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-apply 'claude-opus-5' 'claude-opus-5-5'
   ```
+
+  `--backfill-apply` is deliberately **not** in this command's `allowed-tools`
+  — only the plain refresh and `--backfill-plan` are pre-approved. Running
+  this line always raises Claude Code's own permission prompt, which the
+  user must approve in THIS session before anything runs; that is a second,
+  harness-enforced gate on top of the question above, independent of this
+  file's text. An unattended or headless run never reaches it: it never
+  reaches this step at all (see "Unattended run" above), and even if it
+  somehow did, the prompt auto-denies with no one present to approve it.
 
   Never pass a prefix that is not exactly `claude-<family>-<version>` (e.g.
   `claude-opus-5-5`) or a legacy alias the table itself shows — the script

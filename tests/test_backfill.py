@@ -961,6 +961,42 @@ class TestApplyArgumentShape(Base):
         self.assertEqual(code, 1, out)   # well-formed, just not a candidate
 
 
+class TestBackfillApplyOptionInjection(Base):
+    """AOS-136 F1: an option-shaped token after ``--backfill-apply`` must
+    never reach argparse's own option parser. Before the fix, argparse's
+    ``nargs="+"`` handed any ``-``-prefixed (or, via abbreviation matching,
+    shortened-flag) token to its own parser before the prefix shape was ever
+    checked — redirecting the write to a second ``--db``, switching mode
+    (``--backfill-plan``, ``-h``), or exiting 0 with nothing rejected. Every
+    one of these must now be refused, by position, with exit 2, before any
+    DB — the target one or the one named by the injected value — is ever
+    opened."""
+
+    def setUp(self):
+        super().setUp()
+        self.f.price("claude-opus-", FAM_OPUS, D - 30 * DAY)
+        self.f.price("claude-opus-5-5", OPUS_55, D + DAY)
+        self.f.event("claude-opus-5-5", D + 60)
+
+    def test_option_shaped_tokens_after_backfill_apply_are_rejected(self):
+        other = pathlib.Path(self.f.tmp.name) / "other.db"
+        before = (self.f.digest(), self.f.pricing_rows())
+        for tail in ("--db=" + str(other), "--d=" + str(other),
+                     "--backfill-plan", "-h", "-x"):
+            with self.subTest(tail=tail):
+                code, out = self.f.cli("--backfill-apply",
+                                       "claude-opus-5-5", tail)
+                self.assertEqual(code, 2, out)
+                self.assertIn("rejected --backfill-apply argument(s) #2",
+                              out)
+                self.assertFalse(other.exists(), tail)
+                self.assertEqual((self.f.digest(), self.f.pricing_rows()),
+                                 before, tail)
+        # the well-formed prefix alone still applies afterwards
+        code, out = self.f.cli("--backfill-apply", "claude-opus-5-5")
+        self.assertEqual(code, 0, out)
+
+
 class TestBundleClosure(Base):
     """F2/F3 pinned on the shared-prefix fixture: backfilling the
     predecessor alone would leave the successor's event on an ANCESTOR row

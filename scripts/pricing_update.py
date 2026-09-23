@@ -15,7 +15,12 @@ re-price) and `--backfill-apply PREFIX...` applies the user-confirmed prefixes
 — contract §Pricing table, "Third narrow case" (consent-gated backfill). Neither
 fetches the page. `--backfill-apply` exits 2, touching nothing, when any
 argument is not a well-formed pricing prefix (:func:`is_pricing_prefix`), and 1
-when the apply is refused or rolled back (nothing written).
+when the apply is refused or rolled back (nothing written). `--backfill-apply`
+consumes every remaining raw argument as a candidate prefix (validated before
+argument parsing even runs — see :func:`_reject_option_shaped_backfill_apply`),
+so `--db`/`--html` MUST be given before `--backfill-apply` on the command line;
+anything after it that is not a well-formed prefix, including another flag,
+is rejected by position, never echoed.
 
 Backend seam: DB work goes through capture.connect() (the schema owner);
 parsing and planning are pure functions over plain data, reusable unchanged
@@ -1226,8 +1231,76 @@ def backfill_apply(conn, prefixes, today):
     return "\n".join(out)
 
 
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """``argparse.ArgumentParser`` whose ``error()`` strips ASCII control
+    characters (e.g. a raw ESC byte) out of argparse's own error message
+    before printing it, so a hostile argv token cannot inject terminal
+    escape sequences into stderr. Mirrors the base implementation otherwise
+    (usage to stderr, then exit 2).
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        clean = _CONTROL_CHAR_RE.sub("", message)
+        self.exit(2, f"{self.prog}: error: {clean}\n")
+
+
+def _reject_option_shaped_backfill_apply(argv):
+    """Defence in depth against option injection: reject any raw argv token
+    after ``--backfill-apply`` that is not a well-formed pricing prefix,
+    BEFORE argparse ever runs. ``--backfill-apply`` uses ``nargs="+"``, so
+    without this guard argparse hands any ``-``-prefixed token (or, with
+    abbreviation matching, a shortened flag) to its own option parser first
+    — e.g. ``--backfill-apply claude-opus-5-5 --db=other.db`` would redirect
+    the write to ``other.db`` instead of being rejected. Because argparse
+    consumes every following token as a value once it sees
+    ``--backfill-apply``, ``--db``/``--html`` must be given BEFORE it on the
+    command line.
+
+    :param argv: the raw argument list, before ``argparse.parse_args``.
+    :returns: the 1-based positions (within the arguments following
+        ``--backfill-apply``) of every offending token, or ``None`` when
+        ``--backfill-apply`` is absent or every following token is a
+        well-formed prefix.
+    """
+    if "--backfill-apply" not in argv:
+        return None
+    start = argv.index("--backfill-apply") + 1
+    bad = [i for i, tok in enumerate(argv[start:], 1)
+           if not is_pricing_prefix(tok)]
+    return bad or None
+
+
+def _backfill_apply_refusal(positions):
+    """The REFUSED message for malformed ``--backfill-apply`` arguments,
+    naming only their position — the value itself is never echoed back.
+
+    :param positions: 1-based positions of the offending arguments.
+    :returns: the report line to print.
+    """
+    return ("Backfill REFUSED — nothing written: rejected"
+            " --backfill-apply argument(s) "
+            + ", ".join(f"#{i}" for i in positions) + " — not a pricing"
+            " prefix (expected claude-<family>-<version>, e.g."
+            " claude-opus-5-5).")
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="pricing_update.py")
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    # Validate BEFORE argparse ever runs: argparse would otherwise hand any
+    # option-shaped token following --backfill-apply (or, via abbreviation
+    # matching, a shortened flag) to its own parser first, redirecting the
+    # write or switching modes (--db=, --d=, --backfill-plan, -h) instead of
+    # being rejected as a malformed prefix. Nothing is opened here.
+    bad = _reject_option_shaped_backfill_apply(raw_argv)
+    if bad:
+        print(_backfill_apply_refusal(bad))
+        return 2
+
+    ap = _ArgumentParser(prog="pricing_update.py", allow_abbrev=False)
     ap.add_argument("--db", default=None)
     ap.add_argument("--html", default=None,
                     help="parse a local HTML file instead of fetching (tests)")
@@ -1237,20 +1310,17 @@ def main(argv=None):
                     help="with --backfill-plan: machine-readable JSON")
     ap.add_argument("--backfill-apply", nargs="+", metavar="PREFIX",
                     help="insert the backfill row for each confirmed prefix"
-                         " (all-or-nothing; re-plans first)")
+                         " (all-or-nothing; re-plans first; --db/--html must"
+                         " be given BEFORE this flag)")
     args = ap.parse_args(argv)
     if args.backfill_apply:
-        # defence in depth, before the DB is opened: only the strict prefix
-        # shape the parser mints may ever reach an apply. The offending value
-        # is identified by position, never echoed back.
+        # Second layer, defence in depth, before the DB is opened: only the
+        # strict prefix shape the parser mints may ever reach an apply. The
+        # offending value is identified by position, never echoed back.
         bad = [i for i, p in enumerate(args.backfill_apply, 1)
                if not is_pricing_prefix(p)]
         if bad:
-            print("Backfill REFUSED — nothing written: rejected"
-                  " --backfill-apply argument(s) "
-                  + ", ".join(f"#{i}" for i in bad) + " — not a pricing"
-                  " prefix (expected claude-<family>-<version>, e.g."
-                  " claude-opus-5-5).")
+            print(_backfill_apply_refusal(bad))
             return 2
     db = args.db or capture.db_path()
     if not Path(db).exists():
