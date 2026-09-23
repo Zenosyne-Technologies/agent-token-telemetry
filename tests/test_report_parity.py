@@ -1187,6 +1187,227 @@ class TestPostgresEstimateRls(unittest.TestCase):
         self.assertNotIn("s-x1", event_sessions)   # OWNER2's intruder session
 
 
+ROLE_OWNER = "44444444-4444-4444-8444-444444444444"
+ROLE_MODELS = {
+    "O": "claude-opus-5-5", "S": "claude-sonnet-5",
+    "H": "claude-haiku-4-5-20251001", "F": "claude-fable-5-1",
+    "G": "gpt-4o",
+}
+
+# ---------------------------------------------------------------------------
+# Role-rule fixture (AOS-141 F3): one event per branch of tier_case/rung_case
+# — the SAME rule docs/TELEMETRY-CONTRACT.md's "Tier mapping" and the kit's
+# token-economics.md describe — each with a DISTINCT out_tok, so a wrong
+# tier/rung bucket total in either dialect pinpoints exactly which row
+# misclassified (see role_expected_totals). Covers: the main session (kind=0,
+# agent NULL); every named marvin:* persona (heavy/ladder/small/micro),
+# including validator-foo (an unnamed validator-* suffix) and
+# escalation-bogus (an unnamed escalation-* suffix, so 'ladder' with no
+# rung); the four named escalation rungs; an unnamed agent on each model
+# family, including a non-claude model (unknown); kind=0 WITH a named agent
+# (must NOT read 'orchestrator' — that needs agent IS NULL too). Loaded
+# through the REAL RPC (report_token_stats), never a direct view query, so
+# the RLS-scoped invoker path is exercised too.
+# (kind, agent, model_key, out_tok, expected_tier, expected_rung)
+ROLE_ROWS = [
+    (0, None, "O", 2001, "orchestrator", None),
+    (0, None, "F", 2002, "orchestrator", None),
+    (0, None, "G", 2003, "orchestrator", None),
+    (1, None, "S", 2004, "small", None),
+    (1, None, "F", 2005, "ladder", None),        # model-prefix fallback
+    (1, None, "H", 2006, "micro", None),
+    (1, None, "G", 2007, "unknown", None),
+    (1, None, "O", 2008, "heavy", None),
+    (1, "marvin:developer", "H", 2009, "heavy", None),
+    (1, "marvin:researcher", "S", 2010, "heavy", None),
+    (1, "marvin:validator-completion", "H", 2011, "heavy", None),
+    (1, "marvin:validator-security", "S", 2012, "heavy", None),
+    (1, "marvin:validator-foo", "G", 2013, "heavy", None),
+    (1, "marvin:escalation-high", "S", 2014, "ladder", "high"),
+    (1, "marvin:escalation-xhigh", "H", 2015, "ladder", "xhigh"),
+    (1, "marvin:escalation-max", "O", 2016, "ladder", "max"),
+    (1, "marvin:escalation-frontier", "G", 2017, "ladder", "frontier"),
+    (1, "marvin:escalation-bogus", "O", 2018, "ladder", None),  # no rung
+    (1, "marvin:developer-small", "O", 2019, "small", None),
+    (1, "marvin:documenter", "F", 2020, "small", None),
+    (1, "marvin:ponytail", "O", 2021, "micro", None),
+    (1, "claude", "O", 2022, "heavy", None),
+    (1, "claude", "S", 2023, "small", None),
+    (1, "claude", "H", 2024, "micro", None),
+    (1, "claude", "F", 2025, "ladder", None),
+    (1, "general-purpose", "O", 2026, "heavy", None),
+    (1, "general-purpose", "F", 2027, "ladder", None),
+    (1, "Explore", "S", 2028, "small", None),
+    (1, "Explore", "H", 2029, "micro", None),
+    (0, "marvin:developer", "S", 2030, "heavy", None),   # kind=0, named agent
+    (1, "unknown-thing", "F", 2031, "ladder", None),
+]
+
+
+def role_corpus_sql(owner):
+    """ROLE_ROWS as owner/natural-keyed Postgres INSERTs (schema.sql shape),
+    in one project/session — pricing is irrelevant to tier/rung, so none is
+    loaded."""
+    out = [
+        f"INSERT INTO public.users(uuid, name, created_at) VALUES"
+        f" ({_sql_lit(owner)}, 'RoleTester', {NOW});",
+        f"INSERT INTO public.projects(owner_id, path, name) VALUES"
+        f" ({_sql_lit(owner)}, '/role', 'Role');",
+        f"INSERT INTO public.sessions(owner_id, uuid, project_path) VALUES"
+        f" ({_sql_lit(owner)}, 's-role', '/role');",
+    ]
+    for name in ROLE_MODELS.values():
+        out.append(f"INSERT INTO public.models(owner_id, name) VALUES"
+                   f" ({_sql_lit(owner)}, {_sql_lit(name)});")
+    for kind, agent, mk, out_tok, _tier, _rung in ROLE_ROWS:
+        out.append(
+            "INSERT INTO public.events(owner_id, session_uuid, model_name, ts,"
+            " kind, agent, in_tok, out_tok, cache_r, cache_w, cache_w_1h,"
+            " issue_key, note) VALUES ("
+            f"{_sql_lit(owner)}, 's-role', {_sql_lit(ROLE_MODELS[mk])}, {NOW},"
+            f" {kind}, {_sql_lit(agent)}, 1, {out_tok}, 0, 0, 0, NULL, NULL);")
+    return "\n".join(out)
+
+
+def build_sqlite_role_corpus(path):
+    """The SAME ROLE_ROWS fixture in a fresh SQLite DB — the local half of
+    the role-rule fixture's local<->remote parity check."""
+    conn = capture.connect(path)
+    conn.execute("DELETE FROM pricing")
+    pid = conn.execute(
+        "INSERT INTO projects(path, name) VALUES ('/role', 'Role')").lastrowid
+    sid = conn.execute(
+        "INSERT INTO sessions(uuid, project_id) VALUES ('s-role', ?)",
+        (pid,)).lastrowid
+    mid = {}
+    for key, name in ROLE_MODELS.items():
+        mid[key] = conn.execute(
+            "INSERT INTO models(name) VALUES (?)", (name,)).lastrowid
+    for kind, agent, mk, out_tok, _tier, _rung in ROLE_ROWS:
+        conn.execute(
+            "INSERT INTO events(ts, session_id, kind, agent, model_id, in_tok,"
+            " out_tok, cache_r, cache_w, cache_w_1h) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (NOW, sid, kind, agent, mid[mk], 1, out_tok, 0, 0, 0))
+    conn.commit()
+    conn.close()
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+def role_expected_totals():
+    """(tier_totals, rung_totals): ``{label: [out_sum, count]}``, derived from
+    ROLE_ROWS' hand-assigned expected_tier/expected_rung columns — the
+    independent pin every dialect's report_token_stats() must reproduce. A
+    ladder row with no named rung is expected under
+    ``report.RUNG_FALLBACK_LABEL`` (F5), same as the code under test."""
+    tiers, rungs = {}, {}
+    for _kind, _agent, _mk, out_tok, tier, rung in ROLE_ROWS:
+        t = tiers.setdefault(tier, [0, 0])
+        t[0] += out_tok
+        t[1] += 1
+        if tier == "ladder":
+            label = rung or report.RUNG_FALLBACK_LABEL
+            r = rungs.setdefault(label, [0, 0])
+            r[0] += out_tok
+            r[1] += 1
+    return tiers, rungs
+
+
+@unittest.skipUnless(PG_TOOLS, PG_REASON)
+class TestPostgresRoleRuleFixture(unittest.TestCase):
+    """F3: every branch of the role-based tier rule (tier_case/rung_case),
+    verified through the REAL RPC (report_token_stats) against a throwaway
+    Postgres database, and against the SAME fixture loaded locally (SQLite)
+    — pinning both the per-row classification and its local<->remote parity
+    (ROLE_ROWS: every out_tok is distinct, so a misclassified row is always
+    visible as a wrong bucket total)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dbname = f"tt_role_{os.getpid()}"
+        try:
+            subprocess.run(["createdb", cls.dbname], check=True,
+                           capture_output=True, env=os.environ.copy(),
+                           timeout=30)
+        except Exception as exc:   # no reachable server / no permission
+            raise unittest.SkipTest(f"createdb unavailable: {exc}")
+        cls._prev_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+        script = "\n".join([PG_SHIM, SCHEMA_SQL, REPORTS_SQL,
+                            role_corpus_sql(ROLE_OWNER)])
+        TestPostgresEquivalence._run_sql_file(cls.dbname, script)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._prev_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = cls._prev_tz
+        time.tzset()
+        subprocess.run(["dropdb", "--if-exists", cls.dbname],
+                       capture_output=True, env=os.environ.copy(), timeout=30)
+
+    def _rpc(self):
+        r = subprocess.run(
+            ["psql", "-X", "-A", "-t", "-d", self.dbname, "-c",
+             "SELECT public.report_token_stats();"],
+            capture_output=True, text=True, env=os.environ.copy(), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return supabase_backend._map_token_stats(json.loads(r.stdout.strip()))
+
+    def local(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        conn = build_sqlite_role_corpus(pathlib.Path(tmp.name) / "usage.db")
+        self.addCleanup(conn.close)
+        return report.fetch_token_stats(conn)
+
+    def test_every_role_rule_row_classifies_correctly_remote(self):
+        exp_tiers, exp_rungs = role_expected_totals()
+        pg = self._rpc()
+        self.assertEqual({t: [o, n] for t, _i, o, n in pg["by_tier"]},
+                         exp_tiers)
+        self.assertEqual({r: [o, n] for r, _i, o, n in pg["by_rung"]},
+                         exp_rungs)
+
+    def test_every_role_rule_row_classifies_correctly_local(self):
+        exp_tiers, exp_rungs = role_expected_totals()
+        d = self.local()
+        self.assertEqual({t: [o, n] for t, _i, o, n in d["by_tier"]},
+                         exp_tiers)
+        self.assertEqual({r: [o, n] for r, _i, o, n in d["by_rung"]},
+                         exp_rungs)
+
+    def test_model_used_across_every_tier_is_one_by_model_row(self):
+        # F1, remote + local: ROLE_ROWS runs "claude-opus-5-5" (key "O")
+        # through all five kit tiers (orchestrator/heavy/ladder/small/micro).
+        # by_model must still hold exactly ONE row for it, tier-listed in the
+        # kit's display order, output summed across every one of those rows —
+        # never split into one row per (model, tier).
+        expected_out = sum(out for _k, _a, mk, out, _t, _r in ROLE_ROWS
+                           if mk == "O")
+        expected_n = sum(1 for _k, _a, mk, *_ in ROLE_ROWS if mk == "O")
+        for label, d in (("remote", self._rpc()), ("local", self.local())):
+            with self.subTest(label):
+                rows = [r for r in d["by_model"] if r[0] == "claude-opus-5-5"]
+                self.assertEqual(len(rows), 1, d["by_model"])
+                _name, tier, inp, outp, _cost, _rf = rows[0]
+                self.assertEqual(tier, "orchestrator, heavy, ladder, small,"
+                                       " micro")
+                self.assertEqual(outp, expected_out)
+                self.assertEqual(inp, expected_n)   # 1 in_tok per event
+
+    def test_role_fixture_local_equals_remote(self):
+        pg = self._rpc()
+        loc = self.local()
+        self.assertEqual(sorted(pg["by_tier"]), sorted(loc["by_tier"]))
+        self.assertEqual(sorted(pg["by_rung"]), sorted(loc["by_rung"]))
+        # rung lines reconcile to the ladder tier total in both dialects (F5)
+        ladder = {t: o for t, _i, o, _n in loc["by_tier"]}["ladder"]
+        self.assertEqual(sum(o for _r, _i, o, _n in loc["by_rung"]), ladder)
+        self.assertEqual(sum(o for _r, _i, o, _n in pg["by_rung"]), ladder)
+
+
 class TestReportsSecurityHardening(unittest.TestCase):
     """Always-on structural guards on supabase/reports.sql (no Postgres needed).
     They pin the Supabase security posture its linter checks on a real instance

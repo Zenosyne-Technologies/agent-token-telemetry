@@ -957,10 +957,12 @@ class TestRoleTierMapping(unittest.TestCase):
                 self.seed(1, "some-unnamed-agent", model)
                 self.assertEqual(self.only_tier(), expected)
                 if expected == "ladder":
-                    # fallback ladder row names no escalation persona -> no
-                    # rung to report, though the tier total still counts it.
+                    # fallback ladder row names no escalation persona -> it
+                    # is grouped under RUNG_FALLBACK_LABEL rather than
+                    # dropped, so by_rung still sums to the tier total.
                     self.assertEqual(
-                        report.fetch_token_stats(self.conn)["by_rung"], [])
+                        report.fetch_token_stats(self.conn)["by_rung"],
+                        [(report.RUNG_FALLBACK_LABEL, 100, 1000, 1)])
 
     def test_null_agent_with_kind_1_falls_back_to_model_prefix(self):
         # kind=1 (subagent) with a NULL agent is NOT the main session — that
@@ -968,6 +970,29 @@ class TestRoleTierMapping(unittest.TestCase):
         # any other unnamed agent, never 'orchestrator'.
         self.seed(1, None, "claude-haiku-5")
         self.assertEqual(self.only_tier(), "micro")
+
+    def test_model_serving_two_roles_is_one_by_model_row(self):
+        # F1: by_model is model-tiered (one row per model), NOT (model,
+        # tier)-tiered — a model used at more than one role-tier this window
+        # lists them ALL on that single row, comma-joined in the kit's
+        # display order (orchestrator, heavy, ladder, small, micro), never
+        # repeating the model. The per-model estimated/event counts are the
+        # SUM across both roles (main() + insert_events() here both price at
+        # the undated seed, so both events are estimated).
+        self.seed(0, None, "claude-opus-5-5", out=1000)            # orchestrator
+        self.seed(1, "marvin:developer", "claude-opus-5-5", out=500)  # heavy
+        d = report.fetch_token_stats(self.conn)
+        rows = [r for r in d["by_model"] if r[0] == "claude-opus-5-5"]
+        self.assertEqual(len(rows), 1, d["by_model"])
+        name, tier, inp, outp, _cost, _rate_from = rows[0]
+        self.assertEqual(tier, "orchestrator, heavy")
+        self.assertEqual((inp, outp), (200, 1500))
+        self.assertEqual(d["estimated_by_model"]["claude-opus-5-5"], 2)
+        self.assertEqual(d["events_by_model"]["claude-opus-5-5"], 2)
+        # the role split lives in by_tier instead, as two separate rows
+        tiers = {t: o for t, _i, o, _n in d["by_tier"]}
+        self.assertEqual(tiers["orchestrator"], 1000)
+        self.assertEqual(tiers["heavy"], 500)
 
 
 if __name__ == "__main__":
