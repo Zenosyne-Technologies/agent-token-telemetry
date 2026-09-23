@@ -265,13 +265,26 @@ def fetch_price_warning(conn, models=None):
 _WARN_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
+_WARN_DATE_FALLBACK = "unknown date"
+
 
 def _warn_date(ts):
     """``Mon D, YYYY`` for an epoch-seconds timestamp, in the server's local
     timezone. The dashboard is localhost-only (see the timeline bucketing
     comment above ``_bucket_start``), so the server's clock is the reader's
-    clock; there is no cross-timezone reader to mislead."""
-    d = datetime.datetime.fromtimestamp(ts)
+    clock; there is no cross-timezone reader to mislead.
+
+    Total over its whole domain: a timestamp that ``datetime.fromtimestamp``
+    cannot represent in local time (e.g. one whose local calendar date falls
+    outside ``datetime``'s year range, such as the first local day of year 1,
+    or any other out-of-range/invalid value) never raises — it renders as
+    :data:`_WARN_DATE_FALLBACK` instead, so one bad timestamp can't fail the
+    whole ``/api/data`` response (AOS-135 F1).
+    """
+    try:
+        d = datetime.datetime.fromtimestamp(ts)
+    except (OverflowError, OSError, ValueError):
+        return _WARN_DATE_FALLBACK
     return f"{_WARN_MONTHS[d.month - 1]} {d.day}, {d.year}"
 
 

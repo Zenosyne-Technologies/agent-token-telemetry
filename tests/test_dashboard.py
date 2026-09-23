@@ -34,8 +34,17 @@ def pin_utc(testcase):
     test asserting a literal expected date string needs a fixed zone to be
     deterministic across runners — mirrors the TZ pin in
     tests/test_report_parity.py's ``TestPostgresEquivalence``."""
+    pin_tz(testcase, "UTC")
+
+
+def pin_tz(testcase, tz):
+    """Pin TZ to an explicit POSIX TZ string for one test, restoring it on
+    cleanup — the non-UTC sibling of :func:`pin_utc`, for tests that need a
+    *non-zero* local offset to reproduce a conversion that only misbehaves
+    away from UTC (AOS-135 F1: a UTC instant right at year 1's start only
+    overflows ``datetime.fromtimestamp`` once shifted into local time)."""
     prev = os.environ.get("TZ")
-    os.environ["TZ"] = "UTC"
+    os.environ["TZ"] = tz
     time.tzset()
 
     def _restore():
@@ -573,6 +582,54 @@ class TestDashboardData(unittest.TestCase):
         self.assertEqual(dashboard._warn_usd(0), "$0.00")
         self.assertEqual(dashboard._warn_usd(None), "$0.00")
         self.assertEqual(dashboard._warn_usd(float("nan")), "$0.00")
+
+    # ---- F1: _warn_date must be total, never raise (AOS-135 dashboard fix) --
+
+    def test_warn_date_returns_fallback_for_out_of_range_timestamps(self):
+        # datetime.fromtimestamp raises on a value whose LOCAL calendar date
+        # falls outside datetime's representable year range (1..9999) — a
+        # UTC instant at year 1's start only does this once shifted into a
+        # non-UTC local time (ValueError), same as a timestamp so large or so
+        # negative that no local offset keeps it in range (OverflowError on
+        # some platforms, OSError on others). _warn_date must swallow all of
+        # them and answer the fixed fallback instead of propagating.
+        pin_tz(self, "UTC-1")   # local = UTC+1h
+        year_one_utc_midnight = -62135596800   # 0001-01-01T00:00:00Z
+        huge = 10 ** 18
+        very_negative = -10 ** 18
+        for bad_ts in (year_one_utc_midnight, huge, very_negative):
+            self.assertEqual(dashboard._warn_date(bad_ts),
+                             dashboard._WARN_DATE_FALLBACK, bad_ts)
+        self.assertEqual(dashboard._WARN_DATE_FALLBACK, "unknown date")
+
+    def test_price_warning_survives_an_out_of_range_event_timestamp(self):
+        # F1's actual failure mode: the security review's report (sec135.md)
+        # found that a single event whose timestamp lands on the first local
+        # day of year 1 makes build_data — and so /api/data, whose handler
+        # (_api_data) does nothing but json.dumps(build_data(...)) — raise,
+        # taking down the WHOLE response instead of just that one model's
+        # date text. Reproduced here over a real DB/build_data, matching how
+        # _api_data actually calls it, not just the unit-level _warn_date.
+        pin_tz(self, "UTC-1")
+        self._insert("/proj", "s1", model="claude-sonnet-5", inp=1000,
+                     out=500, cr=0, cw=0, cw1h=0, mid="m1",
+                     ts="0001-01-01T00:00:00.000Z")
+        conn = self._ro()
+        d = dashboard.build_data(conn, {"period": ["year"]})   # must not raise
+        conn.close()
+        encoded = json.dumps(d)          # exactly what _api_data sends back
+        self.assertTrue(json.loads(encoded))   # 200 with valid JSON
+        pw = d["priceWarning"]
+        # the only pricing row effective at all is dated near "now" (see
+        # capture's seeded pricing), long after this year-1 event, so it
+        # never resolves to a rate — lands in "unpriced", not "estimated".
+        # Which group it lands in isn't the point; that it's listed at all,
+        # with a fallback date instead of a crash, is.
+        self.assertEqual(pw["estimated"], [])
+        self.assertEqual(len(pw["unpriced"]), 1)
+        row = pw["unpriced"][0]
+        self.assertEqual(row["model"], "claude-sonnet-5")
+        self.assertEqual(row["dateRangeText"], dashboard._WARN_DATE_FALLBACK)
 
 
 # --- timeline bucketing (v0.11.0: per-bucket columns, not a running total) ---
