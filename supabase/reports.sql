@@ -80,11 +80,16 @@ SELECT
   pr.cache_w_usd   AS cache_w_usd,
   pr.cache_w_1h_usd AS cache_w_1h_usd,
   pr.effective_from AS rate_from,
-  -- true when the resolved row is a FAMILY DEFAULT row (a bare
-  -- `claude-<family>-` prefix: the family's fallback rate, so this event's
-  -- cost is an estimate); false for the model's own row; NULL when unpriced.
-  -- Twin of capture.is_family_default / capture.family_default_sql (SQLite).
-  (pr.model_prefix OPERATOR(pg_catalog.~) '^claude-[a-z]+-$') AS family_default
+  -- true when this event's cost is an ESTIMATE: the resolved row is a FAMILY
+  -- DEFAULT row (a bare `claude-<family>-` prefix, the family's fallback rate)
+  -- or an ANCESTOR row (R = the model name minus the row's prefix opens with a
+  -- point-release segment `-<1-2 digits>`: an unlisted point release priced at
+  -- its nearest listed ancestor's row); false for the model's own row; NULL
+  -- when unpriced. Twin of capture.is_estimated / capture.estimated_sql.
+  (pr.model_prefix OPERATOR(pg_catalog.~) '^claude-[a-z]+-$'
+   OR pg_catalog.substr(m.name,
+        pg_catalog.length(pr.model_prefix) OPERATOR(pg_catalog.+) 1)
+      OPERATOR(pg_catalog.~) '^-[0-9]{1,2}(-|$)') AS estimated
 FROM public.events e
 JOIN public.models m
   ON m.owner_id = e.owner_id AND m.name = e.model_name

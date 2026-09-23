@@ -208,6 +208,81 @@ def family_default_sql(col):
     return (f"({col} GLOB 'claude-?*-'"
             f" AND substr({col}, 8, length({col}) - 8) NOT GLOB '*[^a-z]*')")
 
+
+# An "ancestor row" is a pricing row that resolves for a model only because
+# the model is an unlisted POINT RELEASE of the row's version: the remainder R
+# (the model name with the row's model_prefix removed from its start) opens
+# with a 1–2 digit point-release segment — `^-[0-9]{1,2}(-|$)`. E.g. prefix
+# `claude-opus-5` for model `claude-opus-5-5` (R = `-5`). A date snapshot is
+# NOT an ancestor: `claude-haiku-4-5` for `claude-haiku-4-5-20251001`
+# (R = `-20251001`), `claude-opus-4-2025` for `claude-opus-4-20250514`
+# (R = `0514`). An event resolved to an ancestor row prices at its nearest
+# listed ancestor's rate — an ESTIMATE, like a family default. Postgres twin
+# in supabase/reports.sql (`~ '^-[0-9]{1,2}(-|$)'`).
+_ANCESTOR_REMAINDER_RE = re.compile(r"-[0-9]{1,2}(?:-|\Z)")
+
+
+def is_ancestor_row(model_name, prefix):
+    """Whether ``prefix`` prices ``model_name`` only as its nearest listed
+    ancestor (the model is an unlisted point release of that row's version).
+
+    R = ``model_name`` with ``len(prefix)`` leading characters removed (the
+    resolver guarantees the prefix matches); the row is an ancestor row when R
+    matches ``^-[0-9]{1,2}(-|$)`` (ASCII digits, ``$`` = end of string).
+
+    :param model_name: the event's model name.
+    :param prefix: the resolved row's ``model_prefix``.
+    :returns: ``True`` for an ancestor row; ``False`` otherwise, including
+        when either argument is ``None``.
+    """
+    if not isinstance(model_name, str) or not isinstance(prefix, str):
+        return False
+    return _ANCESTOR_REMAINDER_RE.match(model_name[len(prefix):]) is not None
+
+
+def ancestor_row_sql(name_col, prefix_col):
+    """SQLite boolean expression (1/0, NULL when either input is NULL)
+    equivalent to :func:`is_ancestor_row`.
+
+    SQLite has no regex, so ``^-[0-9]{1,2}(-|$)`` is spelled as the four
+    structural GLOB shapes it admits — R is exactly ``-D``, ``-D-…``, ``-DD``
+    or ``-DD-…`` (D an ASCII digit; GLOB's ``*`` matches any tail, newlines
+    included; ``[0-9]`` compares code points). Equivalence is pinned by tests
+    over named edge cases plus a randomized sweep.
+
+    :param name_col: trusted SQL expression for the model name.
+    :param prefix_col: trusted SQL expression for the row's ``model_prefix``.
+    :returns: the SQL fragment, parenthesized.
+    """
+    r = f"substr({name_col}, length({prefix_col}) + 1)"
+    return (f"({r} GLOB '-[0-9]' OR {r} GLOB '-[0-9]-*'"
+            f" OR {r} GLOB '-[0-9][0-9]' OR {r} GLOB '-[0-9][0-9]-*')")
+
+
+def is_estimated(model_name, prefix):
+    """Whether an event of ``model_name`` resolved to the pricing row
+    ``prefix`` prices at an ESTIMATE: the row is a family default row
+    (:func:`is_family_default`) or an ancestor row (:func:`is_ancestor_row`).
+    docs/TELEMETRY-CONTRACT.md §Pricing table.
+
+    :param model_name: the event's model name.
+    :param prefix: the resolved row's ``model_prefix`` (``None`` = unpriced).
+    :returns: ``True`` when estimated, else ``False``.
+    """
+    return is_family_default(prefix) or is_ancestor_row(model_name, prefix)
+
+
+def estimated_sql(name_col, prefix_col):
+    """SQLite boolean expression equivalent to :func:`is_estimated` — 1/0 for
+    a priced event, NULL when ``prefix_col`` is NULL (unpriced).
+
+    :param name_col: trusted SQL expression for the model name.
+    :param prefix_col: trusted SQL expression for the row's ``model_prefix``.
+    :returns: the SQL fragment, parenthesized.
+    """
+    return (f"({family_default_sql(prefix_col)}"
+            f" OR {ancestor_row_sql(name_col, prefix_col)})")
+
 AUDIT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_log(
   ts      INTEGER NOT NULL,

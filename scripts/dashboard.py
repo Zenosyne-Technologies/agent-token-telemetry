@@ -146,11 +146,11 @@ def _rate(col):
     return _resolved(f"pr.{col}")
 
 
-def _family_default():
-    """1 when the event's resolved pricing row is a family default row (an
-    estimate at the family's fallback rate), 0 for the model's own row, NULL
-    when unpriced. Same definition as report.py (capture.is_family_default)."""
-    return _resolved(capture.family_default_sql("pr.model_prefix"))
+def _estimated():
+    """1 when the event's resolved pricing row makes its cost an estimate (a
+    family default or an ancestor row), 0 for the model's own row, NULL when
+    unpriced. Same definition as report.py (capture.is_estimated)."""
+    return _resolved(capture.estimated_sql("m.name", "pr.model_prefix"))
 
 
 def _pretty_model(name):
@@ -224,7 +224,7 @@ def fetch_rows(conn, since, models, agents):
              {_rate('in_usd')} AS r_in, {_rate('out_usd')} AS r_out,
              {_rate('cache_r_usd')} AS r_cr, {_rate('cache_w_usd')} AS r_cw,
              {_rate('cache_w_1h_usd')} AS r_cw1h,
-             {_family_default()} AS family_default
+             {_estimated()} AS estimated
       FROM events e
       JOIN models m ON m.id=e.model_id
       JOIN sessions s ON s.id=e.session_id
@@ -255,7 +255,7 @@ def fetch_rows(conn, since, models, agents):
             "costCacheW": cost_cw,
             "costConsumed": cost_in + cost_out, "costCache": cost_cr + cost_cw,
             "cost": cost_in + cost_out + cost_cr + cost_cw,
-            "estimated": r["family_default"] == 1,
+            "estimated": r["estimated"] == 1,
         })
     return rows
 
@@ -442,7 +442,7 @@ def build_data(conn, q):
             "sums": {"cost": cost, "total": total},
         },
         "backlogExcluded": backlog_excluded,
-        # models whose every event prices at a family default (no own row);
+        # models without an own pricing row (every event estimated/unpriced);
         # data only — the page does not render it yet.
         "modelsWithoutOwnPrice": report.fetch_models_without_own_price(conn),
         "generatedAt": now,

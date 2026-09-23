@@ -69,7 +69,7 @@ class TestDashboardData(unittest.TestCase):
         self.assertAlmostEqual(sum(g["cost"] for g in d["byProject"]), k["cost"], places=6)
         self.assertEqual(d["byModel"][0]["name"], "Sonnet 5")
 
-    def test_family_default_flag_is_carried_without_changing_cost(self):
+    def test_estimated_flag_is_carried_without_changing_cost(self):
         # Seed rows are family defaults: the sonnet event is an estimate. An
         # own row at the SAME rates flips the flag and leaves the cost alone.
         self.seed_one()
@@ -97,6 +97,43 @@ class TestDashboardData(unittest.TestCase):
         self.assertEqual(after["byModel"][0]["estimated"], 0)
         self.assertEqual(after["modelsWithoutOwnPrice"], [])
         self.assertEqual(after["kpis"]["cost"], before["kpis"]["cost"])
+
+    def test_ancestor_row_is_estimated_until_an_own_row_lands(self):
+        # An unlisted successor ('claude-sonnet-5-1') priced by its nearest
+        # listed ancestor's row ('claude-sonnet-5', R = '-1') is still an
+        # estimate, and the model has no own price; its own row flips both.
+        self._insert("/proj", "s1", model="claude-sonnet-5-1", inp=1000,
+                     out=500, cr=0, cw=0, cw1h=0, mid="m1",
+                     ts=iso(int(time.time())))
+
+        def add_row(prefix):
+            rw = capture.connect(self.db)
+            with rw:
+                rw.execute(
+                    "INSERT INTO pricing(provider, model_prefix, in_usd,"
+                    " out_usd, cache_r_usd, cache_w_usd, cache_w_1h_usd,"
+                    " effective_from, source) VALUES"
+                    " ('anthropic', ?, 3, 15, 0.3, 3.75, 6, 1, 'test')",
+                    (prefix,))
+            rw.close()
+
+        def data():
+            conn = self._ro()
+            try:
+                return dashboard.build_data(conn, {"period": ["year"]})
+            finally:
+                conn.close()
+
+        add_row("claude-sonnet-5")
+        d = data()
+        self.assertTrue(d["events"]["rows"][0]["estimated"])
+        self.assertEqual(d["kpis"]["estimatedEvents"], 1)
+        self.assertEqual(d["modelsWithoutOwnPrice"], ["claude-sonnet-5-1"])
+        add_row("claude-sonnet-5-1")
+        d = data()
+        self.assertFalse(d["events"]["rows"][0]["estimated"])
+        self.assertEqual(d["kpis"]["estimatedEvents"], 0)
+        self.assertEqual(d["modelsWithoutOwnPrice"], [])
 
     def test_missing_db_is_read_only_safe(self):
         # build_data is never called without a conn; the HTTP layer guards None.
