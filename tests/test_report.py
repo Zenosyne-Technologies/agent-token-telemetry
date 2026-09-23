@@ -1,4 +1,5 @@
 import contextlib
+import datetime
 import io
 import pathlib
 import re
@@ -479,6 +480,213 @@ class TestScopedRollup(unittest.TestCase):
                          "(unprintable)")
         self.assertEqual(report.sanitize_invalid_echo("a" * 50),
                          "a" * 32 + "…")
+
+    def test_scoped_rollup_flags_estimated_cost(self):
+        # a fresh DB prices at the effective_from=0 family-default seed, so
+        # the one covered event is estimated: the whole figure is an estimate
+        self.seed_event(issue_key="AOS-79")
+        _, out = run(["token-stats", "--scope", "AOS-79", "--db", str(self.db),
+                      "--cwd", str(self.dir)])
+        self.assertIn("100,000 input / 50,000 output tokens; the whole figure"
+                      " is an estimate (every event at an estimated rate).",
+                      out)
+
+
+# The exact qualifier phrases every report renders (docs/TELEMETRY-CONTRACT.md
+# §Pricing table — "Own price vs estimate").
+ALL_EST = "the whole figure is an estimate (every event at an estimated rate)"
+RATE = 1_699_963_200   # 2023-11-14 12:00 UTC
+DAY = datetime.date.fromtimestamp(RATE).isoformat()   # local, as rendered
+
+
+def stats_row(events=10, unpriced=0, estimated=0, **kw):
+    """A fetch_project_stats-shaped row with a priced, dated figure."""
+    r = {"path": "/p/alpha", "name": "Alpha", "sessions": 1, "events": events,
+         "input": 1000, "output": 500, "cache_read": 0, "cache_write": 0,
+         "classic_in": 1.0, "classic_out": 2.0, "cached_r": 0.0,
+         "cached_w": 0.0, "rate_from": RATE,
+         "unpriced_events": unpriced, "first_seen": None,
+         "last_activity": None, "estimated_events": estimated}
+    r.update(kw)
+    return r
+
+
+def token_data(events=10, unpriced=0, estimated=0, without=None,
+               model="claude-opus-5-5"):
+    """A fetch_token_stats-shaped dict with one priced, dated model."""
+    return {
+        "today": (0, 0, 0, 0, 0), "week": (1000, 500, 0, 0, events),
+        "backlog_excluded": 0, "by_project": [], "by_agent": [],
+        "by_model": [(model, "heavy", 1000, 500, 3.0, RATE)],
+        "by_kind": [], "by_tier": [], "by_issue": [],
+        "estimated_by_model": {model: estimated} if estimated else {},
+        "events_by_model": {model: events},
+        "unpriced_by_model": {model: unpriced} if unpriced else {},
+        "models_without_own_price": without if without is not None else [],
+    }
+
+
+def model_cell(md, model="claude-opus-5-5"):
+    line = next(l for l in md.splitlines() if l.startswith(f"| {model} |"))
+    return line.split(" | ")[-1].rstrip(" |")
+
+
+class TestEstimateFlags(unittest.TestCase):
+    """AOS-134: reports flag cost figures priced at a family default or an
+    ancestor row (ESTIMATED), distinct from unpriced events, and footer the
+    models without an own price."""
+
+    # ---- project-stats cost cell
+    def est_cell(self, **kw):
+        md = report.render_project_stats([stats_row(**kw)])
+        return md.splitlines()[2].split(" | ")[7]
+
+    def test_project_stats_none_estimated_says_nothing(self):
+        self.assertEqual(self.est_cell(estimated=0), "**$3** ($1 / $2)")
+
+    def test_project_stats_some_estimated(self):
+        self.assertEqual(self.est_cell(estimated=3),
+                         "**$3** ($1 / $2) — 3 of 10 events at an estimated"
+                         " rate")
+
+    def test_project_stats_all_estimated(self):
+        self.assertEqual(self.est_cell(estimated=10),
+                         f"**$3** ($1 / $2) — {ALL_EST}")
+
+    def test_project_stats_estimated_and_unpriced_stay_distinct(self):
+        self.assertEqual(self.est_cell(unpriced=2, estimated=5),
+                         "**$3** ($1 / $2) — 2 of 10 events unpriced,"
+                         " 5 of 10 events at an estimated rate")
+
+    def test_project_stats_unpriced_only_is_unchanged(self):
+        self.assertEqual(self.est_cell(unpriced=2),
+                         "**$3** ($1 / $2) — 2 of 10 events unpriced")
+
+    def test_project_stats_not_reported_says_nothing(self):
+        # a remote whose reports.sql predates the figure maps it to None
+        self.assertEqual(self.est_cell(estimated=None), "**$3** ($1 / $2)")
+
+    # ---- token-stats by-model cell + headline
+    def test_token_stats_none_estimated_says_nothing(self):
+        md = report.render_token_stats(token_data(estimated=0))
+        self.assertEqual(model_cell(md), "$3")
+        self.assertNotIn("estimated rate", md)
+        self.assertIn(f"(rates as of {DAY}).**", md)
+
+    def test_token_stats_some_estimated(self):
+        md = report.render_token_stats(token_data(estimated=4))
+        self.assertEqual(model_cell(md),
+                         "$3 — 4 of 10 events at an estimated rate")
+        self.assertIn(f"(rates as of {DAY}); 4 of 10 events at an"
+                      " estimated rate.**", md)
+
+    def test_token_stats_all_estimated(self):
+        md = report.render_token_stats(token_data(estimated=10))
+        self.assertEqual(model_cell(md), f"$3 — {ALL_EST}")
+        self.assertIn(f"(rates as of {DAY}); {ALL_EST}.**", md)
+
+    def test_token_stats_estimated_and_unpriced_stay_distinct(self):
+        md = report.render_token_stats(token_data(unpriced=1, estimated=6))
+        self.assertEqual(model_cell(md),
+                         "$3 — 1 of 10 events unpriced, 6 of 10 events at an"
+                         " estimated rate")
+
+    def test_token_stats_headline_sums_across_models(self):
+        d = token_data(estimated=2)
+        d["by_model"].append(("gpt-4o", "unknown", 10, 20, 0.0, None))
+        d["events_by_model"]["gpt-4o"] = 3
+        d["unpriced_by_model"]["gpt-4o"] = 3
+        md = report.render_token_stats(d)
+        self.assertIn("; 3 of 13 events unpriced, 2 of 13 events at an"
+                      " estimated rate.**", md)
+        self.assertEqual(model_cell(md, "gpt-4o"), "unpriced")
+
+    def test_token_stats_not_reported_says_nothing(self):
+        d = token_data(estimated=4)
+        for k in ("estimated_by_model", "events_by_model",
+                  "unpriced_by_model", "models_without_own_price"):
+            d[k] = None
+        md = report.render_token_stats(d)
+        self.assertEqual(model_cell(md), "$3")
+        self.assertNotIn("estimated", md)
+        self.assertNotIn("No own published price", md)
+
+    # ---- footer
+    def test_footer_absent_when_every_model_has_own_price(self):
+        md = report.render_token_stats(token_data(without=[]))
+        self.assertNotIn("No own published price", md)
+        self.assertNotIn("pricing-update", md)
+
+    def test_footer_names_models_and_points_to_pricing_update(self):
+        md = report.render_token_stats(token_data(
+            estimated=10, without=["claude-opus-5-5", "gpt-4o"]))
+        last = md.splitlines()[-1]
+        self.assertEqual(
+            last, "No own published price for `claude-opus-5-5`, `gpt-4o` —"
+            " their cost is an estimate (family default or nearest listed"
+            " ancestor rate) or unpriced; `/token-telemetry:pricing-update`"
+            " refreshes the pricing table.")
+
+    def test_footer_sanitizes_hostile_model_name(self):
+        hostile = ("evil|name\n# Heading\r\n| a | b |\t**bold** `tick`"
+                   " [x](http://evil.example)\x1b[31m‮")
+        md = report.render_token_stats(token_data(without=[hostile]))
+        footer = [l for l in md.splitlines()
+                  if l.startswith("No own published price for")]
+        self.assertEqual(len(footer), 1)         # one line: newlines folded
+        line = footer[0]
+        # nothing after the footer line: the name injected no extra lines
+        self.assertEqual(md.splitlines()[-1], line)
+        self.assertNotIn("\n# Heading", md)
+        # every pipe is escaped, so no table row/column can be forged
+        self.assertIsNone(re.search(r"(?<!\\)\|", line))
+        # the only backticks are the code-span pair around the name and the
+        # pair around the command: the name cannot break out of its span
+        self.assertEqual(line.count("`"), 4)
+        name_span = line.split("`")[1]
+        self.assertEqual(name_span, report.md_cell(hostile))
+        self.assertIn("**bold**", name_span)     # inert inside the code span
+        # control bytes and bidi overrides are gone
+        self.assertTrue(all(ord(ch) >= 0x20 and ord(ch) != 0x7f
+                            for ch in line))
+        self.assertNotIn("‮", line)
+
+    # ---- scoped rollup
+    def scoped(self, events=10, unpriced=0, estimated=0):
+        return report.render_scoped_rollup({
+            "state": "full", "keys": ["AOS-1"], "invalid": [], "n": 1, "k": 1,
+            "in_tok": 1000, "out_tok": 500, "cache_r": 0, "cache_w": 0,
+            "events": events, "cost": 3.0, "rate_from": [RATE],
+            "unpriced": unpriced, "estimated": estimated})
+
+    def test_scoped_rollup_qualifiers(self):
+        base = "**$3** — 10 events, 1,000 input / 500 output tokens"
+        self.assertIn(base + ".", self.scoped())
+        self.assertIn(base + "; 3 of 10 events at an estimated rate.",
+                      self.scoped(estimated=3))
+        self.assertIn(base + f"; {ALL_EST}.", self.scoped(estimated=10))
+        self.assertIn(base + "; 1 of 10 events unpriced, 4 of 10 events at an"
+                      " estimated rate.", self.scoped(unpriced=1, estimated=4))
+
+    # ---- end to end over a real DB
+    def test_seed_priced_db_flags_estimate_and_footers(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = pathlib.Path(tmp.name) / "usage.db"
+        conn = capture.connect(db)
+        now = int(time.time())
+        groups = capture.aggregate([
+            entry(model="claude-sonnet-5", inp=1000, out=500, mid="m1",
+                  ts=time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
+                                   time.gmtime(now)))])
+        with conn:
+            capture.insert_events(conn, "/proj", "s1", 0, None, groups)
+        conn.close()
+        _, ps = run(["project-stats", "--db", str(db)])
+        self.assertIn(f"— {ALL_EST} |", ps)
+        _, ts = run(["token-stats", "--db", str(db)])
+        self.assertIn(f"(seed rates) — {ALL_EST} |", ts)
+        self.assertIn("No own published price for `claude-sonnet-5` —", ts)
 
 
 if __name__ == "__main__":

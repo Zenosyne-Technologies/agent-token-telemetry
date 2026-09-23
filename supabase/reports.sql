@@ -6,7 +6,7 @@
 -- The client renders `/token-stats`, `/project-stats` and `/info` from the exact
 -- same aggregations whether the data lives in the local SQLite store or the
 -- remote Supabase (Postgres) store. `scripts/report.py` is the REFERENCE dialect
--- (SQLite); the view + functions below reproduce its pricing resolution, its time
+-- (SQLite); the views + functions below reproduce its pricing resolution, its time
 -- windows, its tier mapping and its cost math in Postgres, returning `jsonb` the
 -- client maps 1:1 into the same Python shape `report.py`'s `fetch_*` returns.
 --
@@ -18,14 +18,14 @@
 --
 -- SECURITY MODEL — the load-bearing invariant a reviewer must confirm
 -- ---------------------------------------------------------------------------
--- Every function and the view below is **SECURITY INVOKER** (functions state it
--- explicitly; the view sets `security_invoker = true`). They therefore run with
+-- Every function and view below is **SECURITY INVOKER** (functions state it
+-- explicitly; each view sets `security_invoker = true`). They therefore run with
 -- the PRIVILEGES AND RLS OF THE CALLER, so the owner-scoped Row-Level Security in
 -- schema.sql applies and a caller sees ONLY THEIR OWN rows (own-rows-only). None
 -- of them is `SECURITY DEFINER` — that would run as the object owner and BYPASS
 -- the caller's RLS, turning a per-user report into a cross-user data leak. A
 -- Postgres VIEW is especially dangerous here: WITHOUT `security_invoker = true` a
--- view evaluates RLS as its OWNER (definer-like), so the flag below is mandatory,
+-- view evaluates RLS as its OWNER (definer-like), so the flags below are mandatory,
 -- not cosmetic. No `service_role` / secret / bypass key is referenced anywhere;
 -- reports run under the same per-user Auth JWT as the writes.
 --
@@ -36,11 +36,54 @@
 -- Re-runnable: drop-then-create, so re-applying this file is safe.
 -- ===========================================================================
 
--- Functions depend on the view; drop them first, then the view, then recreate.
+-- Functions depend on the views; drop them first, then the views (dependent
+-- first), then recreate.
 DROP FUNCTION IF EXISTS public.report_project_stats();
 DROP FUNCTION IF EXISTS public.report_token_stats();
 DROP FUNCTION IF EXISTS public.report_info(text);
 DROP VIEW IF EXISTS public.report_priced_events;
+DROP VIEW IF EXISTS public.report_model_pricing;
+
+-- ---------------------------------------------------------------------------
+-- report_model_pricing — one row per (model, pricing row whose `model_prefix` is
+-- a prefix of the model name), at every `effective_from`, carrying the row's
+-- rates and the ONE Postgres definition of the `estimated` flag. Both consumers
+-- read the flag from here: report_priced_events (for the row each event
+-- resolves to) and report_token_stats' models_without_own_price (a model with
+-- no row here whose `estimated` is false has no own price).
+--
+-- `security_invoker = true` (MANDATORY): the view evaluates RLS as the CALLER, so
+-- models/pricing are filtered to the caller's own owner_id.
+-- ---------------------------------------------------------------------------
+CREATE VIEW public.report_model_pricing
+  WITH (security_invoker = true) AS
+SELECT
+  m.owner_id        AS owner_id,
+  m.name            AS model_name,
+  pr.model_prefix   AS model_prefix,
+  pr.in_usd         AS in_usd,
+  pr.out_usd        AS out_usd,
+  pr.cache_r_usd    AS cache_r_usd,
+  pr.cache_w_usd    AS cache_w_usd,
+  pr.cache_w_1h_usd AS cache_w_1h_usd,
+  pr.effective_from AS effective_from,
+  -- true when pricing this model at this row is an ESTIMATE: the row is a
+  -- FAMILY DEFAULT row (a bare `claude-<family>-` prefix, the family's fallback
+  -- rate) or an ANCESTOR row (R = the model name minus the row's prefix opens
+  -- with a point-release segment `-<1-2 digits>`: an unlisted point release
+  -- priced at its nearest listed ancestor's row); false for the model's own
+  -- row. Twin of capture.is_estimated / capture.estimated_sql.
+  (pr.model_prefix OPERATOR(pg_catalog.~) '^claude-[a-z]+-$'
+   OR pg_catalog.substr(m.name,
+        pg_catalog.length(pr.model_prefix) OPERATOR(pg_catalog.+) 1)
+      OPERATOR(pg_catalog.~) '^-[0-9]{1,2}(-|$)') AS estimated
+FROM public.models m
+JOIN public.pricing pr
+  ON pr.owner_id = m.owner_id
+ AND m.name LIKE pr.model_prefix || '%';
+
+GRANT SELECT ON public.report_model_pricing TO authenticated;
+REVOKE ALL ON public.report_model_pricing FROM PUBLIC, anon;
 
 -- ---------------------------------------------------------------------------
 -- report_priced_events — one row per event, priced at the rate in force at the
@@ -50,9 +93,10 @@ DROP VIEW IF EXISTS public.report_priced_events;
 -- whose `effective_from <= ts`, choosing the LONGEST prefix then the LATEST
 -- `effective_from`. `report.py` runs one correlated subquery per rate column, all
 -- with identical WHERE/ORDER/LIMIT, so they all resolve to the SAME pricing row;
--- the LATERAL join below picks that one row once and reads every column from it —
--- equivalent given a unique best match (the pricing UNIQUE key + curated data
--- guarantee it; a prefix/effective_from tie would be ambiguous in BOTH dialects).
+-- the LATERAL join below picks that one row once (from report_model_pricing, the
+-- model's matching rows) and reads every column from it — equivalent given a
+-- unique best match (the pricing UNIQUE key + curated data guarantee it; a
+-- prefix/effective_from tie would be ambiguous in BOTH dialects).
 --
 -- `security_invoker = true` (MANDATORY): the view evaluates RLS as the CALLER, so
 -- events/models/sessions/pricing are all filtered to the caller's own owner_id.
@@ -80,29 +124,22 @@ SELECT
   pr.cache_w_usd   AS cache_w_usd,
   pr.cache_w_1h_usd AS cache_w_1h_usd,
   pr.effective_from AS rate_from,
-  -- true when this event's cost is an ESTIMATE: the resolved row is a FAMILY
-  -- DEFAULT row (a bare `claude-<family>-` prefix, the family's fallback rate)
-  -- or an ANCESTOR row (R = the model name minus the row's prefix opens with a
-  -- point-release segment `-<1-2 digits>`: an unlisted point release priced at
-  -- its nearest listed ancestor's row); false for the model's own row; NULL
-  -- when unpriced. Twin of capture.is_estimated / capture.estimated_sql.
-  (pr.model_prefix OPERATOR(pg_catalog.~) '^claude-[a-z]+-$'
-   OR pg_catalog.substr(m.name,
-        pg_catalog.length(pr.model_prefix) OPERATOR(pg_catalog.+) 1)
-      OPERATOR(pg_catalog.~) '^-[0-9]{1,2}(-|$)') AS estimated
+  -- the resolved row's report_model_pricing.estimated: true = the event's cost
+  -- is an ESTIMATE, false = the model's own row, NULL = unpriced.
+  pr.estimated     AS estimated
 FROM public.events e
 JOIN public.models m
   ON m.owner_id = e.owner_id AND m.name = e.model_name
 JOIN public.sessions s
   ON s.owner_id = e.owner_id AND s.uuid = e.session_uuid
 LEFT JOIN LATERAL (
-  SELECT p.in_usd, p.out_usd, p.cache_r_usd, p.cache_w_usd,
-         p.cache_w_1h_usd, p.effective_from, p.model_prefix
-  FROM public.pricing p
-  WHERE p.owner_id = e.owner_id
-    AND m.name LIKE p.model_prefix || '%'
-    AND p.effective_from <= e.ts
-  ORDER BY length(p.model_prefix) DESC, p.effective_from DESC
+  SELECT mp.in_usd, mp.out_usd, mp.cache_r_usd, mp.cache_w_usd,
+         mp.cache_w_1h_usd, mp.effective_from, mp.model_prefix, mp.estimated
+  FROM public.report_model_pricing mp
+  WHERE mp.owner_id = e.owner_id
+    AND mp.model_name = m.name
+    AND mp.effective_from <= e.ts
+  ORDER BY length(mp.model_prefix) DESC, mp.effective_from DESC
   LIMIT 1
 ) pr ON true;
 
@@ -117,7 +154,8 @@ REVOKE ALL ON public.report_priced_events FROM PUBLIC, anon;
 -- classic (uncached in/out) and cached (read/write, with the 1h cache-write slice
 -- priced at its own rate and falling back to the 5m rate). The basename fallback
 -- for the display name stays in the CLIENT renderer, so raw path + name are
--- returned here exactly as the SQLite fetch leaves them.
+-- returned here exactly as the SQLite fetch leaves them. `estimated_events`
+-- counts the project's events priced at an estimate (the view's `estimated`).
 -- ---------------------------------------------------------------------------
 CREATE FUNCTION public.report_project_stats()
 RETURNS jsonb
@@ -156,7 +194,12 @@ AS $$
       CASE WHEN min(pe.ts) IS NULL THEN NULL
            ELSE (to_timestamp(min(pe.ts))::date)::text END     AS first_seen,
       CASE WHEN max(pe.ts) IS NULL THEN NULL
-           ELSE (to_timestamp(max(pe.ts))::date)::text END     AS last_activity
+           ELSE (to_timestamp(max(pe.ts))::date)::text END     AS last_activity,
+      -- events priced at an ESTIMATE (view column `estimated`: family default
+      -- or ancestor row); NULL (unpriced) and false both count 0, exactly as
+      -- report.py's SUM(CASE WHEN estimated = 1 ...).
+      pg_catalog.sum(CASE WHEN pe.estimated THEN 1 ELSE 0 END)
+                                                               AS estimated_events
     FROM public.projects p
     LEFT JOIN public.sessions s
       ON s.owner_id = p.owner_id AND s.project_path = p.path
@@ -183,6 +226,10 @@ GRANT EXECUTE ON FUNCTION public.report_project_stats() TO authenticated;
 --     avoids ties on that key so the two dialects cannot order a tie differently.
 -- Tiers map claude-fable/opus/sonnet/haiku prefixes to orchestrator/heavy/small/
 -- micro. Raw path+name are returned for by_project (basename stays client-side).
+-- The estimate figures (estimated_by_model, events_by_model, unpriced_by_model,
+-- models_without_own_price) mirror report.py's keys of the same names; they
+-- read only through the SECURITY INVOKER view and RLS-scoped tables, so they
+-- widen nothing a caller can see.
 -- ---------------------------------------------------------------------------
 CREATE FUNCTION public.report_token_stats()
 RETURNS jsonb
@@ -309,6 +356,63 @@ BEGIN
         FROM public.events
         WHERE issue_key IS NOT NULL
         GROUP BY issue_key
+      ) q),
+    -- Estimate figures, same 7-day backlog-excluded window as by_model (twin of
+    -- report.py's estimated_by_model / events_by_model / unpriced_by_model):
+    -- model -> count, models with a zero count omitted except in
+    -- events_by_model, which lists every by_model name.
+    'estimated_by_model', (
+      SELECT coalesce(
+               pg_catalog.jsonb_object_agg(q.model_name, q.n),
+               '{}'::pg_catalog.jsonb)
+      FROM (
+        SELECT pe.model_name AS model_name, pg_catalog.count(*) AS n
+        FROM public.report_priced_events pe
+        WHERE pe.ts >= v_week AND coalesce(pe.note, '') <> 'backlog-capture'
+          AND pe.estimated
+        GROUP BY pe.model_name
+      ) q),
+    'events_by_model', (
+      SELECT coalesce(
+               pg_catalog.jsonb_object_agg(q.model_name, q.n),
+               '{}'::pg_catalog.jsonb)
+      FROM (
+        SELECT pe.model_name AS model_name, pg_catalog.count(*) AS n
+        FROM public.report_priced_events pe
+        WHERE pe.ts >= v_week AND coalesce(pe.note, '') <> 'backlog-capture'
+        GROUP BY pe.model_name
+      ) q),
+    'unpriced_by_model', (
+      SELECT coalesce(
+               pg_catalog.jsonb_object_agg(q.model_name, q.n),
+               '{}'::pg_catalog.jsonb)
+      FROM (
+        SELECT pe.model_name AS model_name, pg_catalog.count(*) AS n
+        FROM public.report_priced_events pe
+        WHERE pe.ts >= v_week AND coalesce(pe.note, '') <> 'backlog-capture'
+          AND pe.rate_from IS NULL
+        GROUP BY pe.model_name
+      ) q),
+    -- Models WITHOUT OWN PRICE, all-time (twin of report.py's
+    -- fetch_models_without_own_price): a model with at least one event and no
+    -- pricing row matching it (any effective_from) that is neither a family
+    -- default row nor an ancestor row for it, i.e. no report_model_pricing row
+    -- with `estimated` false. Sorted by byte order (COLLATE "C") to match
+    -- SQLite's BINARY ORDER BY. RLS scopes every table to the caller.
+    'models_without_own_price', (
+      SELECT coalesce(
+               pg_catalog.jsonb_agg(q.name ORDER BY q.name COLLATE pg_catalog."C"),
+               '[]'::pg_catalog.jsonb)
+      FROM (
+        SELECT DISTINCT m.name AS name
+        FROM public.models m
+        WHERE EXISTS (
+                SELECT 1 FROM public.events e
+                WHERE e.owner_id = m.owner_id AND e.model_name = m.name)
+          AND NOT EXISTS (
+                SELECT 1 FROM public.report_model_pricing mp
+                WHERE mp.owner_id = m.owner_id AND mp.model_name = m.name
+                  AND NOT mp.estimated)
       ) q)
   ) INTO result;
   RETURN result;

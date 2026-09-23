@@ -28,6 +28,7 @@ Three layers, from always-on to environment-gated:
 import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -256,8 +257,14 @@ def token_stats_to_json(d):
         "by_tier": [list(r) for r in d["by_tier"]],
         "by_issue": [list(r) for r in d["by_issue"]],
         "estimated_by_model": d["estimated_by_model"],
+        "events_by_model": d["events_by_model"],
+        "unpriced_by_model": d["unpriced_by_model"],
         "models_without_own_price": d["models_without_own_price"],
     }
+
+
+ESTIMATE_KEYS = ("estimated_by_model", "events_by_model", "unpriced_by_model",
+                 "models_without_own_price")
 
 
 def info_to_json(central):
@@ -318,6 +325,13 @@ class TestSqliteReference(unittest.TestCase):
             "claude-opus-5-5": 1})
         self.assertEqual(d["models_without_own_price"],
                          EXPECTED_WITHOUT_OWN_PRICE)
+        # the per-model event / unpriced counts the cost qualifiers divide by
+        self.assertEqual(d["events_by_model"], {
+            "claude-sonnet-5": 1, "claude-opus-4-8": 1,
+            "claude-sonnet-4-5-8": 1, "claude-haiku-5": 1, "gpt-4o": 1,
+            "claude-3-5-haiku-20241022": 1, "claude-opus-5-5": 1,
+            "claude-haiku-4-5-20251001": 1})
+        self.assertEqual(d["unpriced_by_model"], {"gpt-4o": 1})
         # the scoped-rollup summer counts the same events
         rowids = [r[0] for r in self.conn.execute("SELECT rowid FROM events")]
         s = report.priced_sum_for_rowids(self.conn, rowids)
@@ -325,6 +339,30 @@ class TestSqliteReference(unittest.TestCase):
             1 for v in EXPECTED_ESTIMATED.values() if v))
         self.assertEqual(report.priced_sum_for_rowids(self.conn, [])
                          ["estimated"], 0)
+
+    def test_estimate_rendered_reference(self):
+        # the rendered qualifiers the Postgres side must reproduce byte-for-byte
+        ps = report.render_project_stats(report.fetch_project_stats(self.conn))
+        self.assertIn("— 3 of 4 events at an estimated rate |", ps)   # Alpha
+        self.assertIn("— 1 of 7 events unpriced, 4 of 7 events at an"
+                      " estimated rate |", ps)                         # beta
+        ts = report.render_token_stats(report.fetch_token_stats(self.conn))
+        # the ancestor-priced unlisted successor: its whole figure estimated
+        self.assertIn("| claude-opus-5-5 | heavy | 9,000 | 3,000 | $0.14 —"
+                      " the whole figure is an estimate (every event at an"
+                      " estimated rate) |", ts)
+        # the snapshot priced by its own row: no qualifier
+        self.assertIn("| claude-haiku-4-5-20251001 | micro | 4,000 | 800 |"
+                      " $0.01 |", ts)
+        self.assertIn("; 1 of 8 events unpriced, 4 of 8 events at an"
+                      " estimated rate.**", ts)
+        self.assertEqual(
+            ts.splitlines()[-1],
+            "No own published price for `claude-haiku-5`, `claude-opus-4-8`,"
+            " `claude-opus-5-5`, `claude-sonnet-5`, `gpt-4o` — their cost is"
+            " an estimate (family default or nearest listed ancestor rate) or"
+            " unpriced; `/token-telemetry:pricing-update` refreshes the"
+            " pricing table.")
 
     def test_info_reference_counts(self):
         c = report.fetch_info_central(self.conn, "/home/user/alpha")
@@ -435,11 +473,29 @@ class TestMockedClientRead(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", self.responder):
             got = b.read_for_report("token-stats")
         ref = report.fetch_token_stats(self.ref)
-        for k in ("estimated_by_model", "models_without_own_price"):
+        for k in ESTIMATE_KEYS:
             self.assertEqual(got[k], ref[k], k)
+        self.assertEqual(set(got), set(ref))   # identical key set
         self.assertEqual(report.render_token_stats(got),
                          report.render_token_stats(
                              report.fetch_token_stats(self.ref)))
+
+    def test_remote_predating_estimate_figures_renders_without_them(self):
+        # a remote whose reports.sql predates the figures: keys map to None,
+        # the render says nothing about estimates and still succeeds
+        old_ts = {k: v for k, v in self.json["report_token_stats"].items()
+                  if k not in ESTIMATE_KEYS}
+        ts = supabase_backend._map_token_stats(old_ts)
+        for k in ESTIMATE_KEYS:
+            self.assertIsNone(ts[k], k)
+        md = report.render_token_stats(ts)
+        self.assertNotIn("estimated rate", md)
+        self.assertNotIn("No own published price", md)
+        old_ps = [{k: v for k, v in r.items() if k != "estimated_events"}
+                  for r in self.json["report_project_stats"]]
+        ps = supabase_backend._map_project_stats(old_ps)
+        self.assertTrue(all(r["estimated_events"] is None for r in ps))
+        self.assertNotIn("estimated rate", report.render_project_stats(ps))
 
     def test_read_for_report_maps_info(self):
         b = self.backend()
@@ -644,6 +700,12 @@ class TestPostgresEquivalence(unittest.TestCase):
         ref = report.fetch_project_stats(self.sqlite_ref())
         self.assertEqual(report.render_project_stats(pg),
                          report.render_project_stats(ref))
+        # the estimate figure itself, per project — not merely its rendering
+        self.assertEqual({r["path"]: r["estimated_events"] for r in pg},
+                         {r["path"]: r["estimated_events"] for r in ref})
+        # non-vacuous: the compared render really carries the qualifiers
+        self.assertIn("4 of 7 events at an estimated rate",
+                      report.render_project_stats(pg))
 
     def test_token_stats_equivalent(self):
         pg = supabase_backend._map_token_stats(
@@ -651,6 +713,22 @@ class TestPostgresEquivalence(unittest.TestCase):
         ref = report.fetch_token_stats(self.sqlite_ref())
         self.assertEqual(report.render_token_stats(pg),
                          report.render_token_stats(ref))
+        for k in ESTIMATE_KEYS:
+            self.assertEqual(pg[k], ref[k], k)
+        self.assertEqual(pg["models_without_own_price"],
+                         EXPECTED_WITHOUT_OWN_PRICE)   # incl. claude-opus-5-5
+        self.assertEqual(pg["estimated_by_model"]["claude-opus-5-5"], 1)
+        md = report.render_token_stats(pg)
+        self.assertIn("No own published price for", md)
+        self.assertIn("4 of 8 events at an estimated rate", md)
+
+    def test_reapplying_reports_sql_is_safe(self):
+        # drop-then-create: applying the file again over itself must succeed
+        # and leave the report functions answering identically
+        before = self._rpc("SELECT public.report_token_stats();")
+        self._run_sql_file(self.dbname, REPORTS_SQL)
+        self.assertEqual(self._rpc("SELECT public.report_token_stats();"),
+                         before)
 
     def test_estimated_per_event_equivalent(self):
         # The view's `estimated` must resolve from the SAME pricing row as
@@ -675,6 +753,134 @@ class TestPostgresEquivalence(unittest.TestCase):
             self.assertEqual(pg[k], ref[k], k)
 
 
+OWNER2 = "22222222-2222-4222-8222-222222222222"
+
+# auth.uid() driven by a session setting, so the test can act as a given user
+# under the `authenticated` role — where the schema.sql RLS policies APPLY
+# (unlike the superuser connection above, which bypasses them).
+PG_RLS_SHIM = """
+CREATE SCHEMA IF NOT EXISTS auth;
+CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE
+  AS $$ SELECT nullif(current_setting('test.uid', true), '')::uuid $$;
+DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE ROLE anon; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+GRANT USAGE ON SCHEMA auth TO authenticated;
+SET TIME ZONE 'UTC';
+"""
+
+
+def pg_intruder_sql():
+    """A second user's rows: a project, a model with NO own price and an
+    event in the 7-day window, plus an OWN pricing row for the first user's
+    ancestor-priced 'claude-opus-5-5'. If any estimate figure leaked across
+    owners, the first user's report would change (an extra model without own
+    price, or 'claude-opus-5-5' losing its estimate)."""
+    o = _sql_lit(OWNER2)
+    return "\n".join([
+        f"INSERT INTO public.users(uuid, name, created_at) VALUES ({o}, 'Other', {NOW});",
+        f"INSERT INTO public.projects(owner_id, path, name) VALUES ({o}, '/home/user/secret', 'Secret');",
+        f"INSERT INTO public.models(owner_id, name) VALUES ({o}, 'claude-intruder-9');",
+        f"INSERT INTO public.models(owner_id, name) VALUES ({o}, 'claude-opus-5-5');",
+        "INSERT INTO public.pricing(owner_id, provider, model_prefix, model_version,"
+        " in_usd, out_usd, cache_r_usd, cache_w_usd, cache_w_1h_usd,"
+        f" effective_from, source) VALUES ({o}, 'anthropic', 'claude-opus-5-5',"
+        " '', 9, 9, 9, 9, 9, 0, 'test');",
+        f"INSERT INTO public.sessions(owner_id, uuid, project_path) VALUES ({o}, 's-x1', '/home/user/secret');",
+        "INSERT INTO public.events(owner_id, session_uuid, model_name, ts, kind,"
+        " agent, in_tok, out_tok, cache_r, cache_w, cache_w_1h, issue_key, note)"
+        f" VALUES ({o}, 's-x1', 'claude-intruder-9', {NOW - D}, 0, NULL, 777,"
+        " 999999, 0, 0, 0, NULL, NULL);",
+        "INSERT INTO public.events(owner_id, session_uuid, model_name, ts, kind,"
+        " agent, in_tok, out_tok, cache_r, cache_w, cache_w_1h, issue_key, note)"
+        f" VALUES ({o}, 's-x1', 'claude-opus-5-5', {NOW - D}, 0, NULL, 5, 5,"
+        " 0, 0, 0, NULL, NULL);",
+    ])
+
+
+@unittest.skipUnless(PG_TOOLS, PG_REASON)
+class TestPostgresEstimateRls(unittest.TestCase):
+    """The estimate figures read only through RLS: acting as one user under
+    the `authenticated` role, the report functions return exactly the SQLite
+    reference for that user's corpus, and another user's rows (models without
+    own price, own pricing rows, events) never reach it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dbname = f"tt_rls_{os.getpid()}"
+        try:
+            subprocess.run(["createdb", cls.dbname], check=True,
+                           capture_output=True, env=os.environ.copy(),
+                           timeout=30)
+        except Exception as exc:
+            raise unittest.SkipTest(f"createdb unavailable: {exc}")
+        cls._prev_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+        TestPostgresEquivalence._run_sql_file(cls.dbname, "\n".join(
+            [PG_RLS_SHIM, SCHEMA_SQL, REPORTS_SQL, pg_corpus_sql(),
+             pg_intruder_sql()]))
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._prev_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = cls._prev_tz
+        time.tzset()
+        subprocess.run(["dropdb", "--if-exists", cls.dbname],
+                       capture_output=True, env=os.environ.copy(), timeout=30)
+
+    def _rpc_as(self, uid, sql):
+        r = subprocess.run(
+            ["psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+             "-d", self.dbname, "-c", "SET ROLE authenticated",
+             "-c", f"SET test.uid = '{uid}'", "-c", sql],
+            capture_output=True, text=True, env=os.environ.copy(), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip())
+
+    def sqlite_ref(self):
+        tmp = tempfile.mkdtemp()
+        return build_sqlite_corpus(pathlib.Path(tmp) / "usage.db")
+
+    def test_owner_sees_only_own_estimate_figures(self):
+        ref_conn = self.sqlite_ref()
+        ts = supabase_backend._map_token_stats(
+            self._rpc_as(OWNER, "SELECT public.report_token_stats();"))
+        ref = report.fetch_token_stats(ref_conn)
+        for k in ESTIMATE_KEYS:
+            self.assertEqual(ts[k], ref[k], k)
+        self.assertNotIn("claude-intruder-9", ts["models_without_own_price"])
+        self.assertIn("claude-opus-5-5", ts["models_without_own_price"])
+        self.assertEqual(report.render_token_stats(ts),
+                         report.render_token_stats(ref))
+        ps = supabase_backend._map_project_stats(
+            self._rpc_as(OWNER, "SELECT public.report_project_stats();"))
+        self.assertEqual(report.render_project_stats(ps),
+                         report.render_project_stats(
+                             report.fetch_project_stats(ref_conn)))
+
+    def test_other_owner_sees_only_theirs(self):
+        ts = supabase_backend._map_token_stats(
+            self._rpc_as(OWNER2, "SELECT public.report_token_stats();"))
+        # their own 'claude-opus-5-5' row is an own price for THEM only
+        self.assertEqual(ts["models_without_own_price"], ["claude-intruder-9"])
+        self.assertEqual(ts["estimated_by_model"], {})
+        self.assertEqual(ts["events_by_model"],
+                         {"claude-intruder-9": 1, "claude-opus-5-5": 1})
+        self.assertEqual(ts["unpriced_by_model"], {"claude-intruder-9": 1})
+        ps = supabase_backend._map_project_stats(
+            self._rpc_as(OWNER2, "SELECT public.report_project_stats();"))
+        self.assertEqual([r["path"] for r in ps], ["/home/user/secret"])
+        self.assertEqual(ps[0]["estimated_events"], 0)
+
+    def test_no_identity_sees_nothing(self):
+        ts = supabase_backend._map_token_stats(
+            self._rpc_as("", "SELECT public.report_token_stats();"))
+        for k in ESTIMATE_KEYS:
+            self.assertFalse(ts[k], k)
+
+
 class TestReportsSecurityHardening(unittest.TestCase):
     """Always-on structural guards on supabase/reports.sql (no Postgres needed).
     They pin the Supabase security posture its linter checks on a real instance
@@ -696,6 +902,21 @@ class TestReportsSecurityHardening(unittest.TestCase):
         # (3); the header's prose mention of "SECURITY INVOKER" won't match this.
         self.assertEqual(
             REPORTS_SQL.count("SECURITY INVOKER\nSET search_path = ''"), 3)
+
+    def test_every_view_is_security_invoker_and_authenticated_only(self):
+        # a view without security_invoker evaluates RLS as its OWNER; each
+        # view is created with the flag and granted to `authenticated` only
+        views = re.findall(r"CREATE VIEW (public\.\w+)\n  WITH "
+                           r"\(security_invoker = true\) AS", REPORTS_SQL)
+        self.assertEqual(len(views), REPORTS_SQL.count("CREATE VIEW"))
+        self.assertEqual(sorted(views), ["public.report_model_pricing",
+                                         "public.report_priced_events"])
+        for v in views:
+            self.assertIn(f"GRANT SELECT ON {v} TO authenticated;",
+                          REPORTS_SQL)
+            self.assertIn(f"REVOKE ALL ON {v} FROM PUBLIC, anon;",
+                          REPORTS_SQL)
+            self.assertIn(f"DROP VIEW IF EXISTS {v};", REPORTS_SQL)
 
 
 if __name__ == "__main__":

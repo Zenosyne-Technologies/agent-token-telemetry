@@ -693,8 +693,8 @@ def _map_project_stats(data):
     :func:`report.fetch_project_stats` returns (keyed by ``report.STATS_KEYS``).
     The RPC returns raw ``path``/``name``; the basename fallback stays in the
     renderer, exactly as the local path leaves it. ``estimated_events`` is
-    ``None`` (not reported) while the RPC does not return it — the key keeps
-    the shape identical to the local fetch."""
+    the RPC's count; it maps to ``None`` (not reported — the renderer then
+    says nothing) only against a remote whose ``reports.sql`` predates it."""
     out = []
     for r in (data or []):
         out.append({
@@ -719,10 +719,16 @@ def _map_token_stats(data):
     :func:`report.fetch_token_stats` returns. Tuples/positions and column types
     match the SQLite path so the shared renderer is source-agnostic. The
     ``by_project`` basename fallback is applied here, exactly as the SQLite fetch
-    does in Python (``nm or Path(path).name``). ``estimated_by_model`` and
-    ``models_without_own_price`` are ``None`` (not reported) while the RPC does
-    not return them — the keys keep the shape identical to the local fetch."""
+    does in Python (``nm or Path(path).name``). The estimate figures
+    (``estimated_by_model``, ``events_by_model``, ``unpriced_by_model``,
+    ``models_without_own_price``) map 1:1; each is ``None`` (not reported —
+    the renderer then says nothing) only against a remote whose
+    ``reports.sql`` predates it, so the keys always match the local fetch."""
     data = data or {}
+
+    def counts(key):
+        v = data.get(key)
+        return None if v is None else {k: _i(n) for k, n in v.items()}
 
     def toks(v):
         v = v or [0, 0, 0, 0, 0]
@@ -749,10 +755,12 @@ def _map_token_stats(data):
                     for t, i, o, n in (data.get("by_tier") or [])],
         "by_issue": [(k, _i(i), _i(o), _i(cr), _i(cw), _i(n))
                      for k, i, o, cr, cw, n in (data.get("by_issue") or [])],
-        "estimated_by_model": (
-            None if data.get("estimated_by_model") is None
-            else {k: _i(v) for k, v in data["estimated_by_model"].items()}),
-        "models_without_own_price": data.get("models_without_own_price"),
+        "estimated_by_model": counts("estimated_by_model"),
+        "events_by_model": counts("events_by_model"),
+        "unpriced_by_model": counts("unpriced_by_model"),
+        "models_without_own_price": (
+            None if data.get("models_without_own_price") is None
+            else list(data["models_without_own_price"])),
     }
 
 

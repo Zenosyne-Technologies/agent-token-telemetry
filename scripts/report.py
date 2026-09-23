@@ -210,6 +210,69 @@ ORDER BY classic_in + classic_out + cached_r + cached_w DESC, output DESC;
     return [dict(zip(STATS_KEYS, r)) for r in rows]
 
 
+def cost_notes(events, unpriced, estimated):
+    """The qualifiers a cost figure carries, as a list of short phrases.
+
+    Unpriced and estimated are different things and are reported separately,
+    so both stay distinguishable when they occur together:
+
+    - ``"U of M events unpriced"`` when ``0 < unpriced < events`` (an all-
+      unpriced figure is rendered as ``unpriced`` by the caller instead);
+    - ``"N of M events at an estimated rate"`` when ``0 < estimated <
+      events``, or ``"the whole figure is an estimate (every event at an
+      estimated rate)"`` when ``estimated == events``.
+
+    Nothing is said for zero counts, and a count of ``None`` (a remote store
+    whose report functions predate the figure) is treated as "not reported".
+
+    :param events: the figure's event count ``M``.
+    :param unpriced: how many of them resolved to no pricing row.
+    :param estimated: how many priced at a family default or ancestor row
+        (capture.is_estimated).
+    :returns: the phrases, in that order; empty when there is nothing to say.
+    """
+    events = events or 0
+    notes = []
+    if unpriced and 0 < unpriced < events:
+        notes.append(f"{unpriced} of {events} events unpriced")
+    if estimated and estimated > 0:
+        if estimated >= events:
+            notes.append("the whole figure is an estimate"
+                         " (every event at an estimated rate)")
+        else:
+            notes.append(f"{estimated} of {events} events at an estimated"
+                         " rate")
+    return notes
+
+
+def with_notes(cell, notes):
+    """Append :func:`cost_notes` phrases to a table cost cell as
+    ``cell — note, note``; the cell is returned unchanged when there are none.
+
+    :param cell: the rendered cost cell.
+    :param notes: phrases from :func:`cost_notes`.
+    :returns: the cell with its qualifiers.
+    """
+    return cell + (" — " + ", ".join(notes) if notes else "")
+
+
+def own_price_footer(models):
+    """The one-line footer naming the models that have no own pricing row
+    (every event of theirs is estimated or unpriced), or ``None`` when there
+    are none — or when the list was not reported (``None``). Model names are
+    untrusted and pass through :func:`md_cell`.
+
+    :param models: model names from :func:`fetch_models_without_own_price`.
+    :returns: the footer line, or ``None``.
+    """
+    if not models:
+        return None
+    names = ", ".join(f"`{md_cell(m)}`" for m in models)
+    return (f"No own published price for {names} — their cost is an estimate"
+            " (family default or nearest listed ancestor rate) or unpriced;"
+            " `/token-telemetry:pricing-update` refreshes the pricing table.")
+
+
 def split_cell(total, left, right, bold=False):
     t = fmt_usd(total)
     if bold:
@@ -218,6 +281,9 @@ def split_cell(total, left, right, bold=False):
 
 
 def render_project_stats(rows):
+    """Render :func:`fetch_project_stats` rows as the ``/project-stats`` table.
+    The est. cost cell carries :func:`cost_notes` qualifiers (unpriced and
+    estimated events of that project)."""
     out = ["| project | sessions | events | input | output | cache read |"
            " cache write | est. cost (input / output) |"
            " classic (input / output) | cached (read / write) |"
@@ -242,9 +308,8 @@ def render_project_stats(rows):
             cached_cell = split_cell(cached, r["cached_r"], r["cached_w"])
             if r["rate_from"] == 0:
                 seed_seen = True
-            if 0 < r["unpriced_events"] < r["events"]:
-                est_cell += (f" — {r['unpriced_events']} of {r['events']}"
-                             " events unpriced")
+            est_cell = with_notes(est_cell, cost_notes(
+                r["events"], r["unpriced_events"], r.get("estimated_events")))
         out.append(
             f"| {project} | {r['sessions']} | {fmt_n(r['events'])} |"
             f" {fmt_n(r['input'])} | {fmt_n(r['output'])} |"
@@ -277,8 +342,12 @@ def fetch_token_stats(conn):
     ``estimated_by_model`` maps a model name to its count of events (same
     7-day, backlog-excluded window as ``by_model``) whose resolved pricing row
     makes it an estimate (capture.is_estimated); models with none are omitted.
-    ``models_without_own_price`` is :func:`fetch_models_without_own_price`
-    (all-time). Neither is rendered yet."""
+    ``events_by_model`` maps every ``by_model`` name to its event count in that
+    window and ``unpriced_by_model`` to its unpriced-event count (models with
+    none omitted) — the ``M`` and ``U`` the per-model and headline cost
+    qualifiers need (:func:`cost_notes`). ``models_without_own_price`` is
+    :func:`fetch_models_without_own_price` (all-time), rendered as the
+    :func:`own_price_footer`."""
     cw1h, cw1h_usd = priced_cte(conn)
     name = "p.name" if has_column(conn, "projects", "name") else "NULL"
 
@@ -336,12 +405,17 @@ SELECT model_name,
              + cache_w_1h*COALESCE(cache_w_1h_usd, cache_w_usd, 0))
              / 1000000.0, 4),
        MAX(rate_from),
-       SUM(CASE WHEN estimated = 1 THEN 1 ELSE 0 END)
+       SUM(CASE WHEN estimated = 1 THEN 1 ELSE 0 END),
+       COUNT(*),
+       SUM(CASE WHEN rate_from IS NULL THEN 1 ELSE 0 END)
 FROM priced GROUP BY model_name ORDER BY SUM(out_tok) DESC;""").fetchall()
     # by_model keeps its 6-tuple shape (the renderer and the remote mapper
-    # depend on it); the per-model estimated-event count rides alongside.
+    # depend on it); the per-model estimated/event/unpriced counts ride
+    # alongside.
     d["by_model"] = [tuple(r[:6]) for r in by_model]
     d["estimated_by_model"] = {r[0]: r[6] for r in by_model if r[6]}
+    d["events_by_model"] = {r[0]: r[7] for r in by_model}
+    d["unpriced_by_model"] = {r[0]: r[8] for r in by_model if r[8]}
     d["models_without_own_price"] = fetch_models_without_own_price(conn)
     d["by_kind"] = conn.execute(
         "SELECT CASE kind WHEN 0 THEN 'main' ELSE 'subagent' END,"
@@ -378,9 +452,25 @@ def md_table(header, align, rows):
 
 
 def render_token_stats(d):
+    """Render :func:`fetch_token_stats` data as the ``/token-stats`` markdown.
+
+    Cost figures carry :func:`cost_notes` qualifiers (unpriced and estimated
+    events, per model and summed in the headline) and the output ends with
+    the :func:`own_price_footer` when any model has no own price. Keys a
+    remote store did not report (``None``) render as "nothing to say"."""
     def tok_row(label, t):
         return [label, fmt_n(t[0]), fmt_n(t[1]), fmt_n(t[2]), fmt_n(t[3]),
                 str(t[4])]
+
+    est_by = d.get("estimated_by_model") or {}
+    ev_by = d.get("events_by_model")
+    un_by = d.get("unpriced_by_model") or {}
+
+    def model_notes(name):
+        if ev_by is None:
+            return []
+        return cost_notes(ev_by.get(name, 0), un_by.get(name, 0),
+                          est_by.get(name, 0))
 
     week_cost = sum(r[4] for r in d["by_model"])
     rates = [r[5] for r in d["by_model"] if r[5] is not None]
@@ -391,6 +481,10 @@ def render_token_stats(d):
     else:
         cost_label = (f"{fmt_usd(week_cost)} (rates as of "
                       + datetime.date.fromtimestamp(max(rates)).isoformat() + ")")
+    week_notes = ([] if ev_by is None else cost_notes(
+        sum(ev_by.values()), sum(un_by.values()), sum(est_by.values())))
+    if week_notes:
+        cost_label += "; " + ", ".join(week_notes)
     out = [f"**Today: {fmt_n(d['today'][1])} output /"
            f" {fmt_n(d['today'][0])} input tokens, {d['today'][4]} events —"
            f" trailing 7 days est. cost {cost_label}.**", ""]
@@ -407,8 +501,9 @@ def render_token_stats(d):
     model_rows = []
     for name, tier, inp, outp, cost, rate_from in d["by_model"]:
         label = ("unpriced" if rate_from is None
-                 else fmt_usd(cost)
-                 + (" (seed rates)" if rate_from == 0 else ""))
+                 else with_notes(fmt_usd(cost)
+                                 + (" (seed rates)" if rate_from == 0 else ""),
+                                 model_notes(name)))
         model_rows.append([md_cell(name), tier, fmt_n(inp), fmt_n(outp), label])
     out += md_table(["model", "tier", "input", "output", "est. cost"],
                     ["---", "---", "---:", "---:", "---:"], model_rows)
@@ -446,6 +541,9 @@ def render_token_stats(d):
                 " not when the tokens were spent). All-time views"
                 " (`/token-telemetry:project-stats`, the by-issue table)"
                 " include them."]
+    footer = own_price_footer(d.get("models_without_own_price"))
+    if footer:
+        out += ["", footer]
     return "\n".join(out)
 
 
@@ -633,7 +731,10 @@ def sanitize_invalid_echo(tok):
 
 
 def render_scoped_rollup(d):
-    out = ["", "**Scoped rollup**", ""]
+    """Render :func:`fetch_scoped_rollup` data. A covered rollup's cost line
+    ends with the :func:`cost_notes` qualifiers (unpriced and estimated events
+    across the scoped set)."""
+    out =["", "**Scoped rollup**", ""]
     if d["invalid"]:
         shown = ", ".join(f"`{sanitize_invalid_echo(t)}`" for t in d["invalid"])
         out.append(f"Rejected invalid scope key(s): {shown}"
@@ -656,9 +757,10 @@ def render_scoped_rollup(d):
         cost_label = f"{fmt_usd(d['cost'])} (seed rates)"
     else:
         cost_label = fmt_usd(d["cost"])
+    notes = cost_notes(d["events"], d.get("unpriced"), d.get("estimated"))
     out.append(f"**{cost_label}** — {fmt_n(d['events'])} events,"
                f" {fmt_n(d['in_tok'])} input / {fmt_n(d['out_tok'])} output"
-               " tokens.")
+               " tokens" + ("; " + ", ".join(notes) if notes else "") + ".")
     if d["k"] < d["n"]:
         out.append(f"{d['k']} of {d['n']} issues have rows.")
     return "\n".join(out)
