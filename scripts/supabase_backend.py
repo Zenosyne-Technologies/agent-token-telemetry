@@ -692,7 +692,9 @@ def _map_project_stats(data):
     """Map ``report_project_stats``'s JSON array into the list-of-dicts
     :func:`report.fetch_project_stats` returns (keyed by ``report.STATS_KEYS``).
     The RPC returns raw ``path``/``name``; the basename fallback stays in the
-    renderer, exactly as the local path leaves it."""
+    renderer, exactly as the local path leaves it. ``estimated_events`` is
+    ``None`` (not reported) while the RPC does not return it — the key keeps
+    the shape identical to the local fetch."""
     out = []
     for r in (data or []):
         out.append({
@@ -707,7 +709,8 @@ def _map_project_stats(data):
             "rate_from": _i(r.get("rate_from")),
             "unpriced_events": _i(r.get("unpriced_events")),
             "first_seen": r.get("first_seen"),
-            "last_activity": r.get("last_activity")})
+            "last_activity": r.get("last_activity"),
+            "estimated_events": _i(r.get("estimated_events"))})
     return out
 
 
@@ -716,7 +719,9 @@ def _map_token_stats(data):
     :func:`report.fetch_token_stats` returns. Tuples/positions and column types
     match the SQLite path so the shared renderer is source-agnostic. The
     ``by_project`` basename fallback is applied here, exactly as the SQLite fetch
-    does in Python (``nm or Path(path).name``)."""
+    does in Python (``nm or Path(path).name``). ``estimated_by_model`` and
+    ``models_without_own_price`` are ``None`` (not reported) while the RPC does
+    not return them — the keys keep the shape identical to the local fetch."""
     data = data or {}
 
     def toks(v):
@@ -744,6 +749,10 @@ def _map_token_stats(data):
                     for t, i, o, n in (data.get("by_tier") or [])],
         "by_issue": [(k, _i(i), _i(o), _i(cr), _i(cw), _i(n))
                      for k, i, o, cr, cw, n in (data.get("by_issue") or [])],
+        "estimated_by_model": (
+            None if data.get("estimated_by_model") is None
+            else {k: _i(v) for k, v in data["estimated_by_model"].items()}),
+        "models_without_own_price": data.get("models_without_own_price"),
     }
 
 

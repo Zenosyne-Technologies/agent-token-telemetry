@@ -165,6 +165,49 @@ PRICING_SEED = [
 ]
 SEED_SOURCE = "seed-v0.2.0"
 
+# A "family default" pricing row is one whose model_prefix is a bare family
+# prefix — `claude-<lowercase letters>-` and nothing else (the seed rows above,
+# and every dated `claude-<family>-` row pricing-update writes). It is the
+# fallback rate for any model of that family without a row of its own, so an
+# event that resolves to one prices at an ESTIMATE. See
+# docs/TELEMETRY-CONTRACT.md §Pricing table. Postgres twin:
+# `model_prefix ~ '^claude-[a-z]+-$'` (supabase/reports.sql).
+_FAMILY_DEFAULT_RE = re.compile(r"claude-[a-z]+-")
+
+
+def is_family_default(prefix):
+    """Whether a pricing row's ``model_prefix`` is a bare family prefix.
+
+    Exactly the regex ``^claude-[a-z]+-$`` (ASCII lowercase letters only, at
+    least one, whole string): ``claude-opus-`` and ``claude-fable-`` are family
+    defaults; ``claude-opus-5-5``, ``claude-opus-4-2025``, ``claude-3-5-haiku``
+    and ``claude-sonnet-4`` are not.
+
+    :param prefix: a ``pricing.model_prefix`` value (``None`` is not one).
+    :returns: ``True`` when the prefix is a family default, else ``False``.
+    """
+    return isinstance(prefix, str) and \
+        _FAMILY_DEFAULT_RE.fullmatch(prefix) is not None
+
+
+def family_default_sql(col):
+    """SQLite boolean expression (1/0, NULL for a NULL ``col``) equivalent to
+    :func:`is_family_default` on the text column/expression ``col``.
+
+    A single ``GLOB 'claude-[a-z]*-'`` is NOT equivalent — its ``*`` admits
+    digits and dashes (``claude-3-5-haiku-``, ``claude-opus-4-``). This checks
+    the structure instead: the value starts with ``claude-``, ends with ``-``,
+    has at least one character between them, and that middle contains no
+    character outside ``a-z``. GLOB is case-sensitive and compares code
+    points, matching the regex. Equivalence is pinned by tests over a
+    positive/negative list plus a randomized sweep.
+
+    :param col: a trusted SQL expression (a column reference), never user input.
+    :returns: the SQL fragment, parenthesized.
+    """
+    return (f"({col} GLOB 'claude-?*-'"
+            f" AND substr({col}, 8, length({col}) - 8) NOT GLOB '*[^a-z]*')")
+
 AUDIT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_log(
   ts      INTEGER NOT NULL,

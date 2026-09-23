@@ -95,12 +95,43 @@ def md_cell(value):
     return s
 
 
-def rate_subquery(column):
-    return (f"(SELECT pr.{column} FROM pricing pr"
+def resolved_subquery(expr):
+    """Correlated subquery evaluating ``expr`` (over pricing alias ``pr``) on
+    the pricing row resolved for event ``e`` / model ``m``: longest matching
+    prefix, then the latest ``effective_from <= e.ts``. NULL when no row
+    matches (the event is unpriced). The one definition of the resolution
+    every rate column and the family-default flag share."""
+    return (f"(SELECT {expr} FROM pricing pr"
             " WHERE m.name LIKE pr.model_prefix || '%'"
             " AND pr.effective_from <= e.ts"
             " ORDER BY LENGTH(pr.model_prefix) DESC, pr.effective_from DESC"
             " LIMIT 1)")
+
+
+def rate_subquery(column):
+    return resolved_subquery(f"pr.{column}")
+
+
+def family_default_subquery():
+    """1 when the event's resolved pricing row is a family default row (its
+    cost is an estimate at the family's rate), 0 when it is the model's own
+    row, NULL when the event is unpriced. See capture.is_family_default."""
+    return resolved_subquery(capture.family_default_sql("pr.model_prefix"))
+
+
+def fetch_models_without_own_price(conn):
+    """Model names that have at least one event and NO non-family-default
+    pricing row whose prefix matches them (any ``effective_from``) — every
+    event of such a model prices at a family default (an estimate) or not at
+    all. Sorted by name. Prefix matching is the resolver's own
+    ``LIKE model_prefix || '%'``."""
+    return [r[0] for r in conn.execute(
+        "SELECT m.name FROM models m"
+        " WHERE EXISTS (SELECT 1 FROM events e WHERE e.model_id = m.id)"
+        " AND NOT EXISTS (SELECT 1 FROM pricing pr"
+        "   WHERE m.name LIKE pr.model_prefix || '%'"
+        f"  AND NOT {capture.family_default_sql('pr.model_prefix')})"
+        " ORDER BY m.name").fetchall()]
 
 
 # ---------------------------------------------------------------- project-stats
@@ -108,7 +139,8 @@ def rate_subquery(column):
 STATS_KEYS = ("path", "name", "sessions", "events", "input", "output",
               "cache_read", "cache_write",
               "classic_in", "classic_out", "cached_r", "cached_w",
-              "rate_from", "unpriced_events", "first_seen", "last_activity")
+              "rate_from", "unpriced_events", "first_seen", "last_activity",
+              "estimated_events")
 
 
 def priced_cte(conn):
@@ -125,7 +157,9 @@ def fetch_project_stats(conn):
     """One dict per project, ordered by estimated cost. Each event prices at
     the rate in force at its own timestamp (see docs/TELEMETRY-CONTRACT.md).
     Cost components are returned separately: classic (uncached input/output)
-    and cached (read/write) sum to the estimate."""
+    and cached (read/write) sum to the estimate. ``estimated_events`` counts
+    the project's events whose resolved pricing row is a family default row
+    (priced at the family's fallback rate — an estimate)."""
     cw1h, cw1h_usd = priced_cte(conn)
     name = "p.name" if has_column(conn, "projects", "name") else "NULL"
     rows = conn.execute(f"""
@@ -137,7 +171,8 @@ WITH priced AS (
          {rate_subquery('cache_r_usd')} AS cache_r_usd,
          {rate_subquery('cache_w_usd')} AS cache_w_usd,
          {cw1h_usd} AS cache_w_1h_usd,
-         {rate_subquery('effective_from')} AS rate_from
+         {rate_subquery('effective_from')} AS rate_from,
+         {family_default_subquery()} AS family_default
   FROM projects p
   LEFT JOIN sessions s ON s.project_id = p.id
   LEFT JOIN events   e ON e.session_id = s.id
@@ -163,7 +198,9 @@ SELECT path, name,
        SUM(CASE WHEN ts IS NOT NULL AND rate_from IS NULL THEN 1 ELSE 0 END)
          AS unpriced_events,
        date(MIN(ts), 'unixepoch', 'localtime') AS first_seen,
-       date(MAX(ts), 'unixepoch', 'localtime') AS last_activity
+       date(MAX(ts), 'unixepoch', 'localtime') AS last_activity,
+       SUM(CASE WHEN family_default = 1 THEN 1 ELSE 0 END)
+         AS estimated_events
 FROM priced GROUP BY path
 ORDER BY classic_in + classic_out + cached_r + cached_w DESC, output DESC;
 """).fetchall()
@@ -231,7 +268,14 @@ LOCAL_TODAY = "ts >= strftime('%s','now','localtime','start of day','utc')"
 
 
 def fetch_token_stats(conn):
-    """Every breakdown the token-stats report shows, as plain data."""
+    """Every breakdown the token-stats report shows, as plain data.
+
+    Besides the rendered breakdowns it carries the family-default flag data:
+    ``estimated_by_model`` maps a model name to its count of events (same
+    7-day, backlog-excluded window as ``by_model``) whose resolved pricing row
+    is a family default — an estimate; models with none are omitted.
+    ``models_without_own_price`` is :func:`fetch_models_without_own_price`
+    (all-time). Neither is rendered yet."""
     cw1h, cw1h_usd = priced_cte(conn)
     name = "p.name" if has_column(conn, "projects", "name") else "NULL"
 
@@ -261,7 +305,7 @@ def fetch_token_stats(conn):
         " FROM events WHERE ts >= strftime('%s','now','-7 days')"
         f" AND {NOT_BACKLOG}"
         " GROUP BY 1 ORDER BY SUM(out_tok) DESC").fetchall()
-    d["by_model"] = conn.execute(f"""
+    by_model = conn.execute(f"""
 WITH priced AS (
   SELECT e.in_tok, e.out_tok, e.cache_r, e.cache_w, {cw1h} AS cache_w_1h,
          m.name AS model_name,
@@ -270,7 +314,8 @@ WITH priced AS (
          {rate_subquery('cache_r_usd')} AS cache_r_usd,
          {rate_subquery('cache_w_usd')} AS cache_w_usd,
          {cw1h_usd} AS cache_w_1h_usd,
-         {rate_subquery('effective_from')} AS rate_from
+         {rate_subquery('effective_from')} AS rate_from,
+         {family_default_subquery()} AS family_default
   FROM events e JOIN models m ON m.id = e.model_id
   WHERE e.ts >= strftime('%s','now','-7 days') AND {NOT_BACKLOG}
 )
@@ -287,8 +332,14 @@ SELECT model_name,
              + (cache_w - cache_w_1h)*COALESCE(cache_w_usd,0)
              + cache_w_1h*COALESCE(cache_w_1h_usd, cache_w_usd, 0))
              / 1000000.0, 4),
-       MAX(rate_from)
+       MAX(rate_from),
+       SUM(CASE WHEN family_default = 1 THEN 1 ELSE 0 END)
 FROM priced GROUP BY model_name ORDER BY SUM(out_tok) DESC;""").fetchall()
+    # by_model keeps its 6-tuple shape (the renderer and the remote mapper
+    # depend on it); the per-model estimated-event count rides alongside.
+    d["by_model"] = [tuple(r[:6]) for r in by_model]
+    d["estimated_by_model"] = {r[0]: r[6] for r in by_model if r[6]}
+    d["models_without_own_price"] = fetch_models_without_own_price(conn)
     d["by_kind"] = conn.execute(
         "SELECT CASE kind WHEN 0 THEN 'main' ELSE 'subagent' END,"
         " SUM(in_tok), SUM(out_tok),"
@@ -475,9 +526,11 @@ def rowids_for_commit_shas(conn, project_path, shas):
 
 def priced_sum_for_rowids(conn, rowids):
     """Same per-event pricing as fetch_project_stats/fetch_token_stats,
-    restricted to a caller-supplied set of event rowids."""
+    restricted to a caller-supplied set of event rowids. ``estimated`` counts
+    the events whose resolved pricing row is a family default row."""
     empty = {"in_tok": 0, "out_tok": 0, "cache_r": 0, "cache_w": 0,
-             "events": 0, "cost": 0.0, "rate_from": None, "unpriced": 0}
+             "events": 0, "cost": 0.0, "rate_from": None, "unpriced": 0,
+             "estimated": 0}
     if not rowids:
         return empty
     cw1h, cw1h_usd = priced_cte(conn)
@@ -490,7 +543,8 @@ WITH priced AS (
          {rate_subquery('cache_r_usd')} AS cache_r_usd,
          {rate_subquery('cache_w_usd')} AS cache_w_usd,
          {cw1h_usd} AS cache_w_1h_usd,
-         {rate_subquery('effective_from')} AS rate_from
+         {rate_subquery('effective_from')} AS rate_from,
+         {family_default_subquery()} AS family_default
   FROM events e LEFT JOIN models m ON m.id = e.model_id
   WHERE e.rowid IN ({placeholders})
 )
@@ -503,12 +557,13 @@ SELECT COALESCE(SUM(in_tok), 0), COALESCE(SUM(out_tok), 0),
              + SUM(cache_w_1h * COALESCE(cache_w_1h_usd, cache_w_usd, 0)),
              0) / 1000000.0,
        MAX(rate_from),
-       SUM(CASE WHEN rate_from IS NULL THEN 1 ELSE 0 END)
+       SUM(CASE WHEN rate_from IS NULL THEN 1 ELSE 0 END),
+       SUM(CASE WHEN family_default = 1 THEN 1 ELSE 0 END)
 FROM priced""", rowids).fetchone()
-    inp, outp, cr, cw, n, cost, rate_from, unpriced = row
+    inp, outp, cr, cw, n, cost, rate_from, unpriced, estimated = row
     return {"in_tok": inp, "out_tok": outp, "cache_r": cr, "cache_w": cw,
             "events": n, "cost": cost or 0.0, "rate_from": rate_from,
-            "unpriced": unpriced or 0}
+            "unpriced": unpriced or 0, "estimated": estimated or 0}
 
 
 def fetch_scoped_rollup(conn, cwd, scope_raw):
@@ -553,6 +608,7 @@ def fetch_scoped_rollup(conn, cwd, scope_raw):
         "cost": sum(x["cost"] for x in covered),
         "rate_from": [x["rate_from"] for x in covered],
         "unpriced": sum(x["unpriced"] for x in covered),
+        "estimated": sum(x["estimated"] for x in covered),
     }
     return {"state": "partial" if k < n else "full", "keys": valid,
             "invalid": invalid, "n": n, "k": k, **totals}

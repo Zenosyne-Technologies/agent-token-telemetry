@@ -69,6 +69,35 @@ class TestDashboardData(unittest.TestCase):
         self.assertAlmostEqual(sum(g["cost"] for g in d["byProject"]), k["cost"], places=6)
         self.assertEqual(d["byModel"][0]["name"], "Sonnet 5")
 
+    def test_family_default_flag_is_carried_without_changing_cost(self):
+        # Seed rows are family defaults: the sonnet event is an estimate. An
+        # own row at the SAME rates flips the flag and leaves the cost alone.
+        self.seed_one()
+        conn = self._ro()
+        before = dashboard.build_data(conn, {"period": ["year"]})
+        conn.close()
+        self.assertTrue(before["events"]["rows"][0]["estimated"])
+        self.assertEqual(before["kpis"]["estimatedEvents"], 1)
+        self.assertEqual(before["byModel"][0]["estimated"], 1)
+        self.assertEqual(before["modelsWithoutOwnPrice"], ["claude-sonnet-5"])
+        rw = capture.connect(self.db)
+        with rw:
+            rw.execute(
+                "INSERT INTO pricing(provider, model_prefix, in_usd, out_usd,"
+                " cache_r_usd, cache_w_usd, cache_w_1h_usd, effective_from,"
+                " source) SELECT provider, 'claude-sonnet-5', in_usd, out_usd,"
+                " cache_r_usd, cache_w_usd, cache_w_1h_usd, 1, 'test'"
+                " FROM pricing WHERE model_prefix = 'claude-sonnet-'")
+        rw.close()
+        conn = self._ro()
+        after = dashboard.build_data(conn, {"period": ["year"]})
+        conn.close()
+        self.assertFalse(after["events"]["rows"][0]["estimated"])
+        self.assertEqual(after["kpis"]["estimatedEvents"], 0)
+        self.assertEqual(after["byModel"][0]["estimated"], 0)
+        self.assertEqual(after["modelsWithoutOwnPrice"], [])
+        self.assertEqual(after["kpis"]["cost"], before["kpis"]["cost"])
+
     def test_missing_db_is_read_only_safe(self):
         # build_data is never called without a conn; the HTTP layer guards None.
         # Here we assert the ro open of an absent DB stays absent.

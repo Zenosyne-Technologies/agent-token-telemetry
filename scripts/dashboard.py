@@ -34,6 +34,7 @@ import sqlite3
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture
+import report
 import settings
 
 HERE = Path(__file__).resolve().parent
@@ -130,13 +131,26 @@ def open_ro():
     return conn
 
 
-def _rate(col):
-    """Correlated subquery resolving one pricing column for event `e` / model
-    `m` at the event's own timestamp — longest matching prefix, latest rate in
-    force. Mirrors report.py so costs are identical across both surfaces."""
-    return (f"(SELECT pr.{col} FROM pricing pr "
+def _resolved(expr):
+    """Correlated subquery evaluating `expr` (over pricing alias `pr`) on the
+    pricing row resolved for event `e` / model `m` at the event's own
+    timestamp — longest matching prefix, latest rate in force. Mirrors
+    report.py so costs are identical across both surfaces."""
+    return (f"(SELECT {expr} FROM pricing pr "
             f"WHERE m.name LIKE pr.model_prefix || '%' AND pr.effective_from <= e.ts "
             f"ORDER BY LENGTH(pr.model_prefix) DESC, pr.effective_from DESC LIMIT 1)")
+
+
+def _rate(col):
+    """One pricing column of the event's resolved row (see `_resolved`)."""
+    return _resolved(f"pr.{col}")
+
+
+def _family_default():
+    """1 when the event's resolved pricing row is a family default row (an
+    estimate at the family's fallback rate), 0 for the model's own row, NULL
+    when unpriced. Same definition as report.py (capture.is_family_default)."""
+    return _resolved(capture.family_default_sql("pr.model_prefix"))
 
 
 def _pretty_model(name):
@@ -209,7 +223,8 @@ def fetch_rows(conn, since, models, agents):
              {calls_col} AS api_calls, {ctx_col} AS ctx_tokens,
              {_rate('in_usd')} AS r_in, {_rate('out_usd')} AS r_out,
              {_rate('cache_r_usd')} AS r_cr, {_rate('cache_w_usd')} AS r_cw,
-             {_rate('cache_w_1h_usd')} AS r_cw1h
+             {_rate('cache_w_1h_usd')} AS r_cw1h,
+             {_family_default()} AS family_default
       FROM events e
       JOIN models m ON m.id=e.model_id
       JOIN sessions s ON s.id=e.session_id
@@ -240,6 +255,7 @@ def fetch_rows(conn, since, models, agents):
             "costCacheW": cost_cw,
             "costConsumed": cost_in + cost_out, "costCache": cost_cr + cost_cw,
             "cost": cost_in + cost_out + cost_cr + cost_cw,
+            "estimated": r["family_default"] == 1,
         })
     return rows
 
@@ -258,8 +274,9 @@ def _group(rows, key, name_of):
         g = out.get(k)
         if g is None:
             g = out[k] = {"key": k, "name": name_of(r), "n": 0,
-                          **{f: 0 for f in _AGG_FIELDS}}
+                          "estimated": 0, **{f: 0 for f in _AGG_FIELDS}}
         g["n"] += 1
+        g["estimated"] += 1 if r["estimated"] else 0
         for f in _AGG_FIELDS:
             g[f] += r[f]
     return sorted(out.values(), key=lambda g: g["cost"], reverse=True)
@@ -350,7 +367,8 @@ def _event_dto(r):
             "cache_r": r["cache_r"], "cache_w": r["cache_w"],
             "costIn": r["costIn"], "costOut": r["costOut"],
             "costCacheR": r["costCacheR"], "costCacheW": r["costCacheW"],
-            "calls": r["calls"], "ctx": r["ctx"]}
+            "calls": r["calls"], "ctx": r["ctx"],
+            "estimated": r["estimated"]}
 
 
 def build_data(conn, q):
@@ -400,6 +418,7 @@ def build_data(conn, q):
         "projects": len({r["projectKey"] for r in rows}),
         "cachePct": (cachetok / total * 100) if total else 0.0,
         "outCostPct": (_sum(rows, "costOut") / cost * 100) if cost else 0.0,
+        "estimatedEvents": sum(1 for r in rows if r["estimated"]),
     }
 
     # None-safe sort: pre-v6 rows carry NULL calls/ctx and must not crash it
@@ -423,6 +442,9 @@ def build_data(conn, q):
             "sums": {"cost": cost, "total": total},
         },
         "backlogExcluded": backlog_excluded,
+        # models whose every event prices at a family default (no own row);
+        # data only — the page does not render it yet.
+        "modelsWithoutOwnPrice": report.fetch_models_without_own_price(conn),
         "generatedAt": now,
     }
 

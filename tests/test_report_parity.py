@@ -66,18 +66,23 @@ PROJECTS = [
 ]
 
 MODELS = ["claude-sonnet-5", "claude-sonnet-4-5-8", "claude-opus-4-8",
-          "claude-haiku-5", "gpt-4o"]
+          "claude-haiku-5", "gpt-4o", "claude-3-5-haiku-20241022"]
 
 # (provider, model_prefix, model_version, in, out, cache_r, cache_w, cache_w_1h,
 #  effective_from). Two 'claude-sonnet-' rows (seed@0 and dated@NOW-20d) exercise
 # effective_from supersession; 'claude-sonnet-4-5-' (longer) exercises longest-
-# prefix shadowing; gpt-4o has NO matching prefix (unpriced).
+# prefix shadowing; gpt-4o has NO matching prefix (unpriced); 'claude-3-5-haiku'
+# is a legacy-scheme OWN row (not a family default — digits after `claude-`).
+# Family-default coverage: the effective_from=0 seed rows and the dated bare
+# 'claude-sonnet-' row are family defaults; 'claude-sonnet-4-5-' and
+# 'claude-3-5-haiku' are not.
 PRICING = [
     ("anthropic", "claude-sonnet-", "", 3.0, 15.0, 0.30, 3.75, 6.0, 0),
     ("anthropic", "claude-sonnet-", "v2", 4.0, 20.0, 0.40, 5.0, 8.0, NOW - 20 * D),
     ("anthropic", "claude-sonnet-4-5-", "", 3.5, 17.5, 0.35, 4.375, 7.0, NOW - 10 * D),
     ("anthropic", "claude-opus-", "", 5.0, 25.0, 0.50, 6.25, 10.0, 0),
     ("anthropic", "claude-haiku-", "", 1.0, 5.0, 0.10, 1.25, 2.0, 0),
+    ("anthropic", "claude-3-5-haiku", "", 0.8, 4.0, 0.08, 1.0, 1.6, NOW - 40 * D),
 ]
 
 # (uuid, project_path)
@@ -94,7 +99,40 @@ EVENTS = [
     ("s-b1", "claude-sonnet-5",     NOW - 30 * D, 0, None, 200000, 90000,     0,    0,    0, "AOS-3", None),
     ("s-b1", "gpt-4o",              NOW - 3 * D, 0, None,   1000,  2000,     0,    0,    0, None,    None),
     ("s-b1", "claude-sonnet-5",     NOW - 2 * D, 0, None,   3000,  3000,     0,    0,    0, None, "backlog-capture"),
+    # legacy-prefix model priced by its OWN row -> not estimated
+    ("s-b1", "claude-3-5-haiku-20241022", NOW - 4 * D, 0, None, 7000, 1500, 0, 0, 0, None, None),
+    # the shadowing model BEFORE its own row takes effect (NOW-10d): resolves to
+    # the dated bare 'claude-sonnet-' row -> estimated, though the model HAS an
+    # own row (so it is not a "model without own price")
+    ("s-b1", "claude-sonnet-4-5-8", NOW - 12 * D, 1, "dev",  6000,  2500,     0,    0,    0, None,    None),
 ]
+
+# The family-default flag every event must resolve to, in BOTH dialects —
+# keyed (session, model, ts); None = unpriced.
+EXPECTED_FAMILY_DEFAULT = {
+    ("s-a1", "claude-sonnet-5", NOW): True,            # dated bare family row
+    ("s-a1", "claude-opus-4-8", NOW): True,            # effective_from=0 seed
+    ("s-a2", "claude-sonnet-4-5-8", NOW - 3 * D): False,   # own (shadowing) row
+    ("s-a2", "claude-haiku-5", NOW - 3 * D): True,     # seed
+    ("s-b1", "claude-sonnet-5", NOW - 30 * D): True,   # seed (dated row later)
+    ("s-b1", "gpt-4o", NOW - 3 * D): None,             # unpriced
+    ("s-b1", "claude-sonnet-5", NOW - 2 * D): True,    # backlog, dated family
+    ("s-b1", "claude-3-5-haiku-20241022", NOW - 4 * D): False,  # legacy own row
+    ("s-b1", "claude-sonnet-4-5-8", NOW - 12 * D): True,   # own row not yet in force
+}
+EXPECTED_WITHOUT_OWN_PRICE = ["claude-haiku-5", "claude-opus-4-8",
+                              "claude-sonnet-5", "gpt-4o"]
+
+
+def sqlite_family_default_by_event(conn):
+    """Per-event family-default flag from report.py's resolver, keyed like
+    EXPECTED_FAMILY_DEFAULT (0/1 normalized to bool, NULL kept as None)."""
+    rows = conn.execute(
+        f"SELECT s.uuid, m.name, e.ts, {report.family_default_subquery()}"
+        " FROM events e JOIN models m ON m.id = e.model_id"
+        " JOIN sessions s ON s.id = e.session_id").fetchall()
+    return {(u, n, ts): (None if f is None else bool(f))
+            for u, n, ts, f in rows}
 
 
 def build_sqlite_corpus(path):
@@ -203,6 +241,8 @@ def token_stats_to_json(d):
         "by_kind": [list(r) for r in d["by_kind"]],
         "by_tier": [list(r) for r in d["by_tier"]],
         "by_issue": [list(r) for r in d["by_issue"]],
+        "estimated_by_model": d["estimated_by_model"],
+        "models_without_own_price": d["models_without_own_price"],
     }
 
 
@@ -233,7 +273,7 @@ class TestSqliteReference(unittest.TestCase):
         self.assertIn("| Zeta | 0 | 0 |", md)
         self.assertIn("| — | — | — |", md)
         # ...and beta's one unpriced (gpt-4o) event is surfaced, not hidden.
-        self.assertIn("1 of 3 events unpriced", md)
+        self.assertIn("1 of 5 events unpriced", md)
 
     def test_token_stats_reference_today_window(self):
         d = report.fetch_token_stats(self.conn)
@@ -247,6 +287,29 @@ class TestSqliteReference(unittest.TestCase):
         self.assertIn("| gpt-4o | unknown |", md)             # unpriced model tier
         self.assertIn("unpriced", md)                         # gpt-4o cost cell
         self.assertIn("| AOS-3 |", md)                        # all-time by-issue
+
+    def test_family_default_per_event_reference(self):
+        self.assertEqual(sqlite_family_default_by_event(self.conn),
+                         EXPECTED_FAMILY_DEFAULT)
+
+    def test_estimated_counts_reference(self):
+        rows = {r["path"]: r for r in report.fetch_project_stats(self.conn)}
+        self.assertEqual(rows["/home/user/alpha"]["estimated_events"], 3)
+        self.assertEqual(rows["/home/user/beta"]["estimated_events"], 3)
+        self.assertEqual(rows["/home/user/zeta"]["estimated_events"], 0)
+        d = report.fetch_token_stats(self.conn)
+        # 7-day, backlog-excluded window, like by_model; zero counts omitted
+        self.assertEqual(d["estimated_by_model"], {
+            "claude-sonnet-5": 1, "claude-opus-4-8": 1, "claude-haiku-5": 1})
+        self.assertEqual(d["models_without_own_price"],
+                         EXPECTED_WITHOUT_OWN_PRICE)
+        # the scoped-rollup summer counts the same events
+        rowids = [r[0] for r in self.conn.execute("SELECT rowid FROM events")]
+        s = report.priced_sum_for_rowids(self.conn, rowids)
+        self.assertEqual(s["estimated"], sum(
+            1 for v in EXPECTED_FAMILY_DEFAULT.values() if v))
+        self.assertEqual(report.priced_sum_for_rowids(self.conn, [])
+                         ["estimated"], 0)
 
     def test_info_reference_counts(self):
         c = report.fetch_info_central(self.conn, "/home/user/alpha")
@@ -346,6 +409,8 @@ class TestMockedClientRead(unittest.TestCase):
         b = self.backend()
         with mock.patch("urllib.request.urlopen", self.responder):
             got = b.read_for_report("project-stats")
+        # the mapped shape carries the same keys (estimated_events included)
+        self.assertEqual(got, report.fetch_project_stats(self.ref))
         self.assertEqual(report.render_project_stats(got),
                          report.render_project_stats(
                              report.fetch_project_stats(self.ref)))
@@ -354,6 +419,9 @@ class TestMockedClientRead(unittest.TestCase):
         b = self.backend()
         with mock.patch("urllib.request.urlopen", self.responder):
             got = b.read_for_report("token-stats")
+        ref = report.fetch_token_stats(self.ref)
+        for k in ("estimated_by_model", "models_without_own_price"):
+            self.assertEqual(got[k], ref[k], k)
         self.assertEqual(report.render_token_stats(got),
                          report.render_token_stats(
                              report.fetch_token_stats(self.ref)))
@@ -568,6 +636,20 @@ class TestPostgresEquivalence(unittest.TestCase):
         ref = report.fetch_token_stats(self.sqlite_ref())
         self.assertEqual(report.render_token_stats(pg),
                          report.render_token_stats(ref))
+
+    def test_family_default_per_event_equivalent(self):
+        # The view's `family_default` must resolve from the SAME pricing row as
+        # report.py's resolver, event for event — seed rows, a dated bare
+        # family row, an own row, the legacy 'claude-3-5-haiku' own row, the
+        # shadowing own row before and after it takes effect, and an unpriced
+        # model.
+        rows = self._rpc(
+            "SELECT coalesce(json_agg(json_build_array(session_uuid,"
+            " model_name, ts, family_default)), '[]'::json)"
+            " FROM public.report_priced_events;")
+        pg = {(u, n, ts): f for u, n, ts, f in rows}
+        self.assertEqual(pg, sqlite_family_default_by_event(self.sqlite_ref()))
+        self.assertEqual(pg, EXPECTED_FAMILY_DEFAULT)
 
     def test_info_equivalent(self):
         pg = supabase_backend._map_info(

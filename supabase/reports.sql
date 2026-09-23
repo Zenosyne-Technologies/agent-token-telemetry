@@ -79,7 +79,12 @@ SELECT
   pr.cache_r_usd   AS cache_r_usd,
   pr.cache_w_usd   AS cache_w_usd,
   pr.cache_w_1h_usd AS cache_w_1h_usd,
-  pr.effective_from AS rate_from
+  pr.effective_from AS rate_from,
+  -- true when the resolved row is a FAMILY DEFAULT row (a bare
+  -- `claude-<family>-` prefix: the family's fallback rate, so this event's
+  -- cost is an estimate); false for the model's own row; NULL when unpriced.
+  -- Twin of capture.is_family_default / capture.family_default_sql (SQLite).
+  (pr.model_prefix OPERATOR(pg_catalog.~) '^claude-[a-z]+-$') AS family_default
 FROM public.events e
 JOIN public.models m
   ON m.owner_id = e.owner_id AND m.name = e.model_name
@@ -87,7 +92,7 @@ JOIN public.sessions s
   ON s.owner_id = e.owner_id AND s.uuid = e.session_uuid
 LEFT JOIN LATERAL (
   SELECT p.in_usd, p.out_usd, p.cache_r_usd, p.cache_w_usd,
-         p.cache_w_1h_usd, p.effective_from
+         p.cache_w_1h_usd, p.effective_from, p.model_prefix
   FROM public.pricing p
   WHERE p.owner_id = e.owner_id
     AND m.name LIKE p.model_prefix || '%'
