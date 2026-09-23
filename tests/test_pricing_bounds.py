@@ -26,7 +26,9 @@ import unittest
 import unittest.mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import capture
+import pricing_golden
 import pricing_update
 
 RATES = {"in_usd": 2.0, "out_usd": 10.0, "cache_r_usd": 0.2,
@@ -1397,6 +1399,93 @@ class TestLayoutHelper(unittest.TestCase):
         self.assertEqual(missing, [])
 
 
+class TestColumnGuardsPinnedIndividually(Base):
+    """AOS-151 completion-validator notes N1/N2: each of the three guards
+    combined in one `if` in :func:`pricing_update._map_rate_columns`
+    (scripts/pricing_update.py, the exactly-one-match guard at ~377, the
+    shared-column and col-0 guards at ~379-380) is pinned in ISOLATION —
+    each variant below is built so only the ONE guard under test refuses
+    it, with the other two satisfied, so a page like `test_ambiguous_
+    two_row_header_is_refused` above (which trips the shared-column guard
+    too) can't stand in for any of them individually.
+
+    Mutation-verified (AOS-151 dispatch): with ONLY the exactly-one-match
+    collection changed to take the last hit instead of requiring exactly
+    one (`if hits: col[key] = hits[-1]`, the validator's M4), only
+    `test_extra_input_like_column_...` below fails — and it fails exactly
+    the way the validator's own $777 case does: Opus 5.5's `in_usd` is
+    minted from the "Batch input" column instead of refusing. With ONLY
+    the shared-column clause removed (M6), only
+    `test_shared_column_guard_...` fails. With ONLY the col-0 clause
+    removed (M5), only `test_col0_guard_...` fails. Restoring the guard
+    after each check leaves `git diff scripts/` empty."""
+
+    def _refused(self, html):
+        before = self.f.digest()
+        path = self.f.write_html(
+            f"<html><body><table>{html}</table></body></html>")
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertNotEqual(code, 0, out + err)
+        self.assertEqual(self.f.digest(), before, "a refusal wrote to the DB")
+
+    def test_extra_input_like_column_refuses_via_exactly_one_match_guard(
+            self):
+        # N1: an extra "Batch input" column beside "Input" (the
+        # validator's realistic drift case) makes the "in" needle match
+        # TWO header cells. "in" is then never added to `col` at all, so
+        # neither the shared-column guard (no two mapped keys collide) nor
+        # the col-0 guard (nothing maps to column 0) has anything to
+        # catch — only the exactly-one-match guard
+        # (`len(col) != len(needles)`) refuses this.
+        html = (_TWO_ROW_GROUP +
+               "<tr><th>Name</th><th>Input</th><th>Output</th>"
+               "<th>5m writes</th><th>1h writes</th>"
+               "<th>Hits and refreshes</th><th>Batch input</th></tr>"
+               "<tr><td>Claude Opus 5.5</td><td>$4.00 / MTok</td>"
+               "<td>$20.00 / MTok</td><td>$5.00 / MTok</td>"
+               "<td>$8.00 / MTok</td><td>$0.20 / MTok</td>"
+               "<td>$777.00 / MTok</td></tr>")
+        self._refused(html)
+
+    def test_shared_column_guard_refuses_a_merged_input_output_header(self):
+        # N2: "Input" and "Output" merged into one "Input/Output" column.
+        # Each needle still matches EXACTLY ONE header cell (that cell
+        # just happens to be the same one for both), so the exactly-one-
+        # match guard is satisfied, and nothing maps to column 0 — only
+        # the shared-column guard (`len(set(col.values())) != len(col)`)
+        # refuses this. Left unguarded, `in_usd` and `out_usd` would both
+        # be read from the same cell.
+        html = (_TWO_ROW_GROUP +
+               "<tr><th>Name</th><th>Input/Output</th>"
+               "<th>5m writes</th><th>1h writes</th>"
+               "<th>Hits and refreshes</th></tr>"
+               "<tr><td>Claude Opus 5.5</td><td>$4.00 / MTok</td>"
+               "<td>$5.00 / MTok</td><td>$8.00 / MTok</td>"
+               "<td>$0.20 / MTok</td></tr>")
+        self._refused(html)
+
+    def test_col0_guard_refuses_a_rate_header_relabelling_the_name_column(
+            self):
+        # N2: column 0 — the model-name column every row is identified by,
+        # regardless of what its header says — is relabelled "Output",
+        # while the real output column is relabelled "Result" so "output"
+        # still matches exactly one header cell (column 0 itself). Both
+        # the exactly-one-match and shared-column guards are satisfied;
+        # only the col-0 guard (`0 in col.values()`) refuses this. The
+        # name cell also carries a genuine "$" token, so left unguarded
+        # this would mint `out_usd` as $777 from it rather than fail on an
+        # unparseable cell.
+        html = (_TWO_ROW_GROUP +
+               "<tr><th>Output</th><th>Input</th><th>Result</th>"
+               "<th>5m writes</th><th>1h writes</th>"
+               "<th>Hits and refreshes</th></tr>"
+               "<tr><td>Claude Opus 5.5 $777.00 / MTok</td>"
+               "<td>$4.00 / MTok</td><td>$20.00 / MTok</td>"
+               "<td>$5.00 / MTok</td><td>$8.00 / MTok</td>"
+               "<td>$0.20 / MTok</td></tr>")
+        self._refused(html)
+
+
 class TestTwoRowLiveFixture(Base):
     """AOS-151: the committed capture of the live page (2026-09-23), parsed
     and applied end to end through ``--html`` on a fresh DB."""
@@ -1431,6 +1520,30 @@ class TestTwoRowLiveFixture(Base):
                   if (e["family"], e["version"]) == ("opus", "5.5")]
         # $8/$40 (fast mode) and $2/$10 (batch) must not appear.
         self.assertEqual([e["rates"]["in_usd"] for e in opus55], [4.0])
+
+    def test_golden_scenarios_cannot_cheaply_add_the_two_row_fixture(self):
+        # N3 (AOS-151 validator note): tests/pricing_golden.py's no-cost-
+        # change golden is frozen against `BASELINE_COMMIT` (4f8c215,
+        # pre-AOS-133) — a snapshot that predates the two-row header
+        # entirely (this fixture's layout was added by AOS-151, long
+        # after that commit). Parametrizing SCENARIOS with this fixture
+        # isn't a cheap addition: regenerating the golden JSON needs the
+        # BASELINE commit's own `parse_models` to parse it, and — proven
+        # directly here — it can't: it recognizes only the single-row
+        # header, so this fixture's rate table is invisible to it and
+        # `_locate_rate_table`'s "not found" `ValueError` fires. The two-
+        # row no-cost-change evidence instead comes from this class'
+        # `test_bare_refresh_...` above (records every listed model at
+        # its documented rate) plus the AOS-151 completion validator's
+        # before/after real-DB cost comparison (identical totals, 0.0
+        # per-model delta, see scratchpad/reports/aos151-completion.md
+        # check 3).
+        try:
+            old = pricing_golden.load_baseline_module()
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            self.skipTest(f"baseline commit unavailable: {exc}")
+        with self.assertRaises(ValueError):
+            old.parse_models(self.FIXTURE.read_text())
 
 
 # Every class that renders a page through self._html() runs a second time
