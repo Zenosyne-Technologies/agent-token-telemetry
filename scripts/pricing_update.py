@@ -72,7 +72,7 @@ MAX_RATE_USD = 10000.0          # money() ceiling: no rate this high is real
 MAX_CANDIDATES = 500            # candidate rows a single run may mint
 BACKDATE_MAX_DAYS = 365         # oldest a `starting <d>` row may be minted at
 
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # Unicode bidi-control characters (U+202A-U+202E, U+2066-U+2069): can
 # visually reorder or spoof rendered/terminal text (mirrors report.md_cell).
 _BIDI_CHAR_RE = re.compile(r"[‪-‮⁦-⁩]")
@@ -82,9 +82,12 @@ _ERROR_TEXT_MAX = 200
 def _safe_error_text(value):
     """Make untrusted page text (a raw cell, a header row) safe to embed in
     an exception message that may reach stderr or a terminal: strip ASCII
-    control characters and DEL, strip Unicode bidi-control characters, then
-    cap length so one hostile page cell cannot blow up the printed message.
-    A parse-failure message must never carry raw, unsanitized page text.
+    control characters and DEL (U+0000-U+001F, U+007F) AND the C1 control
+    range (U+0080-U+009F, which includes U+0085 NEL and U+009B — the 8-bit
+    form of CSI, usable to start a terminal escape sequence without a 7-bit
+    ESC byte), strip Unicode bidi-control characters, then cap length so one
+    hostile page cell cannot blow up the printed message. A parse-failure
+    message must never carry raw, unsanitized page text.
 
     :param value: the untrusted text (or a list/tuple of cells — stringified
         first).
@@ -125,13 +128,27 @@ class TableCollector(HTMLParser):
             self._cell.append(data)
 
 
+_MONEY_RE = re.compile(r"\$\s*([0-9]+(?:\.[0-9]+)?)")
+# A mantissa immediately followed by an exponent marker (e/E, optional sign,
+# digits) — scientific notation, never a real pricing-page rate.
+_EXPONENT_RE = re.compile(r"[eE][+-]?[0-9]+")
+
+
 def money(text):
     """Parse a ``$<amount> / MTok`` cell to a float, or ``None`` when the
-    cell has no dollar amount. Deliberately permissive about magnitude —
-    ``parse_models`` is the bound-enforcement point (:data:`MAX_RATE_USD`),
-    so every caller sees the same, single check."""
-    m = re.search(r"\$\s*([0-9]+(?:\.[0-9]+)?)", text)
-    return float(m.group(1)) if m else None
+    cell has no dollar amount OR when the matched number is immediately
+    followed by an exponent marker (e.g. ``$1e309``) — scientific notation
+    is never a real published rate, and silently truncating to the mantissa
+    would accept a malformed cell as ``$1`` instead of refusing it (AOS-143
+    correction). Deliberately permissive about plain-integer/decimal
+    magnitude otherwise — ``parse_models`` is the bound-enforcement point
+    (:data:`MAX_RATE_USD`), so every caller sees the same, single check."""
+    m = _MONEY_RE.search(text)
+    if not m:
+        return None
+    if _EXPONENT_RE.match(text, m.end()):
+        return None
+    return float(m.group(1))
 
 
 def parse_models(html):
@@ -189,16 +206,21 @@ def parse_models(html):
                              f" {_safe_error_text(row[0])}")
         # Bound what a page can mint (AOS-143): reject a non-finite rate (a
         # very long digit string overflows float() to `inf` with no
-        # exception) and any rate over MAX_RATE_USD/MTok. A single bad cell
-        # refuses the WHOLE run — money() is permissive on purpose, this is
-        # the one enforcement point every caller shares.
+        # exception), any rate over MAX_RATE_USD/MTok, and a non-positive
+        # in_usd/out_usd (a $0 or negative charge would mint a permanent
+        # free/negative rate; cache rates are legitimately allowed to be $0,
+        # so no lower bound applies to them). A single bad cell refuses the
+        # WHOLE run — money() is permissive on purpose, this is the one
+        # enforcement point every caller shares.
         bad = [k for k, v in rates.items()
-               if not math.isfinite(v) or v > MAX_RATE_USD]
+               if not math.isfinite(v) or v > MAX_RATE_USD
+               or (k in ("in_usd", "out_usd") and v <= 0)]
         if bad:
             raise ValueError(
-                "rate out of bounds (non-finite, or over"
-                f" ${MAX_RATE_USD:g}/MTok) for Claude {m.group(1).title()}"
-                f" {m.group(2)}: {', '.join(sorted(bad))}")
+                "rate out of bounds (non-finite, over"
+                f" ${MAX_RATE_USD:g}/MTok, or a non-positive in/out rate)"
+                f" for Claude {m.group(1).title()} {m.group(2)}:"
+                f" {', '.join(sorted(bad))}")
         entries.append({"family": m.group(1).lower(), "version": m.group(2),
                         "rates": rates, "condition": condition})
     if not entries:
@@ -251,7 +273,7 @@ def in_force(condition, today):
     return date >= today if kind == "through" else date <= today
 
 
-def build_candidates(entries, today):
+def build_candidates(entries, today, refused_versions=frozenset()):
     """Deterministic prefix plan — mint only the rate IN FORCE today, per
     listed version (docs/TELEMETRY-CONTRACT.md §Pricing table):
 
@@ -276,6 +298,17 @@ def build_candidates(entries, today):
       :func:`stale_intros`), no family row is minted either — the family
       default keeps its last recorded rate, like the version itself.
 
+    ``refused_versions`` (AOS-143 correction, F1) names every ``(family,
+    version)`` whose in-force ``starting`` row :func:`filter_backdated_starting`
+    refused as too old to trust: refusal skips ONLY that row's INSERT here —
+    IN-FORCE STATUS IS STILL DECIDED FROM THE PAGE, exactly as before AOS-143.
+    A refused conditional still suppresses its version's unconditional rate
+    (the version stays in ``conditioned`` below), and if the refused row is
+    the family's newest version's in-force rate, no family default row is
+    minted either (its ``rows`` lookup below finds none) — the family default
+    keeps its last recorded rate, like the version itself. Nothing that was
+    suppressed before AOS-143 becomes mintable because of a refusal.
+
     Ordering: on a ``(prefix, effective_from)`` collision the first candidate
     wins. In-force conditionals are listed before unconditional rows (and an
     in-force conditional suppresses the version's unconditional rate anyway),
@@ -285,6 +318,9 @@ def build_candidates(entries, today):
 
     :param entries: :func:`parse_models` output, in page order.
     :param today: the run date (UTC).
+    :param refused_versions: ``{(family, version)}`` set — see above. Empty
+        by default so callers that never refuse a row (most tests) are
+        unaffected.
     :returns: candidate dicts ``{prefix, rates, effective_from}``, family
         rows first.
     """
@@ -299,6 +335,8 @@ def build_candidates(entries, today):
     for e in entries:
         if not in_force(e["condition"], today):
             continue
+        if e["condition"][0] == "starting" and version(e) in refused_versions:
+            continue  # F1: skip only the INSERT; version stays `conditioned`
         kind, date = e["condition"]
         eff = today_epoch if kind == "through" else _epoch(date)
         for p in specific_prefixes(e["family"], e["version"]):
@@ -400,55 +438,57 @@ def future_only_newest(entries, today):
     return out
 
 
-def filter_backdated_starting(conn, entries, today):
-    """Drop every in-force ``starting <d>`` entry ``d`` is too old to trust
-    (AOS-143 parser bounds): an in-force ``starting`` row is normally minted
-    dated ``d`` however far back (:func:`build_candidates`), which would
-    re-price every event of that prefix back to ``d`` — permanently, since
-    pricing history is insert-only. Refused when ``d`` is more than
-    :data:`BACKDATE_MAX_DAYS` days before ``today``, OR earlier than the
-    latest ``effective_from`` already recorded for the version's own
-    prefix(es) (a real increase is never older than what is already on
-    record). A future ``starting`` (``d > today``) is left alone — it is
-    never minted anyway (:func:`in_force`), so it cannot be backdated.
+def filter_backdated_starting(entries, today):
+    """Identify every in-force ``starting <d>`` entry whose date ``d`` is too
+    old to trust (AOS-143 parser bounds, corrected): an in-force ``starting``
+    row is normally minted dated ``d`` however far back
+    (:func:`build_candidates`), which would re-price every event of that
+    prefix back to ``d`` — permanently, since pricing history is
+    insert-only. Refused when ``d`` is more than :data:`BACKDATE_MAX_DAYS`
+    days before ``today``. A future ``starting`` (``d > today``) is left
+    alone — it is never minted anyway (:func:`in_force`), so it cannot be
+    backdated.
 
-    :param conn: an open, readable telemetry DB connection.
+    This is a REFUSAL TO MINT, not a removal from the page: the caller
+    (:func:`run_update`) still passes every entry, unfiltered, to
+    :func:`build_candidates`, which decides in-force status from the page
+    exactly as before AOS-143 and only skips the INSERT for a version named
+    here — see :func:`build_candidates` for why (F1: a refusal must not make
+    a suppressed pre-increase/post-intro rate mintable, nor revert a real
+    increase already on record).
+
+    There is deliberately no other bound: a ``starting`` date equal to or
+    earlier than a prefix's already-recorded rows is a NORMAL steady-state
+    re-run — the increase was minted when it first arrived, and ``INSERT OR
+    IGNORE`` (:func:`apply`) makes every later run at the same date a no-op.
+    An earlier rule that also refused a ``starting`` row older than the
+    prefix's latest recorded row was removed: in steady state, the real DB
+    already holds later rows for a prefix once an increase has landed, so
+    that rule refused every LEGITIMATE increase on the very next scheduled
+    run after it arrived.
+
     :param entries: :func:`parse_models` output, in page order.
     :param today: the run date (UTC).
-    :returns: ``(filtered_entries, warnings)`` — ``entries`` with every
-        refused row removed, and one ``(family, version, date, reason)``
-        tuple per refusal, in page order.
+    :returns: ``(refused_versions, warnings)`` — ``refused_versions`` a
+        ``{(family, version)}`` set naming every version whose in-force
+        ``starting`` row is refused (:func:`build_candidates` takes this),
+        and one ``(family, version, date, reason)`` tuple per refusal, in
+        page order.
     """
     cutoff = today - datetime.timedelta(days=BACKDATE_MAX_DAYS)
-    filtered, warnings = [], []
+    refused, warnings = set(), []
     for e in entries:
         cond = e["condition"]
         if cond is None or cond[0] != "starting" or cond[1] > today:
-            filtered.append(e)
             continue
         date = cond[1]
-        reason = None
         if date < cutoff:
-            reason = (f"more than {BACKDATE_MAX_DAYS} days before today"
-                      f" ({today.isoformat()})")
-        else:
-            latest = None
-            for p in specific_prefixes(e["family"], e["version"]):
-                row = conn.execute(
-                    "SELECT MAX(effective_from) FROM pricing"
-                    " WHERE provider=? AND model_prefix=?",
-                    (PROVIDER, p)).fetchone()
-                if row and row[0] is not None:
-                    latest = row[0] if latest is None else max(latest, row[0])
-            if latest is not None and _epoch(date) < latest:
-                reason = ("earlier than the latest recorded rate for"
-                          f" `{specific_prefixes(e['family'], e['version'])[0]}`"
-                          f" ({_iso(latest)})")
-        if reason is None:
-            filtered.append(e)
-        else:
-            warnings.append((e["family"], e["version"], date, reason))
-    return filtered, warnings
+            refused.add((e["family"], e["version"]))
+            warnings.append((e["family"], e["version"], date,
+                             f"more than {BACKDATE_MAX_DAYS} days before"
+                             f" today ({today.isoformat()}); not recorded;"
+                             " the version's existing rows are unchanged"))
+    return refused, warnings
 
 
 def plan(conn, candidates):
@@ -553,8 +593,7 @@ def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
     for fam, ver, date, reason in backdated:
         out += ["", f"BACKDATED-STARTING WARNING: Claude {fam.capitalize()}"
                 f" {ver} (`{specific_prefixes(fam, ver)[0]}`) — its"
-                f" `starting {date.isoformat()}` row was refused ({reason});"
-                " nothing was minted for it."]
+                f" `starting {date.isoformat()}` row was refused: {reason}."]
     for fam, ver, date in future_only:
         out += ["", f"FUTURE-RATE WARNING: Claude {fam.capitalize()} {ver}"
                 f" (`{specific_prefixes(fam, ver)[0]}`) — its only listed"
@@ -573,12 +612,14 @@ class PricingRefused(Exception):
 def run_update(conn, entries, today, source=URL):
     """Plan, apply and report one pricing refresh of parsed page ``entries``.
 
-    Two bounds (AOS-143) can refuse work before any write reaches the DB:
-    an in-force ``starting`` row too old to trust is dropped per-entry by
-    :func:`filter_backdated_starting` (a warning, not a refusal — the rest
-    of the run proceeds); a candidate count over :data:`MAX_CANDIDATES`
-    refuses the WHOLE run atomically (:class:`PricingRefused`, nothing
-    planned or applied).
+    Two bounds (AOS-143) can refuse work before any write reaches the DB: an
+    in-force ``starting`` row too old to trust has its INSERT skipped, named
+    by :func:`filter_backdated_starting` (a per-entry refusal, warned not
+    fatal — the rest of the run proceeds, and :func:`build_candidates` still
+    decides in-force status from the unfiltered page, so a refusal never
+    makes a suppressed rate mintable); a candidate count over
+    :data:`MAX_CANDIDATES` refuses the WHOLE run atomically
+    (:class:`PricingRefused`, nothing planned or applied).
 
     :param conn: an open telemetry DB connection (:func:`capture.connect`).
     :param entries: :func:`parse_models` output, in page order.
@@ -591,8 +632,8 @@ def run_update(conn, entries, today, source=URL):
     :raises PricingRefused: the candidate count exceeds
         :data:`MAX_CANDIDATES`; nothing was planned or applied.
     """
-    filtered, backdated = filter_backdated_starting(conn, entries, today)
-    raw_candidates = build_candidates(filtered, today)
+    refused_versions, backdated = filter_backdated_starting(entries, today)
+    raw_candidates = build_candidates(entries, today, refused_versions)
     if len(raw_candidates) > MAX_CANDIDATES:
         raise PricingRefused(
             "Pricing refresh REFUSED — nothing written: this run would mint"

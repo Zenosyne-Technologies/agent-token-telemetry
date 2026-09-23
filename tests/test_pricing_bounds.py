@@ -23,6 +23,12 @@ RATES = {"in_usd": 2.0, "out_usd": 10.0, "cache_r_usd": 0.2,
          "cache_w_usd": 2.5, "cache_w_1h_usd": 4.0}
 INCREASE_FIXTURE = (pathlib.Path(__file__).resolve().parent / "fixtures"
                     / "pricing-page-increase.html")
+# The exact rates INCREASE_FIXTURE's `starting September 1, 2026` row parses
+# to (its "Claude Sonnet 5 (starting ...)" row: $4 / $5 / $8 / $0.40 / $20 per
+# MTok) — used to pre-seed a DB that already recorded the real increase, so
+# the steady-state tests below exercise a re-run that changes nothing.
+INCREASE_RATES = {"in_usd": 4.0, "out_usd": 20.0, "cache_r_usd": 0.4,
+                  "cache_w_usd": 5.0, "cache_w_1h_usd": 8.0}
 
 
 def _epoch(d):
@@ -108,9 +114,13 @@ class Base(unittest.TestCase):
 
 
 class TestBackdatedStarting(Base):
-    """Fix 1: an in-force `starting <d>` row is normally minted dated `d`
-    however far back — refused (warned, not fatal) when `d` is more than a
-    year before today, or earlier than the prefix's latest recorded rate."""
+    """Fix 1 (AOS-143, corrected): an in-force `starting <d>` row is
+    normally minted dated `d` however far back — refused (warned, not
+    fatal, INSERT-only) when `d` is more than a year before today. The
+    "earlier than the prefix's latest recorded rate" rule was removed
+    entirely: in steady state the DB already holds later rows for a prefix
+    once a real increase has landed, and that rule refused every
+    legitimate increase on the very next scheduled run after it arrived."""
 
     def test_1970_starting_page_mints_nothing_and_warns(self):
         today = datetime.date(2026, 9, 23)
@@ -120,23 +130,32 @@ class TestBackdatedStarting(Base):
         self.assertIn("BACKDATED-STARTING WARNING", report)
         self.assertIn("Claude Sonnet 5", report)
         self.assertIn("1970-01-01", report)
+        self.assertIn("not recorded; the version's existing rows are"
+                      " unchanged", report)
         self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
         self.assertIn("0 row(s) inserted", report)
 
-    def test_starting_earlier_than_prefixs_latest_row_refused(self):
+    def test_starting_before_prefixs_latest_row_still_mints_within_365d(self):
+        # The removed rule: a starting date within the 365-day window still
+        # mints even though the DB already holds a LATER row for the same
+        # prefix (e.g. the page corrected a previously-announced date
+        # backward) — INSERT OR IGNORE, never UPDATE/DELETE, so the later
+        # row stays exactly as recorded.
         today = datetime.date(2026, 9, 23)
-        self.f.price("claude-sonnet-5", RATES, _epoch(datetime.date(2026, 9, 1)))
+        later_eff = _epoch(datetime.date(2026, 9, 15))
+        self.f.price("claude-sonnet-5", RATES, later_eff)
         before = self.f.pricing_rows("claude-sonnet-5")
         entries = [_entry("sonnet", "5",
                           ("starting", datetime.date(2026, 8, 15)),
                           dict(RATES, in_usd=9.0))]
         report = pricing_update.run_update(self.f.conn, entries, today, "t")
-        self.assertIn("BACKDATED-STARTING WARNING", report)
-        self.assertIn("Claude Sonnet 5", report)
-        self.assertIn("2026-08-15", report)
-        # the existing Sep-1 row is untouched: insert-only, and nothing else
-        # was minted for the prefix
-        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), before)
+        self.assertNotIn("BACKDATED-STARTING WARNING", report)
+        rows = self.f.pricing_rows("claude-sonnet-5")
+        self.assertEqual(len(rows), 2)
+        self.assertIn(_epoch(datetime.date(2026, 8, 15)),
+                     [r[6] for r in rows])
+        # the existing later row is untouched: insert-only
+        self.assertIn(before[0], rows)
 
     def test_arrived_increase_within_a_year_still_mints_regression(self):
         # Regression: filter_backdated_starting must not swallow a
@@ -154,18 +173,73 @@ class TestBackdatedStarting(Base):
         self.assertEqual(rows[0][1], 4.0)                 # in_usd
         self.assertEqual(rows[0][6], _epoch(datetime.date(2026, 9, 1)))
 
-    def test_filter_function_drops_only_the_offending_entry(self):
+    def test_steady_state_366_days_later_mints_nothing_no_base_reversion(self):
+        # F1 regression: the increase already minted the $4 rows on
+        # 2026-09-01; a year-plus later the page is UNCHANGED (still shows
+        # base $3 + `starting September 1, 2026` $4). The starting row is
+        # now >365 days old and refused — but in-force status still comes
+        # from the page (F1), so the version stays "conditioned": the $3
+        # base rate must NOT be minted (that would silently revert the real
+        # increase), and the family default must not mint either, since the
+        # newest version's in-force rate this run is the refused row.
+        arrived = datetime.date(2026, 9, 1)
+        self.f.price("claude-sonnet-5", INCREASE_RATES, _epoch(arrived))
+        self.f.price("claude-sonnet-", INCREASE_RATES, _epoch(arrived))
+        before_5 = self.f.pricing_rows("claude-sonnet-5")
+        before_fam = self.f.pricing_rows("claude-sonnet-")
+        today = datetime.date(2027, 9, 2)   # 366 days after the increase
+        entries = pricing_update.parse_models(INCREASE_FIXTURE.read_text())
+        report = pricing_update.run_update(self.f.conn, entries, today, "t")
+        self.assertIn("BACKDATED-STARTING WARNING", report)
+        # nothing changed for the refused version or its family default: the
+        # pre-increase $3 rate was never (re-)minted, and the already-
+        # recorded $4 rows are untouched. (The fixture's third, unconditional
+        # row, Sonnet 4.5, mints normally either way — unrelated to F1.)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), before_5)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-"), before_fam)
+        table_rows = [ln for ln in report.splitlines() if ln.startswith("| `")]
+        self.assertFalse(any(ln.startswith("| `claude-sonnet-5`")
+                             or ln.startswith("| `claude-sonnet-`")
+                             for ln in table_rows))
+
+    def test_steady_state_within_365_days_still_mints_the_increase(self):
+        # Same steady-state DB, but the run happens within the 365-day
+        # window (the increase is 200 days old, not 366): it mints
+        # normally, and INSERT OR IGNORE makes the re-run of an
+        # already-recorded date a no-op.
+        arrived = datetime.date(2026, 9, 1)
+        self.f.price("claude-sonnet-5", INCREASE_RATES, _epoch(arrived))
+        self.f.price("claude-sonnet-", INCREASE_RATES, _epoch(arrived))
+        today = arrived + datetime.timedelta(days=200)
+        entries = pricing_update.parse_models(INCREASE_FIXTURE.read_text())
+        report = pricing_update.run_update(self.f.conn, entries, today, "t")
+        self.assertNotIn("BACKDATED-STARTING WARNING", report)
+        # the increase is already recorded at its own date: re-running mints
+        # nothing new for it or its family default (INSERT OR IGNORE is a
+        # no-op); only the fixture's unrelated Sonnet 4.5 row is new.
+        rows = self.f.pricing_rows("claude-sonnet-5")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], 4.0)
+        self.assertEqual(rows[0][6], _epoch(arrived))
+        fam_rows = [r for r in self.f.pricing_rows("claude-sonnet-")
+                   if r[6] != 0]              # exclude the seed row
+        self.assertEqual(len(fam_rows), 1)
+        self.assertEqual(fam_rows[0][6], _epoch(arrived))
+
+    def test_filter_function_flags_only_the_offending_entry(self):
         today = datetime.date(2026, 9, 23)
         keep = _entry("opus", "5")
         drop = _entry("sonnet", "5", ("starting", datetime.date(1970, 1, 1)))
-        filtered, warnings = pricing_update.filter_backdated_starting(
-            self.f.conn, [keep, drop], today)
-        self.assertEqual(filtered, [keep])
+        refused, warnings = pricing_update.filter_backdated_starting(
+            [keep, drop], today)
+        self.assertEqual(refused, {("sonnet", "5")})
         self.assertEqual(len(warnings), 1)
         fam, ver, date, reason = warnings[0]
         self.assertEqual((fam, ver, date),
                          ("sonnet", "5", datetime.date(1970, 1, 1)))
         self.assertIn("365", reason)
+        self.assertIn("not recorded; the version's existing rows are"
+                      " unchanged", reason)
 
     def test_future_starting_is_left_alone_not_bound_checked(self):
         # A future `starting` is never minted anyway (in_force) — the bound
@@ -173,20 +247,38 @@ class TestBackdatedStarting(Base):
         today = datetime.date(2026, 9, 23)
         entries = [_entry("sonnet", "5",
                           ("starting", datetime.date(2030, 1, 1)))]
-        filtered, warnings = pricing_update.filter_backdated_starting(
-            self.f.conn, entries, today)
-        self.assertEqual(filtered, entries)
+        refused, warnings = pricing_update.filter_backdated_starting(
+            entries, today)
+        self.assertEqual(refused, set())
         self.assertEqual(warnings, [])
+
+    def test_exactly_365_days_back_mints_366_is_refused(self):
+        # Boundary: the cutoff is "more than 365 days before today", i.e.
+        # `date < cutoff`, not `<=` — exactly 365 days back still mints.
+        today = datetime.date(2026, 9, 23)
+        d364 = today - datetime.timedelta(days=364)
+        d365 = today - datetime.timedelta(days=365)
+        d366 = today - datetime.timedelta(days=366)
+        for d, expect_refused in ((d364, False), (d365, False), (d366, True)):
+            with self.subTest(days_back=(today - d).days):
+                entries = [_entry("sonnet", "5", ("starting", d))]
+                refused, warnings = pricing_update.filter_backdated_starting(
+                    entries, today)
+                self.assertEqual(bool(refused), expect_refused)
+                self.assertEqual(bool(warnings), expect_refused)
 
 
 class TestValueBounds(Base):
     """Fix 2: money() is permissive about magnitude on purpose — a
     non-finite or absurd rate refuses the WHOLE run, atomically, before any
-    write."""
+    write. AOS-143 correction: a number immediately followed by an exponent
+    marker (scientific notation) is malformed, never truncated to its
+    mantissa, and an in_usd/out_usd of 0 or below is refused too (cache
+    rates keep no lower bound)."""
 
-    def _page(self, in_cell):
+    def _page(self, in_cell, out_cell="$10 / MTok"):
         return _table_html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
-                            "$4 / MTok", "$0.20 / MTok", "$10 / MTok")])
+                            "$4 / MTok", "$0.20 / MTok", out_cell)])
 
     def test_400_digit_rate_refuses_whole_run(self):
         before = self.f.digest()
@@ -216,6 +308,59 @@ class TestValueBounds(Base):
         with self.assertRaises(ValueError) as ctx:
             pricing_update.parse_models(self._page("$" + "9" * 400))
         self.assertIn("out of bounds", str(ctx.exception))
+
+    def test_exponent_notation_refuses_whole_run_not_mantissa(self):
+        # $1e309 must never mint $1 (truncated mantissa) — it is malformed
+        # and refuses the whole run, digest unchanged.
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$1e309 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, 2)
+        self.assertIn("pricing page fetch/parse failed", err)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_uppercase_signed_exponent_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$1E+5 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, 2)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_money_returns_none_for_exponent_suffixed_number(self):
+        self.assertIsNone(pricing_update.money("$1e309"))
+        self.assertIsNone(pricing_update.money("$1E+5 / MTok"))
+        self.assertIsNone(pricing_update.money("$5e-2"))
+        # a plain number is unaffected
+        self.assertEqual(pricing_update.money("$2.50 / MTok"), 2.5)
+
+    def test_zero_in_usd_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$0 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, 2)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_zero_out_usd_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$2 / MTok", out_cell="$0 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, 2)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_zero_cache_rate_is_unaffected(self):
+        # Cache rates keep no lower bound: a legitimate $0 cache-read/write
+        # rate is accepted, unlike in_usd/out_usd.
+        path = self.f.write_html(_table_html([
+            ("Claude Sonnet 5", "$2 / MTok", "$0 / MTok", "$0 / MTok",
+             "$0 / MTok", "$10 / MTok")]))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, 0)
+        row = self.f.pricing_rows("claude-sonnet-5")[0]
+        self.assertEqual((row[3], row[4], row[5]), (0.0, 0.0, 0.0))
 
 
 class TestRowCap(Base):
@@ -255,6 +400,18 @@ class TestErrorSanitization(Base):
     def test_safe_error_text_caps_length(self):
         clean = pricing_update._safe_error_text("x" * 1000)
         self.assertLessEqual(len(clean), 201)
+
+    def test_safe_error_text_strips_c1_controls(self):
+        # AOS-143 correction: U+009B (the 8-bit form of CSI — a terminal
+        # escape sequence without a 7-bit ESC byte) and U+0085 (NEL) are C1
+        # controls (U+0080-U+009F), previously left un-stripped.
+        raw = "A\x9b31mB\x85C"
+        clean = pricing_update._safe_error_text(raw)
+        self.assertNotIn("\x9b", clean)
+        self.assertNotIn("\x85", clean)
+        self.assertIn("A", clean)
+        self.assertIn("31mB", clean)
+        self.assertIn("C", clean)
 
     def test_header_error_message_has_no_raw_control_or_bidi_chars(self):
         header = ("<tr><th>Model</th>"
