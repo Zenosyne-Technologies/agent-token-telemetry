@@ -4,8 +4,13 @@ from the parsed pricing page is permanent. These tests bound what a single
 page/run can mint: a `starting <d>` row cannot be minted more than a year
 back (a per-row refusal, warned unless already recorded, not fatal); a
 non-finite or absurd rate refuses the WHOLE run; more than 500 candidate rows
-refuses the WHOLE run; and no raw, unsanitized page text ever reaches an
-error message. Fixture DBs and in-test HTML only — never the network."""
+refuses the WHOLE run; a malformed/obfuscated numeric token (round 1 and
+round 2) refuses the WHOLE run; and no raw, unsanitized page text ever
+reaches an error message. Fixture DBs and in-test HTML only, with one
+deliberate exception: `TestFetchHangAndSizeBounds` (round 2, hang/DoS fix)
+runs a real local stdlib `http.server` on loopback, since the bound under
+test is about genuine socket/timeout behaviour a mocked `urlopen` cannot
+exercise — it never reaches an external host."""
 import contextlib
 import datetime
 import hashlib
@@ -13,7 +18,10 @@ import io
 import pathlib
 import sys
 import tempfile
+import threading
+import time
 import unittest
+import unittest.mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 import capture
@@ -823,6 +831,286 @@ class TestFutureOnlyNewestWarning(Base):
         ]
         report = pricing_update.run_update(self.f.conn, entries, today, "t")
         self.assertNotIn("FUTURE-RATE WARNING", report)
+
+
+class TestStrictNumberToken(Base):
+    """AOS-143 correction, round 2, F6: the round-1 token class
+    (`[0-9,.eE+-]`) still let a separator, magnitude suffix, or written-out
+    exponent it did not recognize truncate a cell to its leading digits
+    instead of refusing it — e.g. `$1 500` (a thousands-grouping space, ASCII
+    or one of four Unicode variants) minted `1`, silently underpricing by
+    3+ orders of magnitude. The token class now also captures every one of
+    those characters, so the WHOLE run fails the strict all-digits check and
+    refuses, instead of stopping short and keeping only the well-formed
+    prefix. `e`/`E`/`+`/`-` stay in the class from round 1 — dropping them
+    would stop capturing `e309` in `$1e309`, silently reintroducing the very
+    truncation-to-`$1` bug round 1 fixed."""
+
+    def _page(self, in_cell):
+        return _table_html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
+                            "$4 / MTok", "$0.20 / MTok", "$10 / MTok")])
+
+    def test_thousands_grouping_space_variants_refuse_whole_run(self):
+        # ASCII space, thin space (U+2009), narrow no-break space (U+202F),
+        # no-break space (U+00A0), figure space (U+2007) — every one of them
+        # is a run character, so "$1<space>500" is captured whole and fails
+        # the strict digits-only check, rather than truncating to "1".
+        for space in (" ", " ", " ", " ", " "):
+            with self.subTest(space=repr(space)):
+                before = self.f.digest()
+                path = self.f.write_html(self._page(f"$1{space}500 / MTok"))
+                code, out, err = self.f.cli("--html", str(path))
+                self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+                self.assertIn("REFUSED", out)
+                self.assertEqual(self.f.digest(), before)
+                self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_apostrophe_thousands_separator_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$1'500 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_underscore_thousands_separator_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$1_500 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_k_magnitude_suffix_refuses_whole_run(self):
+        # Previously truncated to "1" (a 1000x underprice) instead of
+        # refusing the cell.
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$1k / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_m_magnitude_suffix_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$1M / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_written_out_exponent_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$1x10^6 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_leading_minus_sign_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$-4 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_leading_plus_sign_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$+4 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_non_ascii_digit_is_still_the_safe_unparseable_path(self):
+        # A non-ASCII digit (Arabic-Indic ONE, U+0661) is outside the token
+        # class entirely, so no run is captured at all — money() returns
+        # None (not a refusal), and parse_models raises its pre-existing
+        # generic "unparseable rate cell" error (EXIT_OTHER_ERROR), exactly
+        # as it did before this fix. Still safe (STOP either way), and
+        # unchanged by round 2.
+        self.assertIsNone(pricing_update.money("$١"))
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$١"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_OTHER_ERROR)
+        self.assertEqual(self.f.digest(), before)
+
+    def test_exponent_and_legit_forms_still_behave_as_round_one_fixed(self):
+        # Regression guard: e/E/+/- stay in the token class from round 1 —
+        # exponent notation must keep refusing the whole run, never
+        # silently truncate to the leading mantissa digit(s).
+        for bad in ("$1e309", "$1E+5", "$5e-2", "$1,500", "$4.00.00",
+                    "$1.e3"):
+            with self.subTest(cell=bad):
+                with self.assertRaises(pricing_update.PricingRefused):
+                    pricing_update.money(bad)
+        for text, expect in (("$3", 3.0), ("$3.75", 3.75), ("$0.30", 0.30),
+                             ("$5 / MTok", 5.0), ("$5/MTok", 5.0),
+                             ("$1/MTok", 1.0)):
+            with self.subTest(cell=text):
+                self.assertEqual(pricing_update.money(text), expect)
+
+    def test_committed_fixture_pages_still_parse_under_the_stricter_rule(self):
+        # The stricter token class must not refuse any real, currently
+        # published rate cell — every committed fixture page still parses
+        # end to end.
+        fixtures_dir = pathlib.Path(__file__).resolve().parent / "fixtures"
+        for name in ("pricing-page-current.html", "pricing-page-increase.html",
+                    "pricing-page-expired-intro.html", "pricing-page.html"):
+            with self.subTest(fixture=name):
+                html = (fixtures_dir / name).read_text()
+                entries = pricing_update.parse_models(html)
+                self.assertTrue(entries)
+
+
+class TestFetchHangAndSizeBounds(Base):
+    """AOS-143 correction, round 2 (hang/DoS fix): `urlopen(timeout=N)` only
+    bounds each individual socket operation, not the fetch as a whole — a
+    server that keeps the connection open and trickles a byte through just
+    before each such operation would time out could hang the fetch
+    indefinitely, and `resp.read()` has no cap of its own on response body
+    size. `_fetch_page` now enforces one real wall-clock deadline across
+    connect + the whole read (a background thread joined with a timeout,
+    since urllib gives no other way to bound a slow-but-technically-alive
+    read) and a hard cap on total body size, exceeding either -> a fetch
+    failure (EXIT_FETCH_FAILED) with a sanitized message. These run a real
+    local stdlib `http.server` in a background thread — no mocked
+    `urlopen` — so the bound is exercised against genuine socket behaviour."""
+
+    @staticmethod
+    def _serve(handler_cls):
+        import http.server
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        return httpd, thread
+
+    def test_trickle_server_times_out_instead_of_hanging(self):
+        import http.server
+
+        class TrickleHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                # One byte every 0.3s — always faster than the per-socket-
+                # operation `timeout=` below (1s), so a naive per-op-only
+                # timeout would never trip; bounded to ~2.1s so the server
+                # thread self-terminates for test teardown.
+                for _ in range(7):
+                    try:
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                    time.sleep(0.3)
+
+            def log_message(self, *a, **k):
+                pass
+
+        httpd, thread = self._serve(TrickleHandler)
+        try:
+            url = f"http://127.0.0.1:{httpd.server_address[1]}/pricing"
+            started = time.monotonic()
+            with unittest.mock.patch("pricing_update.URL", url), \
+                    unittest.mock.patch("pricing_update.FETCH_TIMEOUT_S", 1.0):
+                code, out, err = self.f.cli()
+            elapsed = time.monotonic() - started
+            self.assertEqual(code, pricing_update.EXIT_FETCH_FAILED)
+            self.assertIn("fetch failed", err)
+            # Must return at ~the patched deadline, not hang for the whole
+            # trickle (~2.1s) or the module-default 30s.
+            self.assertLess(elapsed, 2.0)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_oversized_body_is_rejected_without_buffering_it_all(self):
+        import http.server
+
+        body = b"x" * 50000
+
+        class OversizedHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a, **k):
+                pass
+
+        httpd, thread = self._serve(OversizedHandler)
+        try:
+            url = f"http://127.0.0.1:{httpd.server_address[1]}/pricing"
+            with unittest.mock.patch("pricing_update.URL", url), \
+                    unittest.mock.patch("pricing_update.FETCH_MAX_BYTES", 1024):
+                code, out, err = self.f.cli()
+            self.assertEqual(code, pricing_update.EXIT_FETCH_FAILED)
+            self.assertIn("fetch failed", err)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_normal_sized_fast_response_is_unaffected(self):
+        import http.server
+
+        page = _table_html([("Claude Sonnet 5", "$2 / MTok", "$2.50 / MTok",
+                            "$4 / MTok", "$0.20 / MTok", "$10 / MTok")])
+        body = page.encode()
+
+        class FastHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a, **k):
+                pass
+
+        httpd, thread = self._serve(FastHandler)
+        try:
+            url = f"http://127.0.0.1:{httpd.server_address[1]}/pricing"
+            with unittest.mock.patch("pricing_update.URL", url):
+                code, out, err = self.f.cli()
+            self.assertEqual(code, 0)
+            self.assertEqual(self.f.pricing_rows("claude-sonnet-5")[0][1], 2.0)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class TestDbErrorExitCode(Base):
+    """AOS-143 correction, round 2, INFO: a DB error (e.g. an unopenable or
+    unwritable DB) must map to the documented EXIT_OTHER_ERROR (3), not an
+    uncaught traceback that exits 1 like a bound refusal."""
+
+    def test_unopenable_db_returns_other_error_code_not_a_traceback(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            # A directory, not a file, at the DB path: Path.exists() is
+            # True (passing main()'s "no DB yet" guard), but
+            # sqlite3.connect() on a directory always fails.
+            db_dir = pathlib.Path(tmp.name) / "not-a-file.db"
+            db_dir.mkdir()
+            html_path = pathlib.Path(tmp.name) / "page.html"
+            html_path.write_text(_table_html([
+                ("Claude Sonnet 5", "$2 / MTok", "$2.50 / MTok",
+                 "$4 / MTok", "$0.20 / MTok", "$10 / MTok")]))
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                code = pricing_update.main(
+                    ["--db", str(db_dir), "--html", str(html_path)])
+            self.assertEqual(code, pricing_update.EXIT_OTHER_ERROR)
+            self.assertIn("pricing DB error", err.getvalue())
+        finally:
+            tmp.cleanup()
 
 
 if __name__ == "__main__":

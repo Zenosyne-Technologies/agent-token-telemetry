@@ -49,6 +49,7 @@ import json
 import math
 import re
 import sys
+import threading
 import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
@@ -86,6 +87,14 @@ MIN_INOUT_RATE_USD = 0.01       # in_usd/out_usd floor (AOS-143 correction,
                                  # implausible as the $10,000 ceiling.
 MAX_CANDIDATES = 500            # candidate rows a single run may mint
 BACKDATE_MAX_DAYS = 365         # oldest a `starting <d>` row may be minted at
+
+# Fetch bounds (AOS-143 correction, round 2 — hang/DoS fix): a hostile or
+# merely slow server could otherwise hang the fetch, or exhaust memory with
+# an oversized/unbounded body, without ever tripping urllib's own per-socket-
+# operation `timeout=` (see :func:`_fetch_page`).
+FETCH_TIMEOUT_S = 30.0           # wall-clock seconds for connect + the FULL
+                                  # read together, not per socket operation
+FETCH_MAX_BYTES = 5 * 1024 * 1024  # cap on the fetched page's total body size
 
 # main()'s three distinct exit codes for a run that writes nothing (AOS-143
 # correction, F1) — see the module docstring for what each one means and why
@@ -154,12 +163,32 @@ class TableCollector(HTMLParser):
 
 
 # The full contiguous "numeric-ish" run after a `$` — digits plus every
-# character a malformed rate could plausibly contain (comma, extra dot,
-# exponent marker, sign) — captured WHOLE so it can be validated as a unit,
-# rather than matching only its well-formed prefix and silently dropping the
-# rest (AOS-143 correction: that used to mint `$1,500` as `$1`).
-_MONEY_TOKEN_RE = re.compile(r"\$\s*([0-9][0-9,.eE+\-]*)")
+# character a malformed or obfuscated rate could plausibly contain — captured
+# WHOLE so it can be validated as a unit, rather than matching only a
+# well-formed prefix and silently dropping the rest (AOS-143 correction: that
+# used to mint `$1,500` as `$1`). The class is the union of two generations
+# of that fix: the original round's comma/dot/exponent/sign set (comma, extra
+# dot, `e`/`E` exponent marker, `+`/`-` sign — dropping any of these from the
+# class would silently re-open the exponent-truncation bug it fixed, e.g.
+# `$1e309` collapsing to the leading `$1`) plus AOS-143 correction, round 2,
+# F6's additional separator/suffix/notation characters found to survive the
+# first round's class and still truncate silently: an apostrophe or
+# underscore thousands separator, four non-ASCII "thousands-grouping" space
+# characters plus a literal ASCII space (thin space U+2009, narrow no-break
+# space U+202F, no-break space U+00A0, figure space U+2007), the `k`/`K`/
+# `m`/`M` magnitude suffixes, and `x`/`X`/`^` for a written-out `1x10^6`
+# exponent. A char outside this whole class (e.g. a non-ASCII digit such as
+# `١`) never starts a run at all, which is the pre-existing, still-safe "no
+# $-prefixed numeric token" path (:func:`money` returns ``None``, and
+# :func:`parse_models` raises its own generic, non-refusing parse error).
+_MONEY_TOKEN_RE = re.compile(
+    r"\$ ?([0-9.,'_     kKmMxX^+\-eE]+)")
 # The only token shape money() accepts: ASCII digits, with at most one `.`.
+# Any other character surviving inside the captured run above — a
+# thousands/grouping separator, a magnitude suffix, a written-out exponent,
+# a sign, a second `.`, a classic `e`/`E` exponent marker — fails this match
+# and refuses the whole run (AOS-143 correction, round 2, F6) instead of
+# silently keeping only the run's well-formed leading digits.
 _STRICT_NUMBER_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 
 
@@ -167,30 +196,42 @@ def money(text):
     """Parse a ``$<amount> / MTok`` cell to a float, or ``None`` when the
     cell has no ``$``-prefixed numeric token at all (a genuinely non-numeric
     cell — :func:`parse_models` raises its own "unparseable rate cell" error
-    for that case).
+    for that case; this also covers a token that starts with a character
+    :data:`_MONEY_TOKEN_RE`'s class does not recognize at all, such as a
+    non-ASCII digit like ``١`` — no run is captured, so nothing is refused
+    either, matching the safe pre-existing behaviour for that case).
 
     When a ``$``-prefixed token IS present, the WHOLE contiguous run
-    (:data:`_MONEY_TOKEN_RE`) must be a plain, unambiguous decimal number —
+    (:data:`_MONEY_TOKEN_RE`) — trailing ASCII spaces trimmed, since a
+    legitimate cell continues `` / MTok`` and the space before the slash is
+    itself a run character — must be a plain, unambiguous decimal number —
     ASCII digits with at most one ``.`` (:data:`_STRICT_NUMBER_RE`) — or
-    :class:`PricingRefused` is raised (AOS-143 correction): a thousands
-    separator (``$1,500``), more than one decimal point (``$4.00.00``), or
-    any exponent marker, complete (``$1e309``) or dangling after a bare
-    ``.`` (``$1.e3``), used to be silently truncated to its leading digits
-    (``$1``) instead of refusing the malformed cell outright. Magnitude and
-    the in/out floor are :func:`parse_models`'s job (:data:`MAX_RATE_USD`,
-    :data:`MIN_INOUT_RATE_USD`), so every caller shares the one enforcement
-    point for those; a malformed TOKEN, by contrast, is refused right here,
-    since no caller should ever see a guessed-at number."""
+    :class:`PricingRefused` is raised (AOS-143 correction, extended round 2,
+    F6): a thousands separator, whether a comma (``$1,500``), an apostrophe
+    (``$1'500``), an underscore (``$1_500``), or a thousands-grouping space —
+    ASCII or one of four Unicode space variants (``$1 500``); more than one
+    decimal point (``$4.00.00``); a magnitude suffix (``$1k``, ``$1M``); a
+    written-out exponent (``$1x10^6``); a leading sign (``$-4``, ``$+4``); or
+    a classic exponent marker, complete (``$1e309``) or dangling after a bare
+    ``.`` (``$1.e3``) — used to be silently truncated to its leading digits
+    (``$1``) instead of refusing the malformed cell outright; round 2 closed
+    the remaining separator/suffix/notation shapes the original class let
+    through silently the same way. Magnitude and the in/out floor are
+    :func:`parse_models`'s job (:data:`MAX_RATE_USD`, :data:`MIN_INOUT_RATE_USD`),
+    so every caller shares the one enforcement point for those; a malformed
+    TOKEN, by contrast, is refused right here, since no caller should ever
+    see a guessed-at number."""
     m = _MONEY_TOKEN_RE.search(text)
     if not m:
         return None
-    token = m.group(1)
+    token = m.group(1).rstrip(" ")
     if not _STRICT_NUMBER_RE.match(token):
         raise PricingRefused(
             "Pricing refresh REFUSED — nothing written: malformed rate cell"
             " (expected a plain decimal number such as $3 or $3.75 — not a"
-            " thousands separator, more than one decimal point, or"
-            f" scientific notation): {_safe_error_text(text)}")
+            " thousands separator, a magnitude suffix, scientific/written-out"
+            " exponent notation, or a sign):"
+            f" {_safe_error_text(text)}")
     return float(token)
 
 
@@ -1592,6 +1633,70 @@ def backfill_apply(conn, prefixes, today):
     return "\n".join(out)
 
 
+def _fetch_page(url, timeout_s=FETCH_TIMEOUT_S, max_bytes=FETCH_MAX_BYTES):
+    """Fetch ``url`` under a hard wall-clock deadline covering connect AND
+    the full body read together, with a hard cap on the response body size
+    (AOS-143 correction, round 2 — hang/DoS fix).
+
+    ``urllib.request.urlopen(..., timeout=N)`` only bounds each individual
+    blocking socket operation, not the fetch as a whole: a server that keeps
+    the connection open and trickles a byte (or a few) through just before
+    each such operation would time out never trips it, and the fetch could
+    hang indefinitely. To close that gap, the fetch (connect plus the whole
+    read) runs in a daemon thread that this function joins with a real
+    wall-clock timeout; a thread still running once that timeout elapses is
+    abandoned — it is a daemon thread holding no resource the rest of the
+    process needs, and the process is about to exit anyway on the fetch
+    failure this raises — rather than waited on further. ``resp.read()``
+    likewise has no size limit of its own, so the body is read in bounded
+    chunks and the fetch aborts the moment the running total exceeds
+    ``max_bytes``, instead of buffering an unbounded or oversized body in
+    memory first.
+
+    :param url: the page URL to fetch.
+    :param timeout_s: total seconds allowed for connect + the full read,
+        together (default :data:`FETCH_TIMEOUT_S`).
+    :param max_bytes: maximum total response body size in bytes (default
+        :data:`FETCH_MAX_BYTES`).
+    :raises Exception: on any fetch failure, deadline overrun, or oversized
+        body — :func:`main` treats every exception from this function the
+        same way, as :data:`EXIT_FETCH_FAILED`.
+    :returns: the decoded page text.
+    """
+    outcome = {}
+
+    def worker():
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "token-telemetry-pricing-update"})
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                chunks, total = [], 0
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        outcome["exc"] = Exception(
+                            f"response body exceeded {max_bytes} bytes")
+                        return
+                    chunks.append(chunk)
+            outcome["html"] = b"".join(chunks).decode(
+                "utf-8", errors="replace")
+        except Exception as exc:  # noqa: BLE001 - reported to the caller,
+                                   # which maps every fetch exception alike
+            outcome["exc"] = exc
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        raise Exception(f"fetch exceeded {timeout_s:g}s total timeout")
+    if "exc" in outcome:
+        raise outcome["exc"]
+    return outcome["html"]
+
+
 class _ArgumentParser(argparse.ArgumentParser):
     """``argparse.ArgumentParser`` whose ``error()`` strips ASCII control
     characters (e.g. a raw ESC byte) out of argparse's own error message
@@ -1747,21 +1852,25 @@ def main(argv=None):
         return 0
     # Fetching (network, or --html file for tests) is kept in its own try
     # block, distinct from parsing below (AOS-143 correction, F1): a fetch
-    # failure is the ONLY case that reaches the command's manual fallback —
-    # a page that fetched fine but did not parse/validate must never be
-    # handed to the fallback's unbounded manual read. F2/F3 (sev3
-    # pre-existing): the exception text can carry an attacker- or
-    # MITM-controlled raw HTTP status line, so it is sanitized with the same
-    # sanitizer used for page-derived error text before it ever reaches
-    # stderr.
+    # failure is the ONLY case that reaches the command's manual fallback,
+    # and only on an interactive run — never on an unattended/scheduled one
+    # (`commands/schedule-pricing.md`) — a page that fetched fine but did
+    # not parse/validate must never be handed to the fallback. The fallback
+    # itself no longer parses or inserts anything by hand either (AOS-143
+    # correction, round 2, F1b): it re-fetches the page and re-runs this
+    # same script with `--html`, so every bound below always applies through
+    # this one implementation. The network fetch (`_fetch_page`) itself
+    # enforces its own wall-clock deadline and body-size cap (AOS-143
+    # correction, round 2 — hang/DoS fix) rather than relying solely on
+    # urlopen's per-socket-operation `timeout=`. F2/F3 (sev3 pre-existing):
+    # the exception text can carry an attacker- or MITM-controlled raw HTTP
+    # status line, so it is sanitized with the same sanitizer used for
+    # page-derived error text before it ever reaches stderr.
     try:
         if args.html:
             html = Path(args.html).read_text(errors="replace")
         else:
-            req = urllib.request.Request(
-                URL, headers={"User-Agent": "token-telemetry-pricing-update"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
+            html = _fetch_page(URL, FETCH_TIMEOUT_S, FETCH_MAX_BYTES)
     except Exception as exc:  # noqa: BLE001 - any fetch failure -> fallback
         print(f"pricing page fetch failed: {_safe_error_text(exc)}",
               file=sys.stderr)
@@ -1784,12 +1893,26 @@ def main(argv=None):
               file=sys.stderr)
         return EXIT_OTHER_ERROR
     today = datetime.datetime.now(tz=datetime.timezone.utc).date()
-    conn = capture.connect(db)
+    # Opening the DB is its own failure mode too (AOS-143 correction, round
+    # 2, INFO): an unwritable/unopenable DB (e.g. a permissions problem)
+    # must map to the documented EXIT_OTHER_ERROR, not propagate as an
+    # uncaught traceback that exits 1 like a bound refusal — a DB problem is
+    # neither a fetch failure nor a page-bound refusal.
+    try:
+        conn = capture.connect(db)
+    except Exception as exc:  # noqa: BLE001 - DB open failure
+        print(f"pricing DB error: {_safe_error_text(exc)}", file=sys.stderr)
+        return EXIT_OTHER_ERROR
     try:
         print(run_update(conn, entries, today))
     except PricingRefused as exc:
         print(exc.args[0])
         return EXIT_BOUNDS_REFUSED
+    except Exception as exc:  # noqa: BLE001 - any other unexpected error
+                               # updating the DB (also EXIT_OTHER_ERROR)
+        print(f"pricing update failed: {_safe_error_text(exc)}",
+              file=sys.stderr)
+        return EXIT_OTHER_ERROR
     finally:
         conn.close()
     return 0
