@@ -271,11 +271,13 @@ DECLARE
   result  jsonb;
 BEGIN
   -- `tagged` — every event in the by_model/by_tier/by_rung window (7 days,
-  -- backlog excluded), with its ROLE tier and, for a ladder-tier event, its
-  -- escalation rung. This is the ONE Postgres definition of both rules (twin
-  -- of report.py's tier_case()/rung_case(), which fetch_token_stats likewise
-  -- splices once into its own shared CTE); the three aggregates below only
-  -- ever read t.tier / t.rung, never restate a CASE.
+  -- backlog excluded), with its ROLE tier and, for a ladder-tier event ONLY,
+  -- its escalation rung (NULL for every other tier, so by_rung's
+  -- `rung IS NOT NULL` is exactly by_tier's ladder rows). This is the ONE
+  -- Postgres definition of both rules (twin of report.py's
+  -- tier_case()/rung_case(), which fetch_token_stats likewise splices once
+  -- into its own shared CTE); the three aggregates below only ever read
+  -- t.tier / t.rung, never restate a CASE.
   WITH tagged AS (
     SELECT tt.*,
            CASE WHEN tt.tier = 'ladder' THEN coalesce(CASE
@@ -424,7 +426,7 @@ BEGIN
         SELECT t.rung AS rung, pg_catalog.sum(t.in_tok) AS i,
                pg_catalog.sum(t.out_tok) AS o, pg_catalog.count(*) AS n
         FROM tagged t
-        WHERE t.tier = 'ladder'
+        WHERE t.rung IS NOT NULL   -- set for, and only for, ladder-tier rows
         GROUP BY t.rung
       ) q),
     'by_issue', (

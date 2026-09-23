@@ -1495,6 +1495,34 @@ class TestRungTieBreakLocal(unittest.TestCase):
                         pathlib.Path(tmp.name) / f"rt{i}.db", order),
                     EXPECTED_TIED_RUNGS)
 
+    def test_breakdown_statement_orders_by_label_last(self):
+        # SQLite's GROUP BY hands each breakdown's rows to the final sort
+        # already in ascending label order, and its sorter keeps equal keys
+        # in input order, so on this engine a DROPPED label tie-break still
+        # returns byte order and no insertion order can expose it (a
+        # reversed one is caught by the tests above). SQL guarantees nothing
+        # of the sort, so the one shared ORDER BY of fetch_token_stats'
+        # by_model/by_tier/by_rung statement is pinned here: output DESC,
+        # then the label (model / tier / rung name, BINARY) — the twin of
+        # reports.sql's `, <label> COLLATE pg_catalog."C"` tie-breaks.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        conn = capture.connect(pathlib.Path(tmp.name) / "usage.db")
+        self.addCleanup(conn.close)
+        seen = []
+        conn.set_trace_callback(seen.append)
+        report.fetch_token_stats(conn)
+        conn.set_trace_callback(None)
+        stmts = [re.sub(r"\s+", " ", q).strip() for q in seen
+                 if "'by_rung'" in q]
+        self.assertEqual(len(stmts), 1, stmts)
+        self.assertTrue(stmts[0].endswith("ORDER BY part, o DESC, label;"),
+                        stmts[0][-80:])
+        for part in ("'by_model'", "'by_tier'", "'by_rung'"):
+            self.assertEqual(stmts[0].count(f"SELECT {part} AS part"
+                                            if part == "'by_model'"
+                                            else f"SELECT {part},"), 1, part)
+
 
 @unittest.skipUnless(PG_TOOLS, PG_REASON)
 class TestPostgresRoleRuleFixture(unittest.TestCase):

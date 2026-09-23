@@ -503,8 +503,9 @@ def fetch_token_stats(conn):
     # than one tier lists them ALL, comma-joined in the kit's display order
     # (tier_rank_case), rather than repeating the model; its
     # estimated/event/unpriced counts are summed across those tiers in SQL.
-    # by_rung breaks the 'ladder' rows of by_tier down by escalation rung
-    # (high / xhigh / max / frontier, read only from the named
+    # by_rung breaks the 'ladder' rows of by_tier down by escalation rung —
+    # `tagged` sets `rung` for, and only for, ladder-tier rows — (high /
+    # xhigh / max / frontier, read only from the named
     # marvin:escalation-* persona — see rung_case). A ladder row with no such
     # name (the model-prefix fallback, or an unrecognized marvin:escalation-*
     # suffix) is COALESCEd into RUNG_FALLBACK_LABEL rather than dropped, so
@@ -567,7 +568,7 @@ UNION ALL
 SELECT 'by_rung', rung, NULL, SUM(in_tok), SUM(out_tok), NULL, NULL, NULL,
        COUNT(*), NULL
 FROM tagged
-WHERE tier = 'ladder'
+WHERE rung IS NOT NULL
 GROUP BY rung
 ORDER BY part, o DESC, label;""",
                         {"rung_fallback": RUNG_FALLBACK_LABEL}).fetchall()
