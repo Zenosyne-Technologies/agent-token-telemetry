@@ -9,12 +9,19 @@ finished markdown report. The command prompt runs this and echoes stdout
 verbatim; the LLM flow is only the fallback when this exits non-zero (exit 2 =
 fetch/parse failure — the page layout changed or the network is down).
 
+`--backfill-plan [--json]` prints the read-only consent-gated backfill plan
+(estimated events that a copy of their model's own, later-minted rate would
+re-price) and `--backfill-apply PREFIX...` applies the user-confirmed prefixes
+— contract §Pricing table, "History is never mutated", case 3. Neither
+fetches the page.
+
 Backend seam: DB work goes through capture.connect() (the schema owner);
 parsing and planning are pure functions over plain data, reusable unchanged
 when other database backends arrive.
 """
 import argparse
 import datetime
+import json
 import re
 import sys
 import urllib.request
@@ -388,16 +395,571 @@ def run_update(conn, entries, today, source=URL):
                   stale_intros(entries, today))
 
 
+# ------------------------------------------------------------------ backfill
+#
+# Consent-gated backfill (docs/TELEMETRY-CONTRACT.md §Pricing table, "History
+# is never mutated", case 3). When a model's events were priced at an ESTIMATE
+# (a family default or ancestor row) before its own row was first minted, the
+# plan offers ONE extra INSERT per such prefix: a copy of the prefix's earliest
+# own row R0, dated the UTC start of the day of the earliest estimated event it
+# would own-price. The plan is read-only and computes each candidate's impact
+# set by actually resolving events with and without the hypothetical row
+# (through a TEMP shadow copy of `pricing`, never by assumption); the apply
+# re-plans, inserts inside one transaction, verifies, and rolls back on any
+# surprise. Applying is the user's explicit decision in the interactive
+# command flow, never this script's.
+
+DAY = 86400
+_BACKFILL_SRC_RE = re.compile(r"^backfill:(.*); confirmed \d{4}-\d{2}-\d{2}$",
+                              re.S)
+_EPS = 1e-9
+
+
+def _day_start(ts):
+    """UTC midnight (unix seconds) of the day containing ``ts``."""
+    return int(ts) - int(ts) % DAY
+
+
+def _iso(ts):
+    """``ts`` (unix seconds) as a UTC ``YYYY-MM-DD`` date string."""
+    return datetime.datetime.fromtimestamp(
+        ts, tz=datetime.timezone.utc).date().isoformat()
+
+
+def human_span(first, last):
+    """Human length of the inclusive UTC-date window ``first``..``last``.
+
+    :param first: ``datetime.date`` of the first impacted event.
+    :param last: ``datetime.date`` of the last impacted event.
+    :returns: ``"1 day"``, ``"9 days"``, ``"3 weeks"`` or ``"2 months"`` —
+        days under two weeks, weeks under ~two months, months beyond.
+    """
+    days = (last - first).days + 1
+    if days < 14:
+        return f"{days} day" + ("s" if days != 1 else "")
+    if days < 60:
+        return f"{round(days / 7)} weeks"
+    return f"{round(days / 30)} months"
+
+
+def _cost(tok, rate):
+    """USD cost of one event's tokens at one pricing row — the report's
+    formula (report.fetch_project_stats): missing rates price as 0, the 1h
+    cache-write portion falls back to the 5m rate when the row predates the
+    split. ``rate`` ``None`` (unpriced) costs 0."""
+    if rate is None:
+        return 0.0
+    in_tok, out_tok, cr, cw, cw1h = tok
+
+    def r(k):
+        return rate[k] or 0.0
+    w1h = rate["cache_w_1h_usd"]
+    w1h = w1h if w1h is not None else r("cache_w_usd")
+    return (in_tok * r("in_usd") + out_tok * r("out_usd") + cr * r("cache_r_usd")
+            + (cw - cw1h) * r("cache_w_usd") + cw1h * w1h) / 1_000_000.0
+
+
+class _Shadow:
+    """Event resolution against the ``pricing`` table, with and without
+    hypothetical rows, on one connection.
+
+    It creates ``temp.pricing`` — a copy of ``main.pricing`` whose ``_rid``
+    column is the real row's rowid. SQLite resolves an unqualified ``pricing``
+    to the TEMP schema first, so the production resolver
+    (``report.resolved_subquery``, unchanged) runs against the copy;
+    hypothetical rows get negative ``_rid``s and live only in the copy. The
+    real table is never touched. :meth:`close` drops the copy.
+    """
+
+    def __init__(self, conn):
+        self.conn = conn
+        pcols = {r[1] for r in conn.execute("PRAGMA main.table_info(pricing)")}
+        ecols = {r[1] for r in conn.execute("PRAGMA main.table_info(events)")}
+        w1h = "cache_w_1h_usd" if "cache_w_1h_usd" in pcols else "NULL"
+        self.ev_w1h = "e.cache_w_1h" if "cache_w_1h" in ecols else "0"
+        conn.execute("DROP TABLE IF EXISTS temp.pricing")
+        conn.execute(
+            "CREATE TEMP TABLE pricing AS SELECT rowid AS _rid, provider,"
+            " model_prefix, model_version, in_usd, out_usd, cache_r_usd,"
+            f" cache_w_usd, {w1h} AS cache_w_1h_usd, effective_from, source"
+            " FROM main.pricing")
+        self.rows = {}
+        for r in conn.execute(
+                "SELECT _rid, provider, model_prefix, model_version, in_usd,"
+                " out_usd, cache_r_usd, cache_w_usd, cache_w_1h_usd,"
+                " effective_from, source FROM temp.pricing"):
+            self.rows[r[0]] = self._row(r[1:])
+        self.events, self.baseline = {}, {}
+        for rowid, name, ts, tok, rid in self._resolve(None, with_events=True):
+            self.events[rowid] = (name, ts, tok)
+            self.baseline[rowid] = rid
+
+    @staticmethod
+    def _row(vals):
+        keys = ("provider", "model_prefix", "model_version") + RATE_KEYS + (
+            "effective_from", "source")
+        return dict(zip(keys, vals))
+
+    def _resolve(self, before, with_events=False, expr="pr._rid"):
+        import report  # the one resolver definition; imported lazily
+        sql = ("SELECT e.rowid, m.name, e.ts, e.in_tok, e.out_tok, e.cache_r,"
+               f" e.cache_w, {self.ev_w1h}, {report.resolved_subquery(expr)}"
+               " FROM events e JOIN models m ON m.id = e.model_id")
+        args = ()
+        if before is not None:
+            sql += " WHERE e.ts < ?"
+            args = (before,)
+        for r in self.conn.execute(sql, args):
+            if with_events:
+                yield r[0], r[1], r[2], tuple(v or 0 for v in r[3:8]), r[8]
+            else:
+                yield r[0], r[8]
+
+    def resolve(self, before=None):
+        """``{event rowid: resolved _rid or None}`` for events with
+        ``ts < before`` (all events when ``before`` is None)."""
+        return dict(self._resolve(before))
+
+    def resolve_main(self):
+        """``{event rowid: resolved main.pricing rowid or None}`` against the
+        REAL table — only meaningful once the copy is dropped."""
+        return dict(self._resolve(None, expr="pr.rowid"))
+
+    def add(self, rid, row):
+        """Insert hypothetical ``row`` into the copy under ``_rid = rid``."""
+        self.conn.execute(
+            "INSERT INTO temp.pricing(_rid, provider, model_prefix,"
+            " model_version, in_usd, out_usd, cache_r_usd, cache_w_usd,"
+            " cache_w_1h_usd, effective_from, source)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (rid, row["provider"], row["model_prefix"], row["model_version"],
+             *(row[k] for k in RATE_KEYS), row["effective_from"],
+             row["source"]))
+
+    def remove_hypothetical(self):
+        self.conn.execute("DELETE FROM temp.pricing WHERE _rid < 0")
+
+    def rate(self, rid, hypo=None):
+        return (hypo or {}).get(rid) or self.rows.get(rid)
+
+    def close(self):
+        self.conn.execute("DROP TABLE IF EXISTS temp.pricing")
+
+
+def _original_source(source):
+    """R0's provenance, unwrapped if R0 is itself an earlier backfill row."""
+    m = _BACKFILL_SRC_RE.match(source or "")
+    return m.group(1) if m else (source or "")
+
+
+def _plan_candidates(sh, today):
+    """Every backfill candidate over the shadow ``sh`` — see
+    :func:`backfill_plan` for the rules. Leaves no hypothetical row behind."""
+    by_prefix = {}
+    for rid, row in sh.rows.items():
+        cur = by_prefix.get(row["model_prefix"])
+        if cur is None or (row["effective_from"], rid) < (
+                sh.rows[cur]["effective_from"], cur):
+            by_prefix[row["model_prefix"]] = rid
+    out = []
+    for prefix in sorted(by_prefix):
+        r0_rid = by_prefix[prefix]
+        r0 = sh.rows[r0_rid]
+        if capture.is_family_default(prefix) or r0["effective_from"] <= 0:
+            continue
+        # events P prefixes, by the resolver's own LIKE semantics
+        matched = {rid for (rid,) in sh.conn.execute(
+            "SELECT e.rowid FROM events e JOIN models m ON m.id = e.model_id"
+            " WHERE e.ts < ? AND m.name LIKE ? || '%'",
+            (r0["effective_from"], prefix))}
+        triggers = []
+        for ev in matched:
+            name, ts, _tok = sh.events[ev]
+            base = sh.baseline.get(ev)
+            if (base is not None and not capture.is_estimated(name, prefix)
+                    and capture.is_estimated(
+                        name, sh.rows[base]["model_prefix"])):
+                triggers.append(ts)
+        if not triggers:
+            continue
+        start = _day_start(min(triggers))
+        hypo = dict(r0, effective_from=start,
+                    source=f"backfill:{_original_source(r0['source'])};"
+                           f" confirmed {today.isoformat()}")
+        sh.add(-1, hypo)
+        try:
+            after = sh.resolve(before=r0["effective_from"])
+        finally:
+            sh.remove_hypothetical()
+        changed = {ev: rid for ev, rid in after.items()
+                   if rid != sh.baseline.get(ev)}
+        if not changed:
+            continue
+        cand = {"prefix": prefix, "provider": r0["provider"],
+                "model_version": r0["model_version"],
+                "r0": {"effective_from": _iso(r0["effective_from"]),
+                       "source": r0["source"],
+                       "rates": {k: r0[k] for k in RATE_KEYS}},
+                "row": hypo, "backfill_from": _iso(start),
+                "impact": sorted(changed)}
+        own, unpriced, stray, models = {}, {}, {}, {}
+        for ev, rid in changed.items():
+            name, ts, tok = sh.events[ev]
+            base = sh.baseline.get(ev)
+            if rid != -1:
+                stray[name] = stray.get(name, 0) + 1
+            if base is None:
+                unpriced[name] = unpriced.get(name, 0) + 1
+            elif not capture.is_estimated(
+                    name, sh.rows[base]["model_prefix"]):
+                own[name] = own.get(name, 0) + 1
+            m = models.setdefault(name, {"model": name, "events": 0,
+                                         "cost_now": 0.0, "cost_after": 0.0,
+                                         "first": ts, "last": ts})
+            m["events"] += 1
+            m["cost_now"] += _cost(tok, sh.rows.get(base))
+            m["cost_after"] += _cost(tok, hypo)
+            m["first"], m["last"] = min(m["first"], ts), max(m["last"], ts)
+        first = min(m["first"] for m in models.values())
+        last = max(m["last"] for m in models.values())
+        mlist = []
+        for m in sorted(models.values(), key=lambda m: m["model"]):
+            m["delta"] = m["cost_after"] - m["cost_now"]
+            m["first"], m["last"] = _iso(m["first"]), _iso(m["last"])
+            mlist.append(m)
+        cand.update({
+            "window": {"first": _iso(first), "last": _iso(last),
+                       "span": human_span(
+                           datetime.date.fromisoformat(_iso(first)),
+                           datetime.date.fromisoformat(_iso(last)))},
+            "models": mlist,
+            "events": sum(m["events"] for m in mlist),
+            "cost_now": sum(m["cost_now"] for m in mlist),
+            "cost_after": sum(m["cost_after"] for m in mlist)})
+        cand["delta"] = cand["cost_after"] - cand["cost_now"]
+        reasons = []
+        if own:
+            reasons.append("would re-price events already priced by their"
+                           " own row: " + ", ".join(
+                               f"{k} ({v})" for k, v in sorted(own.items())))
+        if unpriced:
+            reasons.append("would price previously unpriced events: "
+                           + ", ".join(f"{k} ({v})"
+                                       for k, v in sorted(unpriced.items())))
+        if stray:
+            reasons.append("events would resolve to a row other than the"
+                           " backfill row: " + ", ".join(
+                               f"{k} ({v})" for k, v in sorted(stray.items())))
+        cand["refused"] = "; ".join(reasons) or None
+        out.append(cand)
+    for c in out:
+        imp = set(c["impact"])
+        c["overlaps"] = [o["prefix"] for o in out
+                         if o is not c and imp & set(o["impact"])]
+    return out
+
+
+def _group(cands):
+    """Split candidates into (offered, confirm_only, refused)."""
+    offered, zero, refused = [], [], []
+    for c in cands:
+        if c["refused"]:
+            refused.append(c)
+        elif all(abs(m["delta"]) < _EPS for m in c["models"]):
+            zero.append(c)
+        else:
+            offered.append(c)
+    return offered, zero, refused
+
+
+def backfill_plan(conn, today):
+    """The read-only backfill plan over the local central DB.
+
+    A candidate is a non-family-default pricing prefix P whose EARLIEST row R0
+    was preceded (``events.ts < R0.effective_from``) by ESTIMATED events
+    (``capture.is_estimated`` of their currently resolved row) of models for
+    which P is their OWN row (P prefixes the name and is not an ancestor row
+    for it). The hypothetical backfill row is R0's rates dated the UTC start
+    of the day of the earliest such event. The IMPACT SET is every event
+    whose resolved row changes when that row is added — computed by resolving
+    every event before R0 with and without it — and may include other models
+    sharing the prefix (e.g. an unlisted successor under a predecessor's
+    row), listed under their own names. A candidate whose impact set holds an
+    event priced by an OWN (non-estimated) row, or an unpriced event, is
+    REFUSED. Nothing is written: the hypothetical row lives in a TEMP copy.
+
+    :param conn: a connection to the telemetry DB (read-only is enough).
+    :param today: the run date (UTC) — stamped into the would-be ``source``.
+    :returns: ``{"candidates": [...], "confirm_only": [...],
+        "refused": [...]}`` — each entry a dict with ``prefix``, ``provider``,
+        ``model_version``, ``r0`` (effective_from, source, rates),
+        ``backfill_from``, ``window`` (first, last, span), ``models`` (per
+        model: events, cost_now, cost_after, delta, first, last), ``events``,
+        ``cost_now``, ``cost_after``, ``delta``, ``overlaps`` (other
+        candidates sharing impacted events), ``refused`` (reason or None),
+        ``impact`` (event rowids) and ``row`` (the would-be pricing row).
+    """
+    saved = conn.isolation_level
+    conn.isolation_level = None
+    conn.execute("BEGIN")   # one read snapshot for the whole plan
+    try:
+        sh = _Shadow(conn)
+        offered, zero, refused = _group(_plan_candidates(sh, today))
+    finally:
+        conn.execute("ROLLBACK")   # also discards the TEMP copy
+        conn.isolation_level = saved
+    return {"candidates": offered, "confirm_only": zero, "refused": refused}
+
+
+def _usd(v, signed=False):
+    sign = ("+" if v > 0 else "-" if v < 0 else "") if signed else (
+        "-" if v < 0 else "")
+    a = abs(v)
+    body = f"{a:,.2f}" if a >= 0.01 or a == 0 else f"{a:.4f}"
+    return f"{sign}${body}"
+
+
+def _cand_rows(cands, zero=False):
+    out = []
+    for c in cands:
+        per = "<br>".join(
+            f"`{m['model']}`: {m['events']:,}"
+            + ("" if zero else f" ({_usd(m['cost_now'])} → "
+               f"{_usd(m['cost_after'])}, {_usd(m['delta'], True)})")
+            for m in c["models"])
+        w = c["window"]
+        window = (w["first"] if w["first"] == w["last"]
+                  else f"{w['first']} → {w['last']}") + f" ({w['span']})"
+        rate = fmt_rates(c["r0"]["rates"])
+        note = (f" · overlaps {', '.join(f'`{o}`' for o in c['overlaps'])}"
+                if c["overlaps"] else "")
+        if zero:
+            out.append(f"| `{c['prefix']}` | {window} | {per} |"
+                       f" {rate} (own, {c['r0']['effective_from']}) |"
+                       f" {c['backfill_from']}{note} |")
+        else:
+            out.append(f"| `{c['prefix']}` | {window} | {per} |"
+                       f" {_usd(c['cost_now'])} → {_usd(c['cost_after'])} |"
+                       f" **{_usd(c['delta'], True)}** |"
+                       f" {rate} (own, {c['r0']['effective_from']}) |"
+                       f" {c['backfill_from']}{note} |")
+    return out
+
+
+def render_backfill_plan(plan_):
+    """The markdown rendering of :func:`backfill_plan` output."""
+    offered, zero, refused = (plan_["candidates"], plan_["confirm_only"],
+                              plan_["refused"])
+    if not (offered or zero or refused):
+        return ("No backfill candidates: no model has estimated events before"
+                " its own pricing row.")
+    out = []
+    n = len(offered) + len(zero)
+    if n:
+        out.append(f"Backfill available — {n} candidate prefix(es). Each would"
+                   " INSERT one row (the prefix's earliest own rate, dated the"
+                   " backfill date) re-pricing ONLY the estimated events"
+                   " listed; nothing is written without explicit consent"
+                   " (`--backfill-apply <prefix> ...`).")
+    if offered:
+        out += ["", "| prefix | window (span) | events per model"
+                " (cost now → after, delta) | cost now → after | delta |"
+                " rate copied (in / out / cache-read / 5m-write / 1h-write)"
+                " | backfill from |", "|---|---|---|---|---|---|---|"]
+        out += _cand_rows(offered)
+        total = sum(c["delta"] for c in offered)
+        out += ["", f"Total delta if every candidate above is applied"
+                f" independently: {_usd(total, True)}."]
+    if zero:
+        out += ["", "Confirm only — no cost change (the own rate equals the"
+                " estimate these events were priced at):", "",
+                "| prefix | window (span) | events per model |"
+                " rate copied | backfill from |", "|---|---|---|---|---|"]
+        out += _cand_rows(zero, zero=True)
+    if refused:
+        out += ["", "Refused — not offered (a backfill would re-price events"
+                " that are not estimates):", ""]
+        for c in refused:
+            out.append(f"- `{c['prefix']}` (window {c['window']['first']} →"
+                       f" {c['window']['last']}): {c['refused']}")
+    if any(c["overlaps"] for c in offered + zero):
+        out += ["", "Overlapping candidates share impacted events; each row"
+                " above is computed on its own. Applying several together"
+                " prices a shared event at the longest matching backfill"
+                " row — the apply report shows the combined result."]
+    return "\n".join(out)
+
+
+def _json_plan(plan_):
+    def strip(c):
+        return {k: v for k, v in c.items() if k not in ("impact", "row")} | {
+            "impact_events": len(c["impact"])}
+    return {k: [strip(c) for c in v] for k, v in plan_.items()}
+
+
+class BackfillRefused(Exception):
+    """An apply that wrote nothing; ``args[0]`` is the report text."""
+
+
+def backfill_apply(conn, prefixes, today):
+    """Re-plan and apply the backfill for ``prefixes`` — all or nothing.
+
+    Inside ONE ``BEGIN IMMEDIATE`` transaction: re-compute the plan (a stale
+    one is never trusted); refuse the whole apply, writing nothing, if any
+    named prefix is not a current non-refused candidate (a prefix that is
+    already backfilled — no longer a candidate and holding a ``backfill:``
+    row — is a no-op, so a re-run is idempotent); check the COMBINED
+    hypothetical re-prices exactly the union of the named impact sets and
+    only estimated events; ``INSERT OR IGNORE`` one row per prefix (R0's
+    rates, ``effective_from`` = the backfill date, ``source`` =
+    ``backfill:<R0 source>; confirmed <today>``); then verify every event
+    against the real table — each impacted event resolves to its predicted
+    new row, no other event changed — and ROLL BACK on any mismatch. Never
+    UPDATEs or DELETEs a pricing row.
+
+    :param conn: a read-write connection (:func:`capture.connect`).
+    :param prefixes: the pricing prefixes the user confirmed.
+    :param today: the run date (UTC).
+    :returns: the markdown apply report.
+    :raises BackfillRefused: nothing was written (invalid prefix, interaction
+        or verification failure); the message is the report.
+    """
+    names = list(dict.fromkeys(prefixes))
+    saved = conn.isolation_level
+    conn.isolation_level = None
+    conn.execute("BEGIN IMMEDIATE")
+    sh = None
+    try:
+        sh = _Shadow(conn)
+        cands = {c["prefix"]: c for c in _plan_candidates(sh, today)}
+        chosen, noop, bad = [], [], []
+        for p in names:
+            c = cands.get(p)
+            if c is not None and not c["refused"]:
+                chosen.append(c)
+            elif c is None and conn.execute(
+                    "SELECT 1 FROM main.pricing WHERE model_prefix = ?"
+                    " AND source LIKE 'backfill:%'", (p,)).fetchone():
+                noop.append(p)
+            else:
+                bad.append(f"`{p}`: " + (f"refused — {c['refused']}" if c
+                                         else "not a backfill candidate"))
+        if bad:
+            raise BackfillRefused(
+                "Backfill REFUSED — nothing written (all-or-nothing):\n"
+                + "\n".join(f"- {b}" for b in bad))
+        # combined hypothetical: all chosen rows at once
+        hypo = {}
+        for i, c in enumerate(chosen):
+            hypo[-(i + 1)] = c["row"]
+            sh.add(-(i + 1), c["row"])
+        comb = {ev: rid for ev, rid in sh.resolve().items()
+                if rid != sh.baseline.get(ev)}
+        sh.remove_hypothetical()
+        union = set().union(*(c["impact"] for c in chosen)) if chosen else set()
+        if set(comb) != union or any(rid not in hypo for rid in comb.values()):
+            raise BackfillRefused(
+                "Backfill REFUSED — nothing written: applied together, the"
+                " named rows would re-price a different event set than"
+                " their plans.")
+        sh.close()
+        real = {}
+        for rid, row in hypo.items():
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO main.pricing(provider, model_prefix,"
+                " model_version, in_usd, out_usd, cache_r_usd, cache_w_usd,"
+                " cache_w_1h_usd, effective_from, source)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (row["provider"], row["model_prefix"], row["model_version"],
+                 *(row[k] for k in RATE_KEYS), row["effective_from"],
+                 row["source"]))
+            if cur.rowcount != 1:
+                raise BackfillRefused(
+                    f"Backfill REFUSED — nothing written: a row for"
+                    f" `{row['model_prefix']}` at {_iso(row['effective_from'])}"
+                    " already exists.")
+            real[rid] = cur.lastrowid
+        # verify against the REAL table
+        actual = sh.resolve_main()
+        expected = dict(sh.baseline)
+        expected.update({ev: real[rid] for ev, rid in comb.items()})
+        wrong = [ev for ev in actual if actual[ev] != expected.get(ev)]
+        if wrong or set(actual) != set(expected):
+            raise BackfillRefused(
+                "Backfill ROLLED BACK — verification failed:"
+                f" {len(wrong)} event(s) resolved differently than planned.")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.isolation_level = saved
+
+    out = ["| prefix | backfill row effective | events re-priced per model |"
+           " cost before → after | delta |", "|---|---|---|---|---|"]
+    new_rows = {real[rid]: row for rid, row in hypo.items()}
+    for rid, c in zip(hypo, chosen):
+        evs = [ev for ev, r in comb.items() if r == rid]
+        per, before, after = {}, 0.0, 0.0
+        for ev in evs:
+            name, _ts, tok = sh.events[ev]
+            b = _cost(tok, sh.rows.get(sh.baseline[ev]))
+            a = _cost(tok, new_rows[actual[ev]])
+            per[name] = per.get(name, 0) + 1
+            before, after = before + b, after + a
+        cells = "<br>".join(f"`{k}`: {v:,}" for k, v in sorted(per.items()))
+        out.append(f"| `{c['prefix']}` | {c['backfill_from']} | {cells or '—'}"
+                   f" | {_usd(before)} → {_usd(after)} |"
+                   f" **{_usd(after - before, True)}** |")
+    for p in noop:
+        out.append(f"| `{p}` | — | already backfilled — nothing to do | — | — |")
+    out += ["", f"Verified: {len(comb):,} event(s) now resolve to the new"
+            f" backfill row(s) exactly as planned; 0 events outside the"
+            f" impact set(s) changed. {len(real)} row(s) inserted (INSERT"
+            " only; no row was updated or deleted)."]
+    return "\n".join(out)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="pricing_update.py")
     ap.add_argument("--db", default=None)
     ap.add_argument("--html", default=None,
                     help="parse a local HTML file instead of fetching (tests)")
+    ap.add_argument("--backfill-plan", action="store_true",
+                    help="print the read-only backfill plan and exit")
+    ap.add_argument("--json", action="store_true",
+                    help="with --backfill-plan: machine-readable JSON")
+    ap.add_argument("--backfill-apply", nargs="+", metavar="PREFIX",
+                    help="insert the backfill row for each confirmed prefix"
+                         " (all-or-nothing; re-plans first)")
     args = ap.parse_args(argv)
     db = args.db or capture.db_path()
     if not Path(db).exists():
         print("No telemetry DB yet — nothing to update. Enable capture with"
               " `/token-telemetry:enable` first.")
+        return 0
+    today = datetime.datetime.now(tz=datetime.timezone.utc).date()
+    if args.backfill_plan:
+        import storage
+        conn = storage.LocalSqliteBackend(db).open_ro()
+        try:
+            p = backfill_plan(conn, today)
+        finally:
+            conn.close()
+        if args.json:
+            print(json.dumps(_json_plan(p), indent=2, sort_keys=True))
+        else:
+            print(render_backfill_plan(p))
+        return 0
+    if args.backfill_apply:
+        conn = capture.connect(db)
+        try:
+            print(backfill_apply(conn, args.backfill_apply, today))
+        except BackfillRefused as exc:
+            print(exc.args[0])
+            return 1
+        finally:
+            conn.close()
         return 0
     try:
         if args.html:
