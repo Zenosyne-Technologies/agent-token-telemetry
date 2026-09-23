@@ -2,12 +2,12 @@
 doc: Pricing Updates
 type: handbook
 status: active
-summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, minting only the rate in force today per listed version (with a stale-price warning for an expired intro with nothing else listed), the own-price-vs-estimate definitions, the dashboard's own-price warning banner (AOS-135) that now surfaces them with its node-gated client tests, the consent-gated backfill of estimated events, and the narrow exceptions to the pricing table's immutability contract.
-keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning, dashboard, price-warning-banner, node-gated-tests, require-node, backfill, backfill-plan, backfill-apply]
+summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, minting only the rate in force today per listed version (with warnings for an expired intro or a future-only-newest version), the own-price-vs-estimate definitions, the dashboard's own-price warning banner (AOS-135) that now surfaces them with its node-gated client tests, the consent-gated backfill of estimated events, the narrow exceptions to the pricing table's immutability contract, and the AOS-143 parser bounds (backdated-starting refusal, rate-magnitude and row-count caps, sanitized error text) that keep a hostile or broken page from minting permanent bad rows.
+keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning, future-rate-warning, backdated-starting-warning, parser-bounds, max-rate-usd, max-candidates, dashboard, price-warning-banner, node-gated-tests, require-node, backfill, backfill-plan, backfill-apply]
 level: project
 audience: developer
 module: pricing-update
-sources: [scripts/pricing_update.py, commands/pricing-update.md, commands/schedule-pricing.md, docs/TELEMETRY-CONTRACT.md, tests/pricing_golden.py, scripts/dashboard.py, scripts/dashboard.html, tests/test_dashboard_client.py, tests/dashboard_dom_harness.js, tests/test_backfill.py]
+sources: [scripts/pricing_update.py, commands/pricing-update.md, commands/schedule-pricing.md, docs/TELEMETRY-CONTRACT.md, tests/pricing_golden.py, tests/test_pricing_bounds.py, scripts/dashboard.py, scripts/dashboard.html, tests/test_dashboard_client.py, tests/dashboard_dom_harness.js, tests/test_backfill.py]
 related: ["[[capture-pipeline]]", "[[remote-read-parity]]"]
 created: 2026-09-22
 updated: 2026-09-23
@@ -93,6 +93,73 @@ the rate in force today" / "Known limitation — expired intro with no other
 rate") for the exact rules; this section only orients a maintainer to the
 functions that implement them (`in_force`, `build_candidates`,
 `stale_intros`, `render`).
+
+**A family's newest version listed only with a future `starting` date
+(`future_only_newest()`).** Distinct from the stale-intro case above: the
+newest version's only listing is a `starting <d>` increase that has not
+arrived yet (`d > today`), so no rate is in force for it and, as with a stale
+intro, no family default is minted either. This is not a page bug — the
+increase just hasn't happened — but it is easy to mistake for "nothing
+changed": the run report prints a `FUTURE-RATE WARNING` line naming the
+family, version and the increase's start date, so a reader knows the family
+default is intentionally holding its last recorded rate until then. A version
+mixing an expired `through` with a future `starting` is reported once, by
+`stale_intros()`, not twice.
+
+## Parser bounds (AOS-143)
+
+Pricing history is insert-only (`docs/TELEMETRY-CONTRACT.md` §Pricing table,
+"History is never mutated"), so a bad row minted from the parsed page is
+**permanent**. A security review found four ways a hostile or merely broken
+page could abuse that: `pricing_update.py` now bounds all four before any
+row reaches the database, and refuses cleanly rather than silently doing
+the wrong thing.
+
+**Backdated `starting` rows (`filter_backdated_starting()`).** An in-force
+`starting <d>` row is normally minted dated `d`, however far back that is —
+"starting January 1, 1970" would mint `effective_from = 0`, re-pricing every
+event of that prefix back to the epoch. `run_update()` now drops any in-force
+`starting` entry before it ever reaches `build_candidates()` when `d` is more
+than `BACKDATE_MAX_DAYS` (365) days before the run date, **or** earlier than
+the latest `effective_from` already recorded for the version's own prefix(es)
+— a real increase is never older than what is already on record. This is a
+per-entry refusal, not a whole-run refusal: the rest of the page still mints
+normally, and the run report prints a `BACKDATED-STARTING WARNING` line
+naming the family, version and the refused date. A future `starting`
+(`d > today`) is untouched here — it is never minted anyway (`in_force()`).
+
+**Unbounded rate magnitude (`MAX_RATE_USD`, in `parse_models()`).**
+`money()` stays a permissive regex match on purpose — magnitude enforcement
+lives in one place, `parse_models()`, so every caller (including a future
+non-HTML source) shares the same check. A rate cell with several hundred
+digits overflows Python's `float()` to `inf` with **no exception raised**;
+`parse_models()` now rejects any rate that is non-finite or exceeds
+`MAX_RATE_USD` ($10,000/MTok) for **any** of the five columns. The check
+refuses the **whole run** — the `ValueError` propagates out of `parse_models`
+before `main()` ever opens the database connection, so nothing is written,
+and the script exits 2 (its existing fetch/parse-failure code).
+
+**Unbounded row count (`MAX_CANDIDATES`, in `run_update()`).** A page listing
+thousands of rows would mint thousands of candidate pricing rows in one run.
+`run_update()` checks `len(build_candidates(...))` against `MAX_CANDIDATES`
+(500) **before** calling `plan()`/`apply()` — over the cap raises
+`PricingRefused` and nothing is planned or applied. `main()` catches
+`PricingRefused`, prints its message, and exits 1; this is a distinct failure
+mode from the fetch/parse-failure exit 2, since the page parsed fine — the
+result was just too large to trust in one run.
+
+**Raw page text in error messages (`_safe_error_text()`).** The two
+parse-failure messages that embed page text — "unexpected pricing table
+header" and "unparseable rate cell in row" — used to interpolate the raw
+cell text (and, for the header, a raw Python list of raw cells) directly into
+the exception message that `main()` prints to stderr on a parse failure.
+`_safe_error_text()` strips ASCII control characters (including a raw `ESC`
+or `CR` byte — a terminal escape sequence must never reach a viewer's
+terminal) and Unicode bidi-control characters (which can visually reorder or
+spoof the printed text), then caps the result to 200 characters — a header
+row is a Python list, whose `str()` has no length limit on its own, so even
+a single absurdly long or many-celled header now prints a short, bounded
+message.
 
 ## Own price vs estimate
 

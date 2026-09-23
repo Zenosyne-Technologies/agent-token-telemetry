@@ -391,7 +391,36 @@ family default when it is the family's newest version), and the run report print
 `STALE-PRICE WARNING` line naming the version and its intro end date. Its events keep
 the last recorded rate until the page publishes a post-intro rate. They are **not**
 flagged estimated: that would require storing the row's condition (`through <d>`),
-which the `pricing` table does not hold.
+which the `pricing` table does not hold. The mirror case — the family's newest version
+is listed only with a **future** `starting <d>` (`d > today`) — also mints no rate for
+it and no family row either; the run report prints a `FUTURE-RATE WARNING` line instead,
+saying the family default keeps its last recorded rate until the increase's date arrives.
+
+**Parser bounds (AOS-143) — what a fetched page can mint is bounded, because a bad row
+here is permanent.** A security review found the parser could be made to mint rows it
+should not; `pricing_update.py` now refuses on four axes, before any row reaches the
+database:
+
+- **Backdated `starting`.** An in-force `starting <d>` row is normally minted dated `d`
+  however far back — `starting January 1, 1970` would mint `effective_from = 0`,
+  re-pricing that prefix's entire history. A `starting <d>` entry is now refused (its
+  own WARNING line, naming the version and date; the rest of the run proceeds normally)
+  when `d` is more than 365 days before today, **or** earlier than the latest
+  `effective_from` already recorded for the version's own prefix(es).
+- **Unbounded rate magnitude.** `money()`'s regex match is deliberately permissive about
+  digit count — a several-hundred-digit rate cell overflows `float()` to `inf` with no
+  exception raised. Every parsed rate is now checked: non-finite, or over $10,000/MTok,
+  refuses the **whole run** (nothing written, single transaction, exit 2 — the existing
+  fetch/parse-failure code, since the check lives in `parse_models()` before any DB
+  connection is opened).
+- **Unbounded row count.** A page listing thousands of model rows would mint thousands
+  of candidate pricing rows in one run. More than 500 candidate rows in one run refuses
+  the whole run atomically (nothing planned or applied; exit 1).
+- **Raw page text in error messages.** The two parse-failure messages that embed page
+  text (an unrecognized header, an unparseable rate cell) now strip ASCII control
+  characters and Unicode bidi-control characters and cap length before the message is
+  ever constructed — a hostile page cell can no longer inject a terminal escape sequence
+  or an unbounded message into stderr.
 
 A model the page does not list is priced by the longest matching prefix, unchanged:
 an unlisted point release of a listed version (e.g. `claude-opus-5-5` while the page

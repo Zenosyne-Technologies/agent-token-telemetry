@@ -35,6 +35,7 @@ import argparse
 import datetime
 import decimal
 import json
+import math
 import re
 import sys
 import urllib.request
@@ -63,6 +64,34 @@ FAMILIES = ("Fable", "Mythos", "Opus", "Sonnet", "Haiku")
 _PREFIX_RE = re.compile(
     r"claude-(?:" + "|".join(f.lower() for f in FAMILIES) + r")-[0-9]+(?:-[0-9]+)?")
 _LEGACY_PREFIXES = frozenset(p for ps in SPECIAL_PREFIXES.values() for p in ps)
+
+# Parser bounds (AOS-143 security review): a bad row minted from the parsed
+# pricing page is permanent (insert-only history), so what a page can mint is
+# bounded on every axis a hostile or broken page could abuse.
+MAX_RATE_USD = 10000.0          # money() ceiling: no rate this high is real
+MAX_CANDIDATES = 500            # candidate rows a single run may mint
+BACKDATE_MAX_DAYS = 365         # oldest a `starting <d>` row may be minted at
+
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+# Unicode bidi-control characters (U+202A-U+202E, U+2066-U+2069): can
+# visually reorder or spoof rendered/terminal text (mirrors report.md_cell).
+_BIDI_CHAR_RE = re.compile(r"[‪-‮⁦-⁩]")
+_ERROR_TEXT_MAX = 200
+
+
+def _safe_error_text(value):
+    """Make untrusted page text (a raw cell, a header row) safe to embed in
+    an exception message that may reach stderr or a terminal: strip ASCII
+    control characters and DEL, strip Unicode bidi-control characters, then
+    cap length so one hostile page cell cannot blow up the printed message.
+    A parse-failure message must never carry raw, unsanitized page text.
+
+    :param value: the untrusted text (or a list/tuple of cells — stringified
+        first).
+    :returns: the sanitized, length-capped text.
+    """
+    s = _BIDI_CHAR_RE.sub("", _CONTROL_CHAR_RE.sub("", str(value)))
+    return s if len(s) <= _ERROR_TEXT_MAX else s[:_ERROR_TEXT_MAX] + "…"
 
 
 class TableCollector(HTMLParser):
@@ -97,6 +126,10 @@ class TableCollector(HTMLParser):
 
 
 def money(text):
+    """Parse a ``$<amount> / MTok`` cell to a float, or ``None`` when the
+    cell has no dollar amount. Deliberately permissive about magnitude —
+    ``parse_models`` is the bound-enforcement point (:data:`MAX_RATE_USD`),
+    so every caller sees the same, single check."""
     m = re.search(r"\$\s*([0-9]+(?:\.[0-9]+)?)", text)
     return float(m.group(1)) if m else None
 
@@ -128,7 +161,8 @@ def parse_models(html):
     # matched some header cell, else an index is missing and we refuse rather
     # than map a wrong column.
     if set(col) != {"in", "w5", "w1h", "cr", "out"}:
-        raise ValueError(f"unexpected pricing table header: {header}")
+        raise ValueError("unexpected pricing table header:"
+                         f" {_safe_error_text(header)}")
 
     entries = []
     for row in table[1:]:
@@ -151,7 +185,20 @@ def parse_models(html):
                  "cache_w_usd": money(row[col["w5"]]),
                  "cache_w_1h_usd": money(row[col["w1h"]])}
         if any(v is None for v in rates.values()):
-            raise ValueError(f"unparseable rate cell in row: {row[0]}")
+            raise ValueError("unparseable rate cell in row:"
+                             f" {_safe_error_text(row[0])}")
+        # Bound what a page can mint (AOS-143): reject a non-finite rate (a
+        # very long digit string overflows float() to `inf` with no
+        # exception) and any rate over MAX_RATE_USD/MTok. A single bad cell
+        # refuses the WHOLE run — money() is permissive on purpose, this is
+        # the one enforcement point every caller shares.
+        bad = [k for k, v in rates.items()
+               if not math.isfinite(v) or v > MAX_RATE_USD]
+        if bad:
+            raise ValueError(
+                "rate out of bounds (non-finite, or over"
+                f" ${MAX_RATE_USD:g}/MTok) for Claude {m.group(1).title()}"
+                f" {m.group(2)}: {', '.join(sorted(bad))}")
         entries.append({"family": m.group(1).lower(), "version": m.group(2),
                         "rates": rates, "condition": condition})
     if not entries:
@@ -317,6 +364,93 @@ def stale_intros(entries, today):
             if (fam, ver) not in priced]
 
 
+def future_only_newest(entries, today):
+    """Families whose newest (first-listed) version's ONLY listing(s) are a
+    FUTURE ``starting <d>`` increase (``d > today``) — so, like
+    :func:`stale_intros`, no rate is in force for it and no family default is
+    minted either (:func:`build_candidates`). Unlike :func:`stale_intros`
+    (an EXPIRED ``through``), this is a scheduled increase that has not
+    arrived yet: the family default is not stale, it simply has not been
+    told to change. Distinct from :func:`stale_intros` so a version mixing an
+    expired ``through`` with a future ``starting`` is reported once, by
+    :func:`stale_intros`, not twice.
+
+    :param entries: :func:`parse_models` output, in page order.
+    :param today: the run date (UTC).
+    :returns: ``[(family, version, earliest_future_starting_date)]`` in page
+        order.
+    """
+    newest_version, order, rows = {}, {}, {}
+    for i, e in enumerate(entries):
+        newest_version.setdefault(e["family"], e["version"])
+        key = (e["family"], e["version"])
+        order.setdefault(key, i)
+        rows.setdefault(key, []).append(e)
+    out = []
+    for fam, ver in newest_version.items():
+        key = (fam, ver)
+        listings = rows[key]
+        if any(r["condition"] is None or in_force(r["condition"], today)
+               for r in listings):
+            continue
+        if any(r["condition"][0] != "starting" for r in listings):
+            continue  # an expired `through` here is stale_intros's to report
+        out.append((fam, ver, min(r["condition"][1] for r in listings)))
+    out.sort(key=lambda t: order[(t[0], t[1])])
+    return out
+
+
+def filter_backdated_starting(conn, entries, today):
+    """Drop every in-force ``starting <d>`` entry ``d`` is too old to trust
+    (AOS-143 parser bounds): an in-force ``starting`` row is normally minted
+    dated ``d`` however far back (:func:`build_candidates`), which would
+    re-price every event of that prefix back to ``d`` — permanently, since
+    pricing history is insert-only. Refused when ``d`` is more than
+    :data:`BACKDATE_MAX_DAYS` days before ``today``, OR earlier than the
+    latest ``effective_from`` already recorded for the version's own
+    prefix(es) (a real increase is never older than what is already on
+    record). A future ``starting`` (``d > today``) is left alone — it is
+    never minted anyway (:func:`in_force`), so it cannot be backdated.
+
+    :param conn: an open, readable telemetry DB connection.
+    :param entries: :func:`parse_models` output, in page order.
+    :param today: the run date (UTC).
+    :returns: ``(filtered_entries, warnings)`` — ``entries`` with every
+        refused row removed, and one ``(family, version, date, reason)``
+        tuple per refusal, in page order.
+    """
+    cutoff = today - datetime.timedelta(days=BACKDATE_MAX_DAYS)
+    filtered, warnings = [], []
+    for e in entries:
+        cond = e["condition"]
+        if cond is None or cond[0] != "starting" or cond[1] > today:
+            filtered.append(e)
+            continue
+        date = cond[1]
+        reason = None
+        if date < cutoff:
+            reason = (f"more than {BACKDATE_MAX_DAYS} days before today"
+                      f" ({today.isoformat()})")
+        else:
+            latest = None
+            for p in specific_prefixes(e["family"], e["version"]):
+                row = conn.execute(
+                    "SELECT MAX(effective_from) FROM pricing"
+                    " WHERE provider=? AND model_prefix=?",
+                    (PROVIDER, p)).fetchone()
+                if row and row[0] is not None:
+                    latest = row[0] if latest is None else max(latest, row[0])
+            if latest is not None and _epoch(date) < latest:
+                reason = ("earlier than the latest recorded rate for"
+                          f" `{specific_prefixes(e['family'], e['version'])[0]}`"
+                          f" ({_iso(latest)})")
+        if reason is None:
+            filtered.append(e)
+        else:
+            warnings.append((e["family"], e["version"], date, reason))
+    return filtered, warnings
+
+
 def plan(conn, candidates):
     """Attach a status to every candidate; only some statuses insert."""
     for c in candidates:
@@ -378,7 +512,8 @@ def fmt_rates(r):
             f" / {n(r['cache_w_usd'])} / {n(r['cache_w_1h_usd'])}")
 
 
-def render(candidates, inserted, unpriced, today, stale=()):
+def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
+           future_only=()):
     """The finished markdown run report.
 
     :param candidates: planned+applied candidates (:func:`plan`,
@@ -388,6 +523,11 @@ def render(candidates, inserted, unpriced, today, stale=()):
     :param today: the run date (UTC).
     :param stale: :func:`stale_intros` output — one STALE-PRICE WARNING line
         per version whose only listed rate is an expired intro.
+    :param backdated: :func:`filter_backdated_starting` warnings output —
+        one BACKDATED-STARTING WARNING line per refused ``starting`` row.
+    :param future_only: :func:`future_only_newest` output — one FUTURE-RATE
+        WARNING line per family whose newest version's only rate has not
+        started yet.
     :returns: the report text.
     """
     out = ["| model prefix | in / out / cache-read / 5m-write / 1h-write"
@@ -410,26 +550,59 @@ def render(candidates, inserted, unpriced, today, stale=()):
                 " force after it; nothing was minted, so events for it keep"
                 " the last recorded rate until the page publishes a"
                 " post-intro rate."]
+    for fam, ver, date, reason in backdated:
+        out += ["", f"BACKDATED-STARTING WARNING: Claude {fam.capitalize()}"
+                f" {ver} (`{specific_prefixes(fam, ver)[0]}`) — its"
+                f" `starting {date.isoformat()}` row was refused ({reason});"
+                " nothing was minted for it."]
+    for fam, ver, date in future_only:
+        out += ["", f"FUTURE-RATE WARNING: Claude {fam.capitalize()} {ver}"
+                f" (`{specific_prefixes(fam, ver)[0]}`) — its only listed"
+                f" rate starts {date.isoformat()}, still in the future; the"
+                " family default keeps its last recorded rate until then."]
     out += ["", f"Source: {URL} — checked {today.isoformat()},"
             f" {inserted} row(s) inserted (history is insert-only; existing"
             " rows are never modified)."]
     return "\n".join(out)
 
 
+class PricingRefused(Exception):
+    """A run refused before any write; ``args[0]`` is the report/message."""
+
+
 def run_update(conn, entries, today, source=URL):
     """Plan, apply and report one pricing refresh of parsed page ``entries``.
+
+    Two bounds (AOS-143) can refuse work before any write reaches the DB:
+    an in-force ``starting`` row too old to trust is dropped per-entry by
+    :func:`filter_backdated_starting` (a warning, not a refusal — the rest
+    of the run proceeds); a candidate count over :data:`MAX_CANDIDATES`
+    refuses the WHOLE run atomically (:class:`PricingRefused`, nothing
+    planned or applied).
 
     :param conn: an open telemetry DB connection (:func:`capture.connect`).
     :param entries: :func:`parse_models` output, in page order.
     :param today: the run date (UTC).
     :param source: the ``source`` column value for inserted rows.
     :returns: the finished markdown run report (:func:`render`), including a
-        STALE-PRICE WARNING line per :func:`stale_intros` version.
+        STALE-PRICE / BACKDATED-STARTING / FUTURE-RATE WARNING line per
+        :func:`stale_intros` / :func:`filter_backdated_starting` /
+        :func:`future_only_newest`.
+    :raises PricingRefused: the candidate count exceeds
+        :data:`MAX_CANDIDATES`; nothing was planned or applied.
     """
-    candidates = plan(conn, build_candidates(entries, today))
+    filtered, backdated = filter_backdated_starting(conn, entries, today)
+    raw_candidates = build_candidates(filtered, today)
+    if len(raw_candidates) > MAX_CANDIDATES:
+        raise PricingRefused(
+            "Pricing refresh REFUSED — nothing written: this run would mint"
+            f" {len(raw_candidates)} candidate row(s), over the"
+            f" {MAX_CANDIDATES}-row cap per run.")
+    candidates = plan(conn, raw_candidates)
     inserted = apply(conn, candidates, source)
     return render(candidates, inserted, unpriced_models(conn), today,
-                  stale_intros(entries, today))
+                  stale_intros(entries, today), backdated,
+                  future_only_newest(entries, today))
 
 
 # ------------------------------------------------------------------ backfill
@@ -1236,9 +1409,6 @@ def backfill_apply(conn, prefixes, today):
     return "\n".join(out)
 
 
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-
 class _ArgumentParser(argparse.ArgumentParser):
     """``argparse.ArgumentParser`` whose ``error()`` strips ASCII control
     characters (e.g. a raw ESC byte) out of argparse's own error message
@@ -1408,6 +1578,9 @@ def main(argv=None):
     conn = capture.connect(db)
     try:
         print(run_update(conn, entries, today))
+    except PricingRefused as exc:
+        print(exc.args[0])
+        return 1
     finally:
         conn.close()
     return 0
