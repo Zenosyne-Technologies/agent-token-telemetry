@@ -1,10 +1,16 @@
 ---
-title: Capture Pipeline
+doc: Capture Pipeline
+type: handbook
+status: active
+summary: "Stop/SubagentStop capture hook: never-break-a-session guarantee, cursor/offset transcript tailing, lock ordering, migration post-conditions and the version hop chain, storage modes and central authority, mirror metadata semantics, sidecar attribution, project-name ladder resolution, pricing-at-query-time"
+keywords: [capture, stop-hook, subagentstop, never-break-a-session, transcript-tailing, cursor, lock-ordering, migrations, version-hop-chain, storage-modes, central-authority, mirror, sidecar-attribution, project-name-ladder, pricing-at-query-time]
+level: project
 audience: developer
 module: capture
 sources: [scripts/capture.py, hooks/hooks.json, docs/TELEMETRY-CONTRACT.md]
+related: ["[[pricing-and-cost]]"]
+created: 2026-08-05
 updated: 2026-09-22
-related: [[pricing-and-cost]]
 ---
 
 # Capture Pipeline

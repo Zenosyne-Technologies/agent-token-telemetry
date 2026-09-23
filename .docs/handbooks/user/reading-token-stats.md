@@ -1,10 +1,16 @@
 ---
-title: Reading Token Stats
+doc: Reading Token Stats
+type: handbook
+status: active
+summary: "What `/token-stats` shows, the all-time per-project table from `/project-stats`, scoped rollups by issue-key set and their three empty states, estimated-cost markers and the no-own-price footer, seed rates (undated) and the stale-price warning, cache hit rate, backfilling estimated pricing windows (bundles, the permission prompt, nothing applies unattended), and why the scheduled weekly refresh never backfills"
+keywords: [token-stats, project-stats, scoped-rollups, issue-keys, empty-states, estimated-cost, no-own-price-footer, seed-rates, stale-price-warning, cache-hit-rate, backfill, bundles, permission-prompt, scheduled-refresh]
+level: project
 audience: user
 module: reporting
 sources: [commands/token-stats.md, commands/project-stats.md, scripts/report.py, commands/pricing-update.md, commands/schedule-pricing.md, scripts/pricing_update.py]
+related: ["[[enabling-telemetry]]", "[[enabling-remote-telemetry]]", "[[operating-remote-telemetry]]"]
+created: 2026-08-05
 updated: 2026-09-23
-related: [[enabling-telemetry]], [[enabling-remote-telemetry]], [[operating-remote-telemetry]]
 ---
 
 # Reading Token Stats
