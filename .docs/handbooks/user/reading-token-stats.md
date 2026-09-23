@@ -56,6 +56,18 @@ couldn't be resolved at all, telemetry hasn't recorded anything for this
 project yet, or none of the requested issues have any recorded usage (which
 usually means the scope itself is wrong, not that the work was free).
 
+## Estimated costs
+
+Some models don't have their own published price on file yet — their cost is
+worked out from a stand-in rate instead (their model family's default, or the
+rate for the nearest earlier version). When that happens, the cost figure
+says so right in the cell: "N of M events at an estimated rate", or "the
+whole figure is an estimate" when every event in that figure used a stand-in
+rate. `/token-stats` also ends with a line naming any model that has no own
+price on file, pointing you at `/token-telemetry:pricing-update` to refresh
+the pricing table. Running that command fixes the rate going forward; a
+future backfill may later correct the estimated cost of past events too.
+
 ## "seed rates (undated)"
 
 Cost estimates are calculated using a pricing table that starts out with a
