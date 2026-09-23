@@ -8,7 +8,7 @@ level: project
 audience: developer
 module: capture
 sources: [scripts/capture.py, hooks/hooks.json, docs/TELEMETRY-CONTRACT.md]
-related: ["[[pricing-and-cost]]"]
+related: ["[[pricing-updates]]"]
 created: 2026-08-05
 updated: 2026-09-22
 ---
@@ -184,7 +184,7 @@ unaffected and still reads normally.
 (`in_tok`/`out_tok`/`cache_r`/`cache_w`) and lets the `pricing` table (seeded
 at `effective_from=0`, superseded by dated rows as prices change — see
 [[pricing-updates]] for how `pricing_update.py` adds those rows) resolve cost
-at query time — see [[pricing-and-cost]] for the rate-resolution rule
+at query time — see `docs/TELEMETRY-CONTRACT.md` §Pricing table for the rate-resolution rule
 consumers use. This keeps a rate change a pure data insert: historical events
 never need rewriting, and capture itself stays free of any pricing logic or
 external dependency.
