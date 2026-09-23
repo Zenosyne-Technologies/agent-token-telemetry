@@ -6,7 +6,7 @@ summary: The table of contents for one handbook audience — every page in this 
 keywords: [handbook, index, pages, audience]
 level: project
 created: 2026-09-21
-updated: 2026-09-22
+updated: 2026-09-23
 ---
 
 # Handbook Index
@@ -19,7 +19,7 @@ updated: 2026-09-22
 
 | item | sources | what it covers | status | updated |
 |---|---|---|---|---|
-| [[reading-token-stats]] | `commands/token-stats.md`, `commands/project-stats.md`, `scripts/report.py` | What `/token-stats` shows, the all-time per-project table from `/project-stats`, scoped rollups by issue-key set and their three empty states, seed rates (undated), cache hit rate | active | 2026-09-21 |
+| [[reading-token-stats]] | `commands/token-stats.md`, `commands/project-stats.md`, `scripts/report.py`, `commands/pricing-update.md` | What `/token-stats` shows, the all-time per-project table from `/project-stats`, scoped rollups by issue-key set and their three empty states, seed rates (undated) and the stale-price warning, cache hit rate | active | 2026-09-23 |
 | [[migrating-local-logs-to-central]] | `commands/migrate-to-central.md`, `scripts/manage.py` | Importing a project's local mirror (or a storage-separate export) into the central DB with `/migrate-to-central`, the keep-a-copy default, what switching active collection means, and why re-running is safe | active | 2026-09-22 |
 | [[migrating-to-remote]] | `commands/migrate-to-remote.md`, `scripts/remote_migrate.py`, `scripts/supabase_backend.py` | Uploading the whole central DB to the remote Supabase project with `/migrate-to-remote` — login, the readiness check, the count-verified upload, the keep-local default, and that switching collection is reversible and re-running safe | active | 2026-09-22 |
 | [[enabling-remote-telemetry]] | `commands/enable-remote.md`, `commands/enable.md`, `scripts/remote_migrate.py`, `scripts/settings.py`, `scripts/supabase_backend.py`, `scripts/dashboard.py` | Turning on the shared remote (Supabase) backend with `/enable-remote` — the local-vs-remote choice, the URL + publishable-key env-var NAME setup (the key value never entered in chat), applying the schema and running the RLS live-verification, login, ensuring the remote users row, migrate-or-start-fresh, the reversible switch, and the dashboard's local-only banner once remote is active | active | 2026-09-22 |

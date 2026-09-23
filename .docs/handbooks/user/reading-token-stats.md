@@ -2,8 +2,8 @@
 title: Reading Token Stats
 audience: user
 module: reporting
-sources: [commands/token-stats.md, commands/project-stats.md, scripts/report.py]
-updated: 2026-09-22
+sources: [commands/token-stats.md, commands/project-stats.md, scripts/report.py, commands/pricing-update.md]
+updated: 2026-09-23
 related: [[enabling-telemetry]], [[enabling-remote-telemetry]], [[operating-remote-telemetry]]
 ---
 
@@ -66,6 +66,12 @@ Running `/token-telemetry:pricing-update` refreshes this with dated,
 up-to-date rates. Once that's done, reports show the date the rates came into
 effect instead. Either way, the cost shown is always an estimate for
 budgeting, not an authoritative invoice.
+
+Occasionally that refresh prints a `STALE-PRICE WARNING` instead of a new
+rate for a given model — this means the published pricing page no longer
+lists a current rate for it (its introductory-rate period has ended and
+nothing has replaced it yet). Nothing changes for that model until the page
+is updated; its reports keep using the last rate that was recorded.
 
 ## Names shown are cleaned up for display
 

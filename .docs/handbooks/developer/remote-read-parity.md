@@ -2,15 +2,15 @@
 doc: Remote Read Parity
 type: handbook
 status: active
-summary: How reports read from the remote (Supabase/Postgres) backend with the same numbers as local SQLite — the SECURITY INVOKER reports.sql RPC/view, the client read_for_report mapping, report.py routing on active_backend, and the dual-dialect drift risk guarded by the cross-dialect golden test (SQLite reference in CI, Postgres-gated equivalence, maintainer live step).
-keywords: [read-parity, reports, supabase, postgres, rpc, security-invoker, rls, golden-test, dual-dialect, drift, pricing, windows, tiers]
+summary: How reports read from the remote (Supabase/Postgres) backend with the same numbers as local SQLite — the SECURITY INVOKER reports.sql RPC/view (now also carrying the estimated flag), the client read_for_report mapping, report.py routing on active_backend, and the dual-dialect drift risk guarded by the cross-dialect golden test and the estimated-flag three-way parity test (SQLite reference in CI, Postgres-gated equivalence, maintainer live step).
+keywords: [read-parity, reports, supabase, postgres, rpc, security-invoker, rls, golden-test, dual-dialect, drift, pricing, windows, tiers, estimated, family-default, ancestor-row]
 level: project
 audience: developer
 module: storage
-sources: [supabase/reports.sql, scripts/supabase_backend.py, scripts/report.py, scripts/storage.py, tests/test_report_parity.py]
-related: ["[[supabase-backend]]", "[[rls-remote-schema]]", "[[storage-backend]]", "[[capture-pipeline]]"]
+sources: [supabase/reports.sql, scripts/supabase_backend.py, scripts/report.py, scripts/storage.py, scripts/capture.py, tests/test_report_parity.py, tests/test_family_default.py]
+related: ["[[supabase-backend]]", "[[rls-remote-schema]]", "[[storage-backend]]", "[[capture-pipeline]]", "[[pricing-updates]]"]
 created: 2026-09-22
-updated: 2026-09-22
+updated: 2026-09-23
 ---
 
 # Remote Read Parity
@@ -40,7 +40,12 @@ functions, hand-written and reviewed:
   expression of `report.py`'s `rate_subquery()`. `report.py` runs one correlated
   subquery per rate column, all with identical `WHERE`/`ORDER`/`LIMIT`, so they
   resolve to the same pricing row; the view's `LEFT JOIN LATERAL ... LIMIT 1`
-  reads that one row's columns once — equivalent given a unique best match.
+  reads that one row's columns once — equivalent given a unique best match. The
+  view also carries `estimated`: true when the resolved row is a family
+  default or an ancestor row (see [[pricing-updates]] and
+  `docs/TELEMETRY-CONTRACT.md` §"Own price vs estimate"), false for the
+  model's own row, NULL when unpriced — the Postgres twin of
+  `capture.is_estimated` / `capture.estimated_sql`.
 - `report_project_stats()` → the `/project-stats` array; `report_token_stats()` →
   the `/token-stats` object (today/week windows, by project/agent/model/kind/tier
   /issue); `report_info(p_project_path)` → the DB-derived `/info` block.
@@ -101,6 +106,33 @@ client. The dual-dialect equivalence runs only where a Postgres is present. The
 anon reads nothing) is **not** provable in this stdlib suite — it is the
 maintainer's live two-user check (`rls-remote-schema.md`).
 
+## The estimated flag's three-way parity (`tests/test_family_default.py`)
+
+The "own price vs estimate" definitions (family default row, ancestor row,
+estimated event — see [[pricing-updates]]) are implemented three times, once
+per dialect that has to agree on every input: the Python predicates
+(`capture.is_family_default`, `capture.is_ancestor_row`,
+`capture.is_estimated`), their SQLite boolean-expression twins
+(`capture.family_default_sql`, `capture.ancestor_row_sql`,
+`capture.estimated_sql`, used by both `report.py` and `dashboard.py`), and the
+Postgres expression inlined in `report_priced_events.estimated` above.
+`tests/test_family_default.py` is a second, narrower golden test than
+`test_report_parity.py`'s: it checks the family-default and ancestor-row
+predicates in isolation, across a curated positive/negative case list plus a
+randomized sweep of structurally tricky inputs (digits, dashes, case, `LIKE`
+wildcards, non-ASCII), asserting the Python result, the SQLite expression
+(run against a real `sqlite3` connection) and the Postgres expression (parsed
+out of `reports.sql` and run against a real Postgres) all agree. It shares
+`test_report_parity.py`'s Postgres-gated pattern — skips cleanly when
+`psql`/`createdb`/`dropdb` aren't on `PATH`, and needs the same libpq
+connection env (`PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE`) when a
+server is reachable. CI provides one via a throwaway `postgres:16-alpine`
+service container on port 5433 (`.github/workflows/checks.yml`) so both this
+test and `TestPostgresEquivalence` actually run instead of skipping; a
+maintainer running locally needs the same client tools and a reachable
+Postgres, `TZ=UTC` for date alignment with the SQLite reference, and gets a
+clean skip with none of that in place.
+
 ## Running the equivalence against your own Supabase (maintainer)
 
 1. Apply `supabase/schema.sql` then `supabase/reports.sql` in the Supabase SQL
@@ -129,3 +161,11 @@ maintainer's live two-user check (`rls-remote-schema.md`).
 - **`/info` schema line.** The remote has no `PRAGMA user_version`; the client
   stamps the modeled remote shape (v7) and the golden test excludes `schema` from
   the equality — it is a store property, not an aggregation.
+- **Estimated counts are event-grain only on the remote, so far.** `report_priced_events.estimated`
+  exists in the view, but `report_project_stats()`/`report_token_stats()` do
+  not yet aggregate it — `_map_project_stats`'s `estimated_events` and
+  `_map_token_stats`'s `estimated_by_model`/`models_without_own_price` stay
+  `None` on the remote path today (they keep the local shape's keys, just
+  unpopulated). A future story that adds the aggregation to `reports.sql`
+  needs to update those two mapping functions in the same change, or the
+  remote reports will keep reporting "unknown" where local reports don't.
