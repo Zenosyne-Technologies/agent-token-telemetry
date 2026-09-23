@@ -176,7 +176,7 @@ class TestReportScript(unittest.TestCase):
         self.assertIn("No issue-tagged", out)
 
     def test_by_model_tie_breaks_on_model_name(self):
-        # AOS-134 F5: when two models tie on SUM(out_tok) (the sort key),
+        # When two models tie on SUM(out_tok) (the sort key),
         # the order must be deterministic — byte order on the model name —
         # so the local and remote (Postgres) dialects agree on ties.
         conn = capture.connect(self.db)
@@ -193,7 +193,7 @@ class TestReportScript(unittest.TestCase):
         self.assertLess(out.index("claude-opus-1"), out.index("claude-opus-2"))
 
     def test_by_tier_tie_breaks_on_tier_name(self):
-        # AOS-134 F5: same rule for by_tier — a tie on SUM(out_tok) between
+        # Same rule for by_tier — a tie on SUM(out_tok) between
         # two different tiers breaks on the tier label's byte order.
         conn = capture.connect(self.db)
         now = int(time.time())
@@ -447,6 +447,26 @@ class TestScopedRollup(unittest.TestCase):
         self.assertIn("100,000 input / 50,000 output", out)
         self.assertNotIn("of 1 issues have rows", out)   # full coverage
 
+    def test_scoped_output_is_the_rollup_alone_without_price_footer(self):
+        # commands/token-stats.md: with --scope the output is the Scoped
+        # rollup ALONE — it replaces the normal report, so the own-price
+        # footer (which closes the normal report) does not appear, and the
+        # rollup's cost line is the last line.
+        self.seed_event(issue_key="AOS-79")
+        _, full = run(["token-stats", "--db", str(self.db),
+                       "--cwd", str(self.dir)])
+        # non-vacuous: the same DB DOES produce a footer without --scope
+        self.assertTrue(full.rstrip("\n").splitlines()[-1].startswith(
+            "No own published price for `claude-sonnet-5`"))
+        _, out = run(["token-stats", "--scope", "AOS-79", "--db", str(self.db),
+                      "--cwd", str(self.dir)])
+        self.assertNotIn("No own published price", out)
+        lines = out.rstrip("\n").splitlines()
+        self.assertEqual(lines[1], "**Scoped rollup**")
+        self.assertTrue(lines[-1].startswith("**"), lines[-1])
+        self.assertIn(" events, 100,000 input / 50,000 output tokens",
+                      lines[-1])
+
     def test_scoped_rollup_falls_back_to_commit_sha(self):
         self.init_git_repo()
         sha = self.commit("AOS-79: fix the thing")
@@ -567,7 +587,7 @@ def model_cell(md, model="claude-opus-5-5"):
 
 
 class TestEstimateFlags(unittest.TestCase):
-    """AOS-134: reports flag cost figures priced at a family default or an
+    """Reports flag cost figures priced at a family default or an
     ancestor row (ESTIMATED), distinct from unpriced events, and footer the
     models without an own price."""
 
@@ -627,7 +647,7 @@ class TestEstimateFlags(unittest.TestCase):
                          " estimated rate")
 
     def test_token_stats_unpriced_only_says_nothing_without_an_estimate(self):
-        # AOS-134 F1: the "U of M events unpriced" note in token-stats
+        # The "U of M events unpriced" note in token-stats
         # (headline and per-model cell) stays silent when NOTHING in the
         # same figure is also estimated (N == 0) — unpriced-only carries no
         # note here, unlike project-stats, which is unconditional and unaffected.
@@ -657,7 +677,7 @@ class TestEstimateFlags(unittest.TestCase):
 
     # ---- fetch_models_without_own_price
     def test_models_without_own_price_requires_an_event(self):
-        # AOS-134 F3: a model row with NO events at all must not appear —
+        # A model row with NO events at all must not appear —
         # models_without_own_price names models with at least one event that
         # resolves to an estimate or nothing, not every unpriced name.
         tmp = tempfile.TemporaryDirectory()
@@ -683,7 +703,7 @@ class TestEstimateFlags(unittest.TestCase):
         self.assertNotIn("claude-ghost-1", without)
 
     def test_models_without_own_price_excludes_all_zero_token_models(self):
-        # AOS-134 F2: a model whose every event is zero-token (e.g. a
+        # A model whose every event is zero-token (e.g. a
         # synthetic bookkeeping entry) has nothing to price and is excluded
         # from the footer, even though it has events and no own price.
         tmp = tempfile.TemporaryDirectory()
@@ -702,6 +722,40 @@ class TestEstimateFlags(unittest.TestCase):
         without = report.fetch_models_without_own_price(conn)
         conn.close()
         self.assertNotIn("<synthetic>", without)
+
+    def test_models_without_own_price_counts_any_single_token_column(self):
+        # "zero-token" means EVERY token column is zero: a model whose only
+        # non-zero column is input, output, cache read or cache write still
+        # has something to price and stays in the list (each column alone).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = pathlib.Path(tmp.name) / "usage.db"
+        conn = capture.connect(db)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time()))
+        groups = capture.aggregate([
+            entry(model="only-input", inp=7, out=0, cr=0, cw=0, mid="m1",
+                  ts=ts),
+            entry(model="only-output", inp=0, out=7, cr=0, cw=0, mid="m2",
+                  ts=ts),
+            entry(model="only-cache-read", inp=0, out=0, cr=7, cw=0,
+                  mid="m3", ts=ts),
+            entry(model="only-cache-write", inp=0, out=0, cr=0, cw=7,
+                  mid="m4", ts=ts),
+            entry(model="<synthetic>", inp=0, out=0, cr=0, cw=0, mid="m5",
+                  ts=ts)])
+        with conn:
+            capture.insert_events(conn, "/proj", "s1", 0, None, groups)
+        # guard the fixture itself: each model's single column really landed
+        self.assertEqual(sorted(conn.execute(
+            "SELECT m.name, e.in_tok, e.out_tok, e.cache_r, e.cache_w"
+            " FROM events e JOIN models m ON m.id = e.model_id").fetchall()), [
+            ("<synthetic>", 0, 0, 0, 0), ("only-cache-read", 0, 0, 7, 0),
+            ("only-cache-write", 0, 0, 0, 7), ("only-input", 7, 0, 0, 0),
+            ("only-output", 0, 7, 0, 0)])
+        without = report.fetch_models_without_own_price(conn)
+        conn.close()
+        self.assertEqual(without, ["only-cache-read", "only-cache-write",
+                                   "only-input", "only-output"])
 
     # ---- footer
     def test_footer_absent_when_every_model_has_own_price(self):
@@ -765,7 +819,7 @@ class TestEstimateFlags(unittest.TestCase):
             "unpriced": unpriced, "estimated": estimated})
 
     def test_scoped_rollup_unpriced_only_says_nothing_without_an_estimate(self):
-        # AOS-134 F1: same gate as token-stats — the scoped rollup's unpriced
+        # Same gate as token-stats — the scoped rollup's unpriced
         # note stays silent unless the set also carries an estimated marker.
         md = self.scoped(unpriced=1, estimated=0)
         self.assertIn("**$3** — 10 events, 1,000 input / 500 output tokens.",

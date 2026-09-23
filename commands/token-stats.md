@@ -24,10 +24,11 @@ rate` — or `the whole figure is an estimate` when every event is — for event
 priced at a family default or an ancestor row (the contract's "Own price vs
 estimate"). `N of M events unpriced` (no pricing row resolved) appears only
 alongside that estimated marker on the same figure; it says nothing extra when
-the figure has no estimated events at all. A closing `No own published price
-for …` line names the models with at least one non-zero-token event and no own
-pricing row, and points to `/token-telemetry:pricing-update`; it is absent
-when every such model has one (a model whose events are all zero-token, e.g. a
-synthetic bookkeeping model, is never named — there is nothing of theirs to
-price). With `--scope KEY1,KEY2`, the Scoped rollup's cost line carries the
-same qualifiers.
+the figure has no estimated events at all. The report's last line, `No own
+published price for …`, names the models with at least one non-zero-token
+event and no own pricing row, and points to `/token-telemetry:pricing-update`;
+it is absent when every such model has one (a model whose events are all
+zero-token, e.g. a synthetic bookkeeping model, is never named — there is
+nothing of theirs to price). With `--scope KEY1,KEY2` the output is the Scoped rollup alone — it
+replaces the normal report, so there is no `No own published price` line —
+and its cost line carries the same qualifiers.

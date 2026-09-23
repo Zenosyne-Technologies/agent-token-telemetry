@@ -190,6 +190,82 @@ def build_sqlite_corpus(path):
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
 
+# ---------------------------------------------------------------------------
+# Tie fixtures for the by_model / by_tier tie-break. One model family per tier;
+# each family gets a '-8' model at TIE_MODEL_OUT (so the five '-8' models tie
+# on SUM(out_tok): a five-way by_model tie) and a '-9' model that tops its tier
+# up to TIE_TIER_TOTAL (so all five tiers tie: a five-way by_tier tie). A test
+# that inserts the tie rows in a single order can pass by accident when the
+# engine's unsorted output happens to match the expected order; every order in
+# TIE_PERMUTATIONS differs from the expected one, and each runs on a fresh DB,
+# so no single insertion order can satisfy all of them. (On Postgres the tests
+# also run each order on a database whose collation reverses b..z, so an order
+# inherited from a sort-based GROUP BY cannot pass either.)
+# ---------------------------------------------------------------------------
+TIE_TIERS = {"claude-fable-": "orchestrator", "claude-haiku-": "micro",
+             "claude-opus-": "heavy", "claude-sonnet-": "small",
+             "gpt-": "unknown"}
+TIE_MODEL_OUT = 40000
+TIE_TIER_TOTAL = 400000
+# byte order (SQLite BINARY == Postgres COLLATE "C" for these ASCII names)
+EXPECTED_TIED_MODELS = sorted(f + "8" for f in TIE_TIERS)
+EXPECTED_TIED_TIERS = sorted(TIE_TIERS.values())
+TIE_PERMUTATIONS = (
+    # reverse byte order of the model names (tiers: unknown, small, heavy, ...)
+    ("gpt-", "claude-sonnet-", "claude-opus-", "claude-haiku-", "claude-fable-"),
+    # reverse byte order of the tier labels (unknown, small, orchestrator, ...)
+    ("gpt-", "claude-sonnet-", "claude-fable-", "claude-haiku-", "claude-opus-"),
+    # an interleaving that is neither sorted nor reversed on either key
+    ("claude-haiku-", "gpt-", "claude-opus-", "claude-fable-", "claude-sonnet-"),
+)
+
+
+def tie_rows(order, base_tier_out):
+    """The (model_name, out_tok) tie rows in insertion ``order`` (families);
+    within a family the '-9' row goes first (reverse name order too).
+    ``base_tier_out`` maps tier -> the corpus's own windowed SUM(out_tok)."""
+    rows = []
+    for fam in order:
+        top_up = (TIE_TIER_TOTAL - base_tier_out.get(TIE_TIERS[fam], 0)
+                  - TIE_MODEL_OUT)
+        assert top_up > 0 and top_up != TIE_MODEL_OUT, "corpus drifted"
+        rows += [(fam + "9", top_up), (fam + "8", TIE_MODEL_OUT)]
+    return rows
+
+
+def tie_orders(d):
+    """(tied model names, tied tier labels) in the order a report returned
+    them — the rows sitting exactly on the two tie totals."""
+    return ([r[0] for r in d["by_model"] if r[3] == TIE_MODEL_OUT],
+            [r[0] for r in d["by_tier"] if r[2] == TIE_TIER_TOTAL])
+
+
+def sqlite_tie_orders(path, order):
+    """Fresh corpus DB at ``path`` + the tie rows in ``order``; returns the
+    local dialect's :func:`tie_orders`."""
+    build_sqlite_corpus(path).close()
+    conn = sqlite3.connect(path)
+    try:
+        base = {r[0]: r[2] for r in report.fetch_token_stats(conn)["by_tier"]}
+        with conn:
+            pid = conn.execute("SELECT id FROM projects WHERE path = ?",
+                               ("/home/user/alpha",)).fetchone()[0]
+            sid = conn.execute(
+                "INSERT INTO sessions(uuid, project_id, owner_id) VALUES"
+                " (?,?,?)", ("s-tie", pid, OWNER)).lastrowid
+            for name, otok in tie_rows(order, base):
+                mid = conn.execute("INSERT INTO models(name) VALUES (?)",
+                                   (name,)).lastrowid
+                conn.execute(
+                    "INSERT INTO events(ts, session_id, kind, agent, model_id,"
+                    " in_tok, out_tok, cache_r, cache_w, cache_w_1h)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (NOW, sid, 0, None, mid, 10, otok, 0, 0, 0))
+        return tie_orders(report.fetch_token_stats(conn))
+    finally:
+        conn.close()
+
+
 def _sql_lit(v):
     """A safe SQL literal for the corpus loader (test-only, fixed corpus)."""
     if v is None:
@@ -312,6 +388,16 @@ class TestSqliteReference(unittest.TestCase):
     def test_estimated_per_event_reference(self):
         self.assertEqual(sqlite_estimated_by_event(self.conn),
                          EXPECTED_ESTIMATED)
+
+    def test_by_model_and_by_tier_tie_break_on_name_local(self):
+        # A tie on SUM(out_tok) orders by byte order on the model / tier name,
+        # whatever order the tied rows were inserted in (see TIE_PERMUTATIONS).
+        for i, order in enumerate(TIE_PERMUTATIONS):
+            with self.subTest(permutation=i):
+                models, tiers = sqlite_tie_orders(
+                    pathlib.Path(self.tmp.name) / f"tie{i}.db", order)
+                self.assertEqual(models, EXPECTED_TIED_MODELS)
+                self.assertEqual(tiers, EXPECTED_TIED_TIERS)
 
     def test_estimated_counts_reference(self):
         rows = {r["path"]: r for r in report.fetch_project_stats(self.conn)}
@@ -637,6 +723,12 @@ SET TIME ZONE 'UTC';
 """
 
 
+# ICU tailoring that sorts the letters b..z in reverse ('a' stays first), used
+# by the tie-break tests to build a database whose default collation disagrees
+# with byte order on every tie fixture name and tier label.
+REVERSED_ICU_RULES = "&a < " + " < ".join("zyxwvutsrqponmlkjihgfedcb")
+
+
 @unittest.skipUnless(PG_TOOLS, PG_REASON)
 class TestPostgresEquivalence(unittest.TestCase):
     """Apply schema.sql + reports.sql to a throwaway Postgres, load the SAME
@@ -683,9 +775,9 @@ class TestPostgresEquivalence(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def _rpc(self, sql):
+    def _rpc(self, sql, db=None):
         r = subprocess.run(
-            ["psql", "-X", "-A", "-t", "-d", self.dbname, "-c", sql],
+            ["psql", "-X", "-A", "-t", "-d", db or self.dbname, "-c", sql],
             capture_output=True, text=True, env=os.environ.copy(), timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip())
@@ -722,89 +814,86 @@ class TestPostgresEquivalence(unittest.TestCase):
         self.assertIn("No own published price for", md)
         self.assertIn("4 of 8 events at an estimated rate", md)
 
-    def test_by_model_and_by_tier_tie_break_on_name(self):
-        # AOS-134 F5: a tie on SUM(out_tok) must order identically in both
-        # dialects — byte order (COLLATE "C" here) on the model/tier name.
-        # The class DB is shared across this class's tests (no per-test
-        # transaction), so the inserted rows are torn down via addCleanup —
-        # otherwise they'd leak into the OTHER tests' exact-count assertions.
-        self.addCleanup(lambda: self._run_sql_file(
-            self.dbname,
-            "DELETE FROM public.events WHERE session_uuid = 's-tie';"
-            " DELETE FROM public.sessions WHERE uuid = 's-tie';"
-            " DELETE FROM public.models WHERE name IN"
-            " ('claude-opus-9', 'claude-opus-8', 'claude-haiku-9');"))
-        # Baseline 'heavy'/'micro' by_tier totals from the base corpus, read
-        # BEFORE the insert below, so the third (micro-tier) row's out_tok can
-        # be sized to land EXACTLY on the new 'heavy' total — a genuine tie
-        # between two DIFFERENT tiers (by_tier's own ORDER BY), not just two
-        # models tied within the same one (by_model's).
-        base = supabase_backend._map_token_stats(
-            self._rpc("SELECT public.report_token_stats();"))
-        base_out = {t: o for t, i, o, n in base["by_tier"]}
-        heavy_total = base_out.get("heavy", 0) + 20  # the two opus rows below
-        micro_out = heavy_total - base_out.get("micro", 0)
-        self.assertGreater(micro_out, 0, "corpus drifted; recompute the tie")
-        self._run_sql_file(self.dbname, "\n".join([
-            f"INSERT INTO public.models(owner_id, name) VALUES"
-            f" ('{OWNER}', 'claude-opus-9'), ('{OWNER}', 'claude-opus-8'),"
-            f" ('{OWNER}', 'claude-haiku-9');",
-            "INSERT INTO public.sessions(owner_id, uuid, project_path)"
-            f" VALUES ('{OWNER}', 's-tie', '/home/user/alpha');",
-            "INSERT INTO public.events(owner_id, session_uuid, model_name, ts,"
-            " kind, agent, in_tok, out_tok, cache_r, cache_w, cache_w_1h,"
-            " issue_key, note) VALUES"
-            f" ('{OWNER}', 's-tie', 'claude-opus-9', {NOW}, 0, NULL, 10, 10,"
-            " 0, 0, 0, NULL, NULL),"
-            f" ('{OWNER}', 's-tie', 'claude-opus-8', {NOW}, 0, NULL, 10, 10,"
-            " 0, 0, 0, NULL, NULL),"
-            f" ('{OWNER}', 's-tie', 'claude-haiku-9', {NOW}, 0, NULL, 10,"
-            f" {micro_out}, 0, 0, 0, NULL, NULL);",
-        ]))
-        ts = supabase_backend._map_token_stats(
-            self._rpc("SELECT public.report_token_stats();"))
-        names = [r[0] for r in ts["by_model"] if r[0].startswith("claude-opus-")
-                 and r[0] not in ("claude-opus-4-8", "claude-opus-5-5")]
-        self.assertEqual(names, ["claude-opus-8", "claude-opus-9"])
-        remote_tiers = [t for t, i, o, n in ts["by_tier"] if o == heavy_total]
-        self.assertEqual(remote_tiers, ["heavy", "micro"])
+    def _fresh_corpus_db(self, tag, reversed_collation=False):
+        """A throwaway DB holding schema + reports + the corpus, dropped at
+        test end — for tests whose inserts must start from a clean slate.
 
-        # Local (SQLite) dialect: the SAME base corpus plus the SAME tie
-        # insert must produce the SAME tier order — the parity this file
-        # exists to pin, not just each dialect's own internal ordering.
-        tmp = pathlib.Path(tempfile.mkdtemp())
-        db_path = tmp / "usage.db"
-        build_sqlite_corpus(db_path)   # writes + closes; reopened rw below
-        conn = sqlite3.connect(db_path)
-        with conn:
-            mid = {}
-            for name in ("claude-opus-9", "claude-opus-8", "claude-haiku-9"):
-                mid[name] = conn.execute(
-                    "INSERT INTO models(name) VALUES (?)", (name,)).lastrowid
-            proj_id = conn.execute(
-                "SELECT id FROM projects WHERE path = ?",
-                ("/home/user/alpha",)).fetchone()[0]
-            sess_id = conn.execute(
-                "INSERT INTO sessions(uuid, project_id, owner_id) VALUES"
-                " (?,?,?)", ("s-tie", proj_id, OWNER)).lastrowid
-            for name, otok in (("claude-opus-9", 10), ("claude-opus-8", 10),
-                               ("claude-haiku-9", micro_out)):
-                conn.execute(
-                    "INSERT INTO events(ts, session_id, kind, agent, model_id,"
-                    " in_tok, out_tok, cache_r, cache_w, cache_w_1h)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (NOW, sess_id, 0, None, mid[name], 10, otok, 0, 0, 0))
-        local = report.fetch_token_stats(conn)
-        local_names = [r[0] for r in local["by_model"]
-                       if r[0].startswith("claude-opus-")
-                       and r[0] not in ("claude-opus-4-8", "claude-opus-5-5")]
-        self.assertEqual(local_names, ["claude-opus-8", "claude-opus-9"])
-        local_tiers = [r[0] for r in local["by_tier"] if r[2] == heavy_total]
-        self.assertEqual(local_tiers, ["heavy", "micro"])
-        conn.close()
+        ``reversed_collation`` creates it with an ICU default collation that
+        sorts b..z in REVERSE, so any ordering that leans on the database
+        collation (or on a sort-based GROUP BY's output order) instead of an
+        explicit ``COLLATE "C"`` comes out backwards. Needs a server with ICU
+        and ``ICU_RULES`` (Postgres 16+); that case is skipped otherwise."""
+        db = f"{self.dbname}_{tag}"
+        env = os.environ.copy()
+        subprocess.run(["dropdb", "--if-exists", db], capture_output=True,
+                       env=env, timeout=30)
+        if reversed_collation:
+            r = subprocess.run(
+                ["psql", "-X", "-q", "-d", "postgres", "-c",
+                 f"CREATE DATABASE {db} TEMPLATE template0"
+                 " LOCALE_PROVIDER icu ICU_LOCALE 'und' ICU_RULES"
+                 f" '{REVERSED_ICU_RULES}';"],
+                capture_output=True, text=True, env=env, timeout=30)
+            if r.returncode != 0:
+                self.skipTest("server lacks ICU collation rules: "
+                              + r.stderr.strip())
+        else:
+            subprocess.run(["createdb", db], check=True, capture_output=True,
+                           env=env, timeout=30)
+        self.addCleanup(subprocess.run, ["dropdb", "--if-exists", db],
+                        capture_output=True, env=env, timeout=30)
+        self._run_sql_file(db, "\n".join(
+            [PG_SHIM, SCHEMA_SQL, REPORTS_SQL, pg_corpus_sql()]))
+        return db
+
+    def test_by_model_and_by_tier_tie_break_on_name(self):
+        # A tie on SUM(out_tok) must order identically in both dialects —
+        # byte order (COLLATE "C" here) on the model / tier name — whatever
+        # order the tied rows were inserted in and whatever the database's
+        # default collation. Each case gets a FRESH database, so an engine
+        # order that merely happens to match one insertion order cannot pass
+        # them all (see TIE_PERMUTATIONS). The tier labels are fixed and a
+        # sort-based GROUP BY hands them to the final sort already in
+        # collation order, which a plain database shares with byte order —
+        # so the reversed-collation databases are what make a missing
+        # tie-break (or a missing COLLATE "C") observable for by_tier.
+        cases = [(i, order, rev) for rev in (False, True)
+                 for i, order in enumerate(TIE_PERMUTATIONS)]
+        for i, order, rev in cases:
+            with self.subTest(permutation=i, reversed_collation=rev):
+                db = self._fresh_corpus_db(f"tie{i}{'r' if rev else ''}",
+                                           reversed_collation=rev)
+                base = {t: o for t, _, o, _ in supabase_backend._map_token_stats(
+                    self._rpc("SELECT public.report_token_stats();", db)
+                )["by_tier"]}
+                rows = tie_rows(order, base)
+                sql = [f"INSERT INTO public.sessions(owner_id, uuid,"
+                       f" project_path) VALUES ('{OWNER}', 's-tie',"
+                       " '/home/user/alpha');"]
+                for name, otok in rows:
+                    sql.append(f"INSERT INTO public.models(owner_id, name)"
+                               f" VALUES ('{OWNER}', {_sql_lit(name)});")
+                for name, otok in rows:
+                    sql.append(
+                        "INSERT INTO public.events(owner_id, session_uuid,"
+                        " model_name, ts, kind, agent, in_tok, out_tok,"
+                        " cache_r, cache_w, cache_w_1h, issue_key, note)"
+                        f" VALUES ('{OWNER}', 's-tie', {_sql_lit(name)},"
+                        f" {NOW}, 0, NULL, 10, {otok}, 0, 0, 0, NULL, NULL);")
+                self._run_sql_file(db, "\n".join(sql))
+                models, tiers = tie_orders(supabase_backend._map_token_stats(
+                    self._rpc("SELECT public.report_token_stats();", db)))
+                self.assertEqual(models, EXPECTED_TIED_MODELS)
+                self.assertEqual(tiers, EXPECTED_TIED_TIERS)
+                # parity: the local dialect, same corpus + same insertion order
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                self.assertEqual(
+                    sqlite_tie_orders(pathlib.Path(tmp.name) / "usage.db",
+                                      order), (models, tiers))
 
     def test_models_without_own_price_excludes_all_zero_token_models_remote(self):
-        # AOS-134 F2: a model whose every event is zero-token (e.g. a
+        # A model whose every event is zero-token (e.g. a
         # synthetic bookkeeping entry) has nothing to price and is excluded
         # from models_without_own_price on the REMOTE (Postgres) dialect too
         # — matching the local (SQLite) rule pinned by tests/test_report.py's
@@ -829,8 +918,40 @@ class TestPostgresEquivalence(unittest.TestCase):
             self._rpc("SELECT public.report_token_stats();"))
         self.assertNotIn("<synthetic>", ts["models_without_own_price"])
 
+    def test_models_without_own_price_counts_any_single_token_column_remote(self):
+        # "zero-token" means EVERY token column is zero: a model whose only
+        # non-zero column is input, output, cache read or cache write stays
+        # in models_without_own_price — the same rule, pinned locally by
+        # tests/test_report.py's
+        # test_models_without_own_price_counts_any_single_token_column.
+        cols = {"only-input": (7, 0, 0, 0), "only-output": (0, 7, 0, 0),
+                "only-cache-read": (0, 0, 7, 0),
+                "only-cache-write": (0, 0, 0, 7)}
+        self.addCleanup(lambda: self._run_sql_file(
+            self.dbname,
+            "DELETE FROM public.events WHERE session_uuid = 's-col';"
+            " DELETE FROM public.sessions WHERE uuid = 's-col';"
+            " DELETE FROM public.models WHERE name LIKE 'only-%';"))
+        sql = ["INSERT INTO public.sessions(owner_id, uuid, project_path)"
+               f" VALUES ('{OWNER}', 's-col', '/home/user/alpha');"]
+        for name, (i, o, cr, cw) in cols.items():
+            sql += [
+                f"INSERT INTO public.models(owner_id, name) VALUES"
+                f" ('{OWNER}', {_sql_lit(name)});",
+                "INSERT INTO public.events(owner_id, session_uuid, model_name,"
+                " ts, kind, agent, in_tok, out_tok, cache_r, cache_w,"
+                " cache_w_1h, issue_key, note) VALUES"
+                f" ('{OWNER}', 's-col', {_sql_lit(name)}, {NOW}, 0, NULL,"
+                f" {i}, {o}, {cr}, {cw}, 0, NULL, NULL);"]
+        self._run_sql_file(self.dbname, "\n".join(sql))
+        ts = supabase_backend._map_token_stats(
+            self._rpc("SELECT public.report_token_stats();"))
+        self.assertEqual(
+            [m for m in ts["models_without_own_price"] if m.startswith("only-")],
+            sorted(cols))
+
     def test_models_without_own_price_requires_an_event(self):
-        # AOS-134 F3: a model row with NO events at all (a pricing-less name
+        # A model row with NO events at all (a pricing-less name
         # that simply has never been used) must not appear in
         # models_without_own_price — that list names models with at least
         # one event that resolves to an estimate or nothing, not every
@@ -1004,7 +1125,7 @@ class TestPostgresEstimateRls(unittest.TestCase):
             self.assertFalse(ts[k], k)
 
     def test_direct_view_queries_stay_owner_scoped(self):
-        # AOS-134 F4: the report_* FUNCTIONS re-filter every join by
+        # The report_* FUNCTIONS re-filter every join by
         # `owner_id = caller` at the app level, so a view that lost its own
         # `security_invoker = true` (evaluates as the view's OWNER, bypassing
         # RLS on the tables it reads — a "definer view") would NOT show up as
