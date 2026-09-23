@@ -416,10 +416,13 @@ class TestPerRowRefusal(Base):
 class TestValueBounds(Base):
     """Fix 2: money() is permissive about magnitude on purpose — a
     non-finite or absurd rate refuses the WHOLE run, atomically, before any
-    write. AOS-143 correction: a number immediately followed by an exponent
-    marker (scientific notation) is malformed, never truncated to its
-    mantissa, and an in_usd/out_usd of 0 or below is refused too (cache
-    rates keep no lower bound)."""
+    write, with EXIT_BOUNDS_REFUSED (never the fetch-failure or other-error
+    code — AOS-143 correction, F1). AOS-143 correction, F2: a malformed
+    numeric token — a thousands separator, more than one decimal point, or
+    any exponent marker (complete or dangling after a bare `.`) — is never
+    truncated to its leading digits; it refuses the whole run instead. An
+    in_usd/out_usd under MIN_INOUT_RATE_USD is refused too (cache rates keep
+    no lower bound)."""
 
     def _page(self, in_cell, out_cell="$10 / MTok"):
         return _table_html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
@@ -429,8 +432,8 @@ class TestValueBounds(Base):
         before = self.f.digest()
         path = self.f.write_html(self._page("$" + "9" * 400 + " / MTok"))
         code, out, err = self.f.cli("--html", str(path))
-        self.assertEqual(code, 2)
-        self.assertIn("pricing page fetch/parse failed", err)
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertIn("REFUSED", out)
         self.assertEqual(self.f.digest(), before)
         self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
 
@@ -438,7 +441,7 @@ class TestValueBounds(Base):
         before = self.f.digest()
         path = self.f.write_html(self._page("$15000 / MTok"))
         code, out, err = self.f.cli("--html", str(path))
-        self.assertEqual(code, 2)
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
         self.assertEqual(self.f.digest(), before)
         self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
 
@@ -450,7 +453,7 @@ class TestValueBounds(Base):
         self.assertEqual(self.f.pricing_rows("claude-sonnet-5")[0][1], 10000.0)
 
     def test_parse_models_raises_directly_for_non_finite(self):
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(pricing_update.PricingRefused) as ctx:
             pricing_update.parse_models(self._page("$" + "9" * 400))
         self.assertIn("out of bounds", str(ctx.exception))
 
@@ -460,8 +463,8 @@ class TestValueBounds(Base):
         before = self.f.digest()
         path = self.f.write_html(self._page("$1e309 / MTok"))
         code, out, err = self.f.cli("--html", str(path))
-        self.assertEqual(code, 2)
-        self.assertIn("pricing page fetch/parse failed", err)
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertIn("REFUSED", out)
         self.assertEqual(self.f.digest(), before)
         self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
 
@@ -469,22 +472,60 @@ class TestValueBounds(Base):
         before = self.f.digest()
         path = self.f.write_html(self._page("$1E+5 / MTok"))
         code, out, err = self.f.cli("--html", str(path))
-        self.assertEqual(code, 2)
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
         self.assertEqual(self.f.digest(), before)
         self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
 
-    def test_money_returns_none_for_exponent_suffixed_number(self):
-        self.assertIsNone(pricing_update.money("$1e309"))
-        self.assertIsNone(pricing_update.money("$1E+5 / MTok"))
-        self.assertIsNone(pricing_update.money("$5e-2"))
-        # a plain number is unaffected
-        self.assertEqual(pricing_update.money("$2.50 / MTok"), 2.5)
+    def test_thousands_separator_refuses_whole_run(self):
+        # AOS-143 correction, F2: "$1,500" used to mint "$1" (truncated at
+        # the comma) — the comma makes the whole token malformed instead.
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$1,500 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertIn("REFUSED", out)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_two_decimal_points_refuses_whole_run(self):
+        # AOS-143 correction, F2: "$4.00.00" used to mint "$4".
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$4.00.00 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertIn("REFUSED", out)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_dangling_exponent_refuses_whole_run(self):
+        # AOS-143 correction, F2: "$1.e3" used to mint "$1" — a bare "."
+        # with no digits after it, immediately followed by an exponent
+        # marker, is just as malformed as a complete exponent form.
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$1.e3 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertIn("REFUSED", out)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_money_rejects_malformed_numbers_accepts_legit_ones(self):
+        for bad in ("$1e309", "$1E+5 / MTok", "$5e-2", "$1,500", "$4.00.00",
+                    "$1.e3"):
+            with self.subTest(cell=bad):
+                with self.assertRaises(pricing_update.PricingRefused):
+                    pricing_update.money(bad)
+        for text, expect in (("$2.50 / MTok", 2.5), ("$3", 3.0),
+                             ("$3.75", 3.75), ("$0.30", 0.30),
+                             ("$0.08", 0.08)):
+            with self.subTest(cell=text):
+                self.assertEqual(pricing_update.money(text), expect)
 
     def test_zero_in_usd_refuses_whole_run(self):
         before = self.f.digest()
         path = self.f.write_html(self._page("$0 / MTok"))
         code, out, err = self.f.cli("--html", str(path))
-        self.assertEqual(code, 2)
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
         self.assertEqual(self.f.digest(), before)
         self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
 
@@ -492,9 +533,27 @@ class TestValueBounds(Base):
         before = self.f.digest()
         path = self.f.write_html(self._page("$2 / MTok", out_cell="$0 / MTok"))
         code, out, err = self.f.cli("--html", str(path))
-        self.assertEqual(code, 2)
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
         self.assertEqual(self.f.digest(), before)
         self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_below_floor_in_usd_refuses_whole_run(self):
+        # AOS-143 correction, F4: below MIN_INOUT_RATE_USD is refused even
+        # though it is not zero or negative — the old bound was "<= 0" only.
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$0.0000001 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertIn("REFUSED", out)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_at_floor_in_usd_is_accepted(self):
+        # Boundary: the floor is "< 0.01", not "<= 0.01".
+        path = self.f.write_html(self._page("$0.01 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5")[0][1], 0.01)
 
     def test_zero_cache_rate_is_unaffected(self):
         # Cache rates keep no lower bound: a legitimate $0 cache-read/write
@@ -529,6 +588,53 @@ class TestRowCap(Base):
         self.assertIn("row(s) inserted", report)
 
 
+class TestWarningCap(Base):
+    """AOS-143 correction, F3 sev4-low: BACKDATED-STARTING (and the other
+    per-row STALE-PRICE / FUTURE-RATE) warnings are not candidate rows, so
+    the MAX_CANDIDATES cap does not bound them — a page with many refused
+    `starting` rows could otherwise print thousands of warning lines into
+    the report the command echoes verbatim into the agent's context. Each
+    category is capped at WARNING_CAP lines plus one "... and N more"
+    summary line."""
+
+    def test_backdated_starting_warnings_capped_with_summary_line(self):
+        today = datetime.date(2026, 9, 23)
+        old = today - datetime.timedelta(days=400)
+        n = pricing_update.WARNING_CAP + 5
+        entries = [_entry("sonnet", str(1000 + i), ("starting", old))
+                  for i in range(n)]
+        before = self.f.pricing_rows()
+        report = pricing_update.run_update(self.f.conn, entries, today, "t")
+        warn_lines = [ln for ln in report.splitlines()
+                     if ln.startswith("BACKDATED-STARTING WARNING")]
+        self.assertEqual(len(warn_lines), pricing_update.WARNING_CAP)
+        self.assertIn(f"… and {n - pricing_update.WARNING_CAP} more"
+                     " BACKDATED-STARTING warning(s)", report)
+        # nothing was minted for any of the refused rows, capped or not
+        self.assertEqual(self.f.pricing_rows(), before)
+
+    def test_stale_price_warnings_capped_with_summary_line(self):
+        today = datetime.date(2026, 9, 23)
+        ended = today - datetime.timedelta(days=10)
+        n = pricing_update.WARNING_CAP + 3
+        entries = [_entry("sonnet", str(1000 + i), ("through", ended))
+                  for i in range(n)]
+        report = pricing_update.run_update(self.f.conn, entries, today, "t")
+        warn_lines = [ln for ln in report.splitlines()
+                     if ln.startswith("STALE-PRICE WARNING")]
+        self.assertEqual(len(warn_lines), pricing_update.WARNING_CAP)
+        self.assertIn(f"… and {n - pricing_update.WARNING_CAP} more"
+                     " STALE-PRICE warning(s)", report)
+
+    def test_under_cap_warnings_print_no_summary_line(self):
+        today = datetime.date(2026, 9, 23)
+        old = today - datetime.timedelta(days=400)
+        entries = [_entry("sonnet", "5", ("starting", old))]
+        report = pricing_update.run_update(self.f.conn, entries, today, "t")
+        self.assertIn("BACKDATED-STARTING WARNING", report)
+        self.assertNotIn("more BACKDATED-STARTING warning(s)", report)
+
+
 class TestErrorSanitization(Base):
     """Fix 4: no raw, unsanitized page text ever reaches a printed error."""
 
@@ -541,6 +647,17 @@ class TestErrorSanitization(Base):
         self.assertNotIn("⁦", clean)
         self.assertIn("evil", clean)
         self.assertIn("reordered", clean)
+
+    def test_safe_error_text_strips_additional_bidi_control_chars(self):
+        # AOS-143 correction, F5: U+200E LRM, U+200F RLM and U+061C ALM carry
+        # the Bidi_Control property but were missing from the original
+        # range-only strip set.
+        raw = "A‎B‏C؜D"
+        clean = pricing_update._safe_error_text(raw)
+        self.assertNotIn("‎", clean)
+        self.assertNotIn("‏", clean)
+        self.assertNotIn("؜", clean)
+        self.assertEqual(clean, "ABCD")
 
     def test_safe_error_text_caps_length(self):
         clean = pricing_update._safe_error_text("x" * 1000)
@@ -609,8 +726,73 @@ class TestErrorSanitization(Base):
                             "$10 / MTok")])
         path = self.f.write_html(html)
         code, out, err = self.f.cli("--html", str(path))
-        self.assertEqual(code, 2)
+        # A structural parse failure (no dollar amount at all in the "in"
+        # cell) is the "other errors" outcome, distinct from a fetch failure
+        # and from a bounds refusal (AOS-143 correction, F1).
+        self.assertEqual(code, pricing_update.EXIT_OTHER_ERROR)
         self.assertNotIn("\x1b", err)
+
+
+class TestFetchVsParseVsBoundsExitCodes(Base):
+    """AOS-143 correction, F1: the three failure modes a plain refresh run
+    can end in are distinguished by exit code, so the command's manual
+    fallback — which has none of the parser's bounds — can be wired to run
+    ONLY for a genuine fetch failure, never for a page the script refused or
+    could not structurally parse."""
+
+    def test_simulated_fetch_failure_returns_the_fetch_code(self):
+        # No --html: main() takes the real network branch. urlopen is
+        # patched to fail the way a down host or a bad connection would,
+        # without touching the network.
+        import unittest.mock
+        import urllib.error
+
+        before = self.f.pricing_rows()
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch(
+                "pricing_update.urllib.request.urlopen",
+                side_effect=urllib.error.URLError("simulated connection"
+                                                  " failure")), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            code = pricing_update.main(["--db", str(self.f.path)])
+        self.assertEqual(code, pricing_update.EXIT_FETCH_FAILED)
+        self.assertIn("pricing page fetch failed", err.getvalue())
+        self.assertEqual(self.f.pricing_rows(), before)
+
+    def test_fetch_failure_error_text_is_sanitized(self):
+        # F2/F3 (pre-existing, corrected here): a raw HTTP status line can
+        # carry attacker- or MITM-controlled terminal escape sequences —
+        # main() must sanitize it with the same sanitizer used for
+        # page-derived error text before printing it.
+        import unittest.mock
+
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch(
+                "pricing_update.urllib.request.urlopen",
+                side_effect=OSError("HTTP/1.1 500 Oops\x1b]0;pwned\x07"
+                                    "\x1b[2Jbad")), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            code = pricing_update.main(["--db", str(self.f.path)])
+        self.assertEqual(code, pricing_update.EXIT_FETCH_FAILED)
+        self.assertNotIn("\x1b", err.getvalue())
+        self.assertNotIn("\x07", err.getvalue())
+        self.assertIn("Oops", err.getvalue())
+
+    def test_bounds_refusal_and_other_error_never_use_the_fetch_code(self):
+        bounds_path = self.f.write_html(_table_html([
+            ("Claude Sonnet 5", "$0 / MTok", "$2.50 / MTok", "$4 / MTok",
+             "$0.20 / MTok", "$10 / MTok")]), name="bounds.html")
+        other_path = self.f.write_html(_table_html([
+            ("Claude Sonnet 5", "nope", "$2.50 / MTok", "$4 / MTok",
+             "$0.20 / MTok", "$10 / MTok")]), name="other.html")
+        bounds_code, _, _ = self.f.cli("--html", str(bounds_path))
+        other_code, _, _ = self.f.cli("--html", str(other_path))
+        self.assertEqual(bounds_code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertEqual(other_code, pricing_update.EXIT_OTHER_ERROR)
+        self.assertNotEqual(bounds_code, pricing_update.EXIT_FETCH_FAILED)
+        self.assertNotEqual(other_code, pricing_update.EXIT_FETCH_FAILED)
 
 
 class TestFutureOnlyNewestWarning(Base):

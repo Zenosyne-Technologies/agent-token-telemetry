@@ -6,8 +6,19 @@ https://platform.claude.com/docs/en/about-claude/pricing, parses the model
 pricing table, diffs it against the `pricing` table and inserts effective-dated
 rows per the insert-only contract (docs/TELEMETRY-CONTRACT.md), then prints a
 finished markdown report. The command prompt runs this and echoes stdout
-verbatim; the LLM flow is only the fallback when this exits non-zero (exit 2 =
-fetch/parse failure — the page layout changed or the network is down).
+verbatim.
+
+Three distinct exit codes cover a run that mints nothing (AOS-143 correction,
+F1): `EXIT_BOUNDS_REFUSED` (1) — the page was REFUSED by a parser bound (an
+out-of-bounds/malformed rate, or over `MAX_CANDIDATES` rows) — nothing is
+wrong with fetching or reading the page, the page itself is untrustworthy, so
+the LLM flow reports this and STOPS; `EXIT_FETCH_FAILED` (2) — the page (or
+`--html` file) could not be read at all (network down, HTTP error, timeout) —
+this is the ONLY exit code the manual fallback exists for; `EXIT_OTHER_ERROR`
+(3) — the page was read but its structure did not parse (layout changed,
+table/column not found) or an unexpected error occurred — also no fallback,
+since a page that reads but does not parse as expected is exactly the kind of
+anomaly the fallback's unbounded manual read must not be trusted with either.
 
 `--backfill-plan [--json]` prints the read-only consent-gated backfill plan
 (estimated events that a copy of their model's own, later-minted rate would
@@ -69,13 +80,27 @@ _LEGACY_PREFIXES = frozenset(p for ps in SPECIAL_PREFIXES.values() for p in ps)
 # pricing page is permanent (insert-only history), so what a page can mint is
 # bounded on every axis a hostile or broken page could abuse.
 MAX_RATE_USD = 10000.0          # money() ceiling: no rate this high is real
+MIN_INOUT_RATE_USD = 0.01       # in_usd/out_usd floor (AOS-143 correction,
+                                 # F4): $0 was already refused; anything under
+                                 # a cent/MTok is effectively free and just as
+                                 # implausible as the $10,000 ceiling.
 MAX_CANDIDATES = 500            # candidate rows a single run may mint
 BACKDATE_MAX_DAYS = 365         # oldest a `starting <d>` row may be minted at
 
+# main()'s three distinct exit codes for a run that writes nothing (AOS-143
+# correction, F1) — see the module docstring for what each one means and why
+# only EXIT_FETCH_FAILED reaches the command's manual fallback.
+EXIT_BOUNDS_REFUSED = 1
+EXIT_FETCH_FAILED = 2
+EXIT_OTHER_ERROR = 3
+
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-# Unicode bidi-control characters (U+202A-U+202E, U+2066-U+2069): can
-# visually reorder or spoof rendered/terminal text (mirrors report.md_cell).
-_BIDI_CHAR_RE = re.compile(r"[‪-‮⁦-⁩]")
+# Unicode bidi-control characters: U+200E LRM, U+200F RLM, U+061C ALM (AOS-143
+# correction, F5 — these carry the Bidi_Control property but were missing
+# from the original range-only set below) plus U+202A-U+202E and
+# U+2066-U+2069, which can visually reorder or spoof rendered/terminal text
+# (mirrors report.md_cell).
+_BIDI_CHAR_RE = re.compile(r"[‎‏؜‪-‮⁦-⁩]")
 _ERROR_TEXT_MAX = 200
 
 
@@ -128,38 +153,66 @@ class TableCollector(HTMLParser):
             self._cell.append(data)
 
 
-_MONEY_RE = re.compile(r"\$\s*([0-9]+(?:\.[0-9]+)?)")
-# A mantissa immediately followed by an exponent marker (e/E, optional sign,
-# digits) — scientific notation, never a real pricing-page rate.
-_EXPONENT_RE = re.compile(r"[eE][+-]?[0-9]+")
+# The full contiguous "numeric-ish" run after a `$` — digits plus every
+# character a malformed rate could plausibly contain (comma, extra dot,
+# exponent marker, sign) — captured WHOLE so it can be validated as a unit,
+# rather than matching only its well-formed prefix and silently dropping the
+# rest (AOS-143 correction: that used to mint `$1,500` as `$1`).
+_MONEY_TOKEN_RE = re.compile(r"\$\s*([0-9][0-9,.eE+\-]*)")
+# The only token shape money() accepts: ASCII digits, with at most one `.`.
+_STRICT_NUMBER_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 
 
 def money(text):
     """Parse a ``$<amount> / MTok`` cell to a float, or ``None`` when the
-    cell has no dollar amount OR when the matched number is immediately
-    followed by an exponent marker (e.g. ``$1e309``) — scientific notation
-    is never a real published rate, and silently truncating to the mantissa
-    would accept a malformed cell as ``$1`` instead of refusing it (AOS-143
-    correction). Deliberately permissive about plain-integer/decimal
-    magnitude otherwise — ``parse_models`` is the bound-enforcement point
-    (:data:`MAX_RATE_USD`), so every caller sees the same, single check."""
-    m = _MONEY_RE.search(text)
+    cell has no ``$``-prefixed numeric token at all (a genuinely non-numeric
+    cell — :func:`parse_models` raises its own "unparseable rate cell" error
+    for that case).
+
+    When a ``$``-prefixed token IS present, the WHOLE contiguous run
+    (:data:`_MONEY_TOKEN_RE`) must be a plain, unambiguous decimal number —
+    ASCII digits with at most one ``.`` (:data:`_STRICT_NUMBER_RE`) — or
+    :class:`PricingRefused` is raised (AOS-143 correction): a thousands
+    separator (``$1,500``), more than one decimal point (``$4.00.00``), or
+    any exponent marker, complete (``$1e309``) or dangling after a bare
+    ``.`` (``$1.e3``), used to be silently truncated to its leading digits
+    (``$1``) instead of refusing the malformed cell outright. Magnitude and
+    the in/out floor are :func:`parse_models`'s job (:data:`MAX_RATE_USD`,
+    :data:`MIN_INOUT_RATE_USD`), so every caller shares the one enforcement
+    point for those; a malformed TOKEN, by contrast, is refused right here,
+    since no caller should ever see a guessed-at number."""
+    m = _MONEY_TOKEN_RE.search(text)
     if not m:
         return None
-    if _EXPONENT_RE.match(text, m.end()):
-        return None
-    return float(m.group(1))
+    token = m.group(1)
+    if not _STRICT_NUMBER_RE.match(token):
+        raise PricingRefused(
+            "Pricing refresh REFUSED — nothing written: malformed rate cell"
+            " (expected a plain decimal number such as $3 or $3.75 — not a"
+            " thousands separator, more than one decimal point, or"
+            f" scientific notation): {_safe_error_text(text)}")
+    return float(token)
 
 
 def parse_models(html):
     """The model-pricing table -> ordered entries:
-    {family, version, rates, condition: None|('through'|'starting', date)}."""
+    {family, version, rates, condition: None|('through'|'starting', date)}.
+
+    Raises :class:`ValueError` for a structural parse failure (table/column
+    not found, a cell with no dollar amount at all, no model rows) — main()
+    maps this to :data:`EXIT_OTHER_ERROR`. Raises :class:`PricingRefused`
+    instead (AOS-143 correction) for a page BOUND violation on an otherwise
+    well-formed cell — a malformed numeric token (:func:`money`) or a rate
+    outside :data:`MAX_RATE_USD`/:data:`MIN_INOUT_RATE_USD` — which main()
+    maps to :data:`EXIT_BOUNDS_REFUSED` instead: the page read and parsed
+    fine, it is just untrustworthy, a different failure mode from either a
+    fetch failure or a structural one."""
     tc = TableCollector()
     tc.feed(html)
     # Header text is matched case-insensitively: the published page has shipped
     # both title case ("Base Input Tokens") and sentence case ("Base input
     # tokens") for the same columns, and a case-sensitive match silently failed
-    # to find the table (exit 2) when the casing changed.
+    # to find the table (now EXIT_OTHER_ERROR) when the casing changed.
     table = next((t for t in tc.tables
                   if t and any("base input tokens" in c.lower()
                                for c in t[0])), None)
@@ -204,22 +257,24 @@ def parse_models(html):
         if any(v is None for v in rates.values()):
             raise ValueError("unparseable rate cell in row:"
                              f" {_safe_error_text(row[0])}")
-        # Bound what a page can mint (AOS-143): reject a non-finite rate (a
-        # very long digit string overflows float() to `inf` with no
-        # exception), any rate over MAX_RATE_USD/MTok, and a non-positive
-        # in_usd/out_usd (a $0 or negative charge would mint a permanent
-        # free/negative rate; cache rates are legitimately allowed to be $0,
-        # so no lower bound applies to them). A single bad cell refuses the
-        # WHOLE run — money() is permissive on purpose, this is the one
-        # enforcement point every caller shares.
+        # Bound what a page can mint (AOS-143, corrected): reject a
+        # non-finite rate (a very long digit string overflows float() to
+        # `inf` with no exception), any rate over MAX_RATE_USD/MTok, and an
+        # in_usd/out_usd under MIN_INOUT_RATE_USD (a $0, negative, or
+        # near-zero charge would mint a permanent free/negative rate; cache
+        # rates are legitimately allowed to be $0, so no lower bound applies
+        # to them). A single bad cell refuses the WHOLE run as a page bound
+        # violation (:class:`PricingRefused`), not a generic parse failure —
+        # this is the one enforcement point every caller shares.
         bad = [k for k, v in rates.items()
                if not math.isfinite(v) or v > MAX_RATE_USD
-               or (k in ("in_usd", "out_usd") and v <= 0)]
+               or (k in ("in_usd", "out_usd") and v < MIN_INOUT_RATE_USD)]
         if bad:
-            raise ValueError(
-                "rate out of bounds (non-finite, over"
-                f" ${MAX_RATE_USD:g}/MTok, or a non-positive in/out rate)"
-                f" for Claude {m.group(1).title()} {m.group(2)}:"
+            raise PricingRefused(
+                "Pricing refresh REFUSED — nothing written: rate out of"
+                f" bounds (non-finite, over ${MAX_RATE_USD:g}/MTok, or an"
+                f" in/out rate under ${MIN_INOUT_RATE_USD:g}/MTok) for"
+                f" Claude {m.group(1).title()} {m.group(2)}:"
                 f" {', '.join(sorted(bad))}")
         entries.append({"family": m.group(1).lower(), "version": m.group(2),
                         "rates": rates, "condition": condition})
@@ -585,6 +640,37 @@ def fmt_rates(r):
             f" / {n(r['cache_w_usd'])} / {n(r['cache_w_1h_usd'])}")
 
 
+WARNING_CAP = 20   # per-category cap on STALE/BACKDATED/FUTURE report lines
+
+
+def _capped_warnings(items, line_fn, kind):
+    """At most :data:`WARNING_CAP` rendered ``kind`` warning lines for
+    ``items`` (:func:`stale_intros` / :func:`filter_backdated_starting` /
+    :func:`future_only_newest` output), each its own blank-line-prefixed
+    block via ``line_fn``, plus one "... and N more" summary line when
+    ``items`` holds more than the cap (AOS-143 correction, F3 sev4-low): an
+    adversarial or just very large page can otherwise print thousands of
+    per-row warning lines into the report the command prints verbatim into
+    the agent's context, uncapped and at linear cost per line.
+
+    :param items: the warning tuples for one category, in page order.
+    :param line_fn: renders one item to its single warning-line string.
+    :param kind: the category's label (e.g. ``"BACKDATED-STARTING"``), used
+        only in the summary line.
+    :returns: report lines (each preceded by its own blank line), ready to
+        extend the report's ``out`` list.
+    """
+    items = list(items)
+    shown, extra = items[:WARNING_CAP], len(items) - WARNING_CAP
+    out = []
+    for item in shown:
+        out += ["", line_fn(item)]
+    if extra > 0:
+        out += ["", f"… and {extra} more {kind} warning(s) (capped at"
+                    f" {WARNING_CAP} per run)."]
+    return out
+
+
 def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
            future_only=()):
     """The finished markdown run report.
@@ -618,25 +704,34 @@ def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
     for name in unpriced:
         out.append(f"| `{name}` (in models table) | no published rate —"
                    " not fabricated | — | unpriced |")
-    for fam, ver, end in stale:
-        out += ["", f"STALE-PRICE WARNING: Claude {fam.capitalize()} {ver}"
+    def _stale_line(item):
+        fam, ver, end = item
+        return (f"STALE-PRICE WARNING: Claude {fam.capitalize()} {ver}"
                 f" (`{specific_prefixes(fam, ver)[0]}`) — its introductory"
                 f" rate ended {end.isoformat()} and the page lists no rate in"
                 " force after it; nothing was minted, so events for it keep"
                 " the last recorded rate until the page publishes a"
-                " post-intro rate."]
-    for fam, ver, date, _rates in backdated:
+                " post-intro rate.")
+
+    def _backdated_line(item):
+        fam, ver, date, _rates = item
         name = f"Claude {fam.capitalize()} {ver}"
-        out += ["", f"BACKDATED-STARTING WARNING: {name}"
+        return (f"BACKDATED-STARTING WARNING: {name}"
                 f" (`{specific_prefixes(fam, ver)[0]}`) — a starting row dated"
                 f" {date.isoformat()} is more than {BACKDATE_MAX_DAYS} days"
                 " old and was not recorded; the rows already recorded for"
-                f" {name} are unchanged."]
-    for fam, ver, date in future_only:
-        out += ["", f"FUTURE-RATE WARNING: Claude {fam.capitalize()} {ver}"
+                f" {name} are unchanged.")
+
+    def _future_line(item):
+        fam, ver, date = item
+        return (f"FUTURE-RATE WARNING: Claude {fam.capitalize()} {ver}"
                 f" (`{specific_prefixes(fam, ver)[0]}`) — its only listed"
                 f" rate starts {date.isoformat()}, still in the future; the"
-                " family default keeps its last recorded rate until then."]
+                " family default keeps its last recorded rate until then.")
+
+    out += _capped_warnings(stale, _stale_line, "STALE-PRICE")
+    out += _capped_warnings(backdated, _backdated_line, "BACKDATED-STARTING")
+    out += _capped_warnings(future_only, _future_line, "FUTURE-RATE")
     out += ["", f"Source: {URL} — checked {today.isoformat()},"
             f" {inserted} row(s) inserted (history is insert-only; existing"
             " rows are never modified)."]
@@ -644,7 +739,12 @@ def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
 
 
 class PricingRefused(Exception):
-    """A run refused before any write; ``args[0]`` is the report/message."""
+    """A run refused before any write; ``args[0]`` is the report/message.
+    Raised for every page-BOUND violation (AOS-143, corrected): a malformed
+    or out-of-range rate (:func:`money`, :func:`parse_models`) as well as the
+    over-:data:`MAX_CANDIDATES` row-count cap below — main() maps all of
+    these to :data:`EXIT_BOUNDS_REFUSED`, distinct from a fetch failure or a
+    structural parse failure (:class:`ValueError`)."""
 
 
 def run_update(conn, entries, today, source=URL):
@@ -1645,6 +1745,15 @@ def main(argv=None):
         finally:
             conn.close()
         return 0
+    # Fetching (network, or --html file for tests) is kept in its own try
+    # block, distinct from parsing below (AOS-143 correction, F1): a fetch
+    # failure is the ONLY case that reaches the command's manual fallback —
+    # a page that fetched fine but did not parse/validate must never be
+    # handed to the fallback's unbounded manual read. F2/F3 (sev3
+    # pre-existing): the exception text can carry an attacker- or
+    # MITM-controlled raw HTTP status line, so it is sanitized with the same
+    # sanitizer used for page-derived error text before it ever reaches
+    # stderr.
     try:
         if args.html:
             html = Path(args.html).read_text(errors="replace")
@@ -1653,17 +1762,34 @@ def main(argv=None):
                 URL, headers={"User-Agent": "token-telemetry-pricing-update"})
             with urllib.request.urlopen(req, timeout=30) as resp:
                 html = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001 - any fetch failure -> fallback
+        print(f"pricing page fetch failed: {_safe_error_text(exc)}",
+              file=sys.stderr)
+        return EXIT_FETCH_FAILED
+    # Parsing/validating the fetched page is a SEPARATE failure mode (AOS-143
+    # correction, F1): PricingRefused means the page read and parsed fine but
+    # violated a bound (a malformed/out-of-range rate) — report and STOP, no
+    # fallback, since the manual fallback has none of these bounds. Any other
+    # parse failure (layout changed, table/column not found) is a THIRD,
+    # distinct outcome — also no fallback, since a page that read fine but
+    # did not parse as expected is exactly the kind of anomaly the
+    # fallback's unbounded manual read must not be trusted with either.
+    try:
         entries = parse_models(html)
-    except Exception as exc:  # noqa: BLE001 - any failure -> LLM fallback
-        print(f"pricing page fetch/parse failed: {exc}", file=sys.stderr)
-        return 2
+    except PricingRefused as exc:
+        print(exc.args[0])
+        return EXIT_BOUNDS_REFUSED
+    except Exception as exc:  # noqa: BLE001 - any other parse failure
+        print(f"pricing page parse failed: {_safe_error_text(exc)}",
+              file=sys.stderr)
+        return EXIT_OTHER_ERROR
     today = datetime.datetime.now(tz=datetime.timezone.utc).date()
     conn = capture.connect(db)
     try:
         print(run_update(conn, entries, today))
     except PricingRefused as exc:
         print(exc.args[0])
-        return 1
+        return EXIT_BOUNDS_REFUSED
     finally:
         conn.close()
     return 0
