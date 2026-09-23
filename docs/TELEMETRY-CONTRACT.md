@@ -315,7 +315,19 @@ on the run date:
 - when the page lists several unconditional rows for one version (e.g. a long-context
   row), the **first** one listed is the version's rate;
 - the `claude-<family>-` family default row, dated today, carries the in-force rate of
-  the family's newest unconditionally-listed version.
+  the family's **newest** version (its first-listed one — the page lists newest first),
+  whether that version is listed unconditionally or only conditionally (`through` /
+  `starting`), by the same in-force rule as the version's own row. A family whose only
+  listings are conditional still gets its family row.
+
+**Known limitation — expired intro with no other rate.** When a version's only listing
+is an expired `through <d>` intro (no unconditional row, no in-force `starting`), the
+page states no rate in force today: nothing is minted for that version (nor for its
+family default when it is the family's newest version), and the run report prints a
+`STALE-PRICE WARNING` line naming the version and its intro end date. Its events keep
+the last recorded rate until the page publishes a post-intro rate. They are **not**
+flagged estimated: that would require storing the row's condition (`through <d>`),
+which the `pricing` table does not hold.
 
 A model the page does not list is priced by the longest matching prefix, unchanged:
 an unlisted point release of a listed version (e.g. `claude-opus-5-5` while the page

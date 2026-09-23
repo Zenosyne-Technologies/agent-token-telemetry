@@ -176,8 +176,14 @@ def build_candidates(entries, today):
       <version>`` or the legacy aliases), the family's newest one included;
     - ``claude-<family>-`` — the FAMILY DEFAULT row, the fallback for models
       of that family the page does not list — dated today at the in-force
-      rate of the family's newest unconditionally-listed version (the rate its
-      own specific prefix resolves to from today on).
+      rate of the family's NEWEST version (its first-listed one: the page
+      lists newest first), whether that version is listed unconditionally or
+      only conditionally — the rate its own specific prefix resolves to from
+      today on, by the same in-force rule as above. A family whose only
+      listings are conditional still gets its family row. If the newest
+      version has no in-force rate (only an expired intro, see
+      :func:`stale_intros`), no family row is minted either — the family
+      default keeps its last recorded rate, like the version itself.
 
     Ordering: on a ``(prefix, effective_from)`` collision the first candidate
     wins. In-force conditionals are listed before unconditional rows (and an
@@ -220,26 +226,51 @@ def build_candidates(entries, today):
         if key not in seen:
             seen.add(key)
             deduped.append(c)
-    # family default rows: the newest unconditional version's in-force rate —
-    # the row its own first prefix resolves to from today on (greatest
-    # effective_from, first on a tie).
-    family_rows, done = [], set()
+    # family default rows: the in-force rate of the family's newest version
+    # (first listed; conditional-only listings count) — the row its own first
+    # prefix resolves to from today on (greatest effective_from, first on a
+    # tie). No in-force rate for the newest version -> no family row.
+    newest = {}
     for e in entries:
-        fam = e["family"]
-        if e["condition"] is not None or fam in done:
-            continue
-        done.add(fam)
-        own = specific_prefixes(fam, e["version"])[0]
-        best = None
-        for c in deduped:
-            if c["prefix"] == own and (
-                    best is None
-                    or c["effective_from"] > best["effective_from"]):
-                best = c
-        family_rows.append({"prefix": f"claude-{fam}-",
-                            "rates": best["rates"],
-                            "effective_from": today_epoch})
+        newest.setdefault(e["family"], e["version"])
+    family_rows = []
+    for fam, ver in newest.items():
+        own = specific_prefixes(fam, ver)[0]
+        rows = [c for c in deduped if c["prefix"] == own]
+        if rows:
+            best = max(rows, key=lambda c: c["effective_from"])
+            family_rows.append({"prefix": f"claude-{fam}-",
+                                "rates": best["rates"],
+                                "effective_from": today_epoch})
     return family_rows + deduped
+
+
+def stale_intros(entries, today):
+    """Versions whose only rate on the page is an EXPIRED intro.
+
+    A version listed with a ``through <d>`` intro rate where ``d < today`` and
+    with no other rate in force today (no unconditional row, no in-force
+    ``starting``/``through`` row) has no known in-force rate: nothing is
+    minted for it — nor for its family default when it is the family's newest
+    version (:func:`build_candidates`) — so its events keep the last
+    recorded rate until the page publishes a post-intro rate. The run report
+    names each such version in a STALE-PRICE WARNING line.
+
+    :param entries: :func:`parse_models` output, in page order.
+    :param today: the run date (UTC).
+    :returns: ``[(family, version, intro_end_date)]`` in page order, the
+        latest expired intro end date per version.
+    """
+    priced, expired = set(), {}
+    for e in entries:
+        key = (e["family"], e["version"])
+        cond = e["condition"]
+        if cond is None or in_force(cond, today):
+            priced.add(key)
+        elif cond[0] == "through":
+            expired[key] = max(expired.get(key, cond[1]), cond[1])
+    return [(fam, ver, end) for (fam, ver), end in expired.items()
+            if (fam, ver) not in priced]
 
 
 def plan(conn, candidates):
@@ -303,7 +334,18 @@ def fmt_rates(r):
             f" / {n(r['cache_w_usd'])} / {n(r['cache_w_1h_usd'])}")
 
 
-def render(candidates, inserted, unpriced, today):
+def render(candidates, inserted, unpriced, today, stale=()):
+    """The finished markdown run report.
+
+    :param candidates: planned+applied candidates (:func:`plan`,
+        :func:`apply`).
+    :param inserted: number of rows inserted.
+    :param unpriced: model names matching no pricing prefix.
+    :param today: the run date (UTC).
+    :param stale: :func:`stale_intros` output — one STALE-PRICE WARNING line
+        per version whose only listed rate is an expired intro.
+    :returns: the report text.
+    """
     out = ["| model prefix | in / out / cache-read / 5m-write / 1h-write"
            " (USD per MTok) | effective | status |", "|---|---|---|---|"]
     for c in candidates:
@@ -317,10 +359,33 @@ def render(candidates, inserted, unpriced, today):
     for name in unpriced:
         out.append(f"| `{name}` (in models table) | no published rate —"
                    " not fabricated | — | unpriced |")
+    for fam, ver, end in stale:
+        out += ["", f"STALE-PRICE WARNING: Claude {fam.capitalize()} {ver}"
+                f" (`{specific_prefixes(fam, ver)[0]}`) — its introductory"
+                f" rate ended {end.isoformat()} and the page lists no rate in"
+                " force after it; nothing was minted, so events for it keep"
+                " the last recorded rate until the page publishes a"
+                " post-intro rate."]
     out += ["", f"Source: {URL} — checked {today.isoformat()},"
             f" {inserted} row(s) inserted (history is insert-only; existing"
             " rows are never modified)."]
     return "\n".join(out)
+
+
+def run_update(conn, entries, today, source=URL):
+    """Plan, apply and report one pricing refresh of parsed page ``entries``.
+
+    :param conn: an open telemetry DB connection (:func:`capture.connect`).
+    :param entries: :func:`parse_models` output, in page order.
+    :param today: the run date (UTC).
+    :param source: the ``source`` column value for inserted rows.
+    :returns: the finished markdown run report (:func:`render`), including a
+        STALE-PRICE WARNING line per :func:`stale_intros` version.
+    """
+    candidates = plan(conn, build_candidates(entries, today))
+    inserted = apply(conn, candidates, source)
+    return render(candidates, inserted, unpriced_models(conn), today,
+                  stale_intros(entries, today))
 
 
 def main(argv=None):
@@ -349,9 +414,7 @@ def main(argv=None):
     today = datetime.datetime.now(tz=datetime.timezone.utc).date()
     conn = capture.connect(db)
     try:
-        candidates = plan(conn, build_candidates(entries, today))
-        inserted = apply(conn, candidates, URL)
-        print(render(candidates, inserted, unpriced_models(conn), today))
+        print(run_update(conn, entries, today))
     finally:
         conn.close()
     return 0
