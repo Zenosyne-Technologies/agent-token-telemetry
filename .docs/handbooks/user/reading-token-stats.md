@@ -27,10 +27,15 @@ disagree with your machine's local day if their timezones differ (see
 - **By project, by agent, by model, by tier** — the same totals broken down
   different ways, so you can see which project or which kind of agent is
   using the most. Tier reflects the AGENT'S ROLE (the main session vs. a
-  named sub-agent persona), not just which model answered — two rows can
-  share a model and still fall in different tiers. When any of that usage
-  came from an escalation persona, a further **by ladder rung** breakdown
-  shows how much went to each escalation level.
+  named sub-agent persona), not just which model answered, so the **by
+  tier** table can split what looks like one model's work across several
+  rows. **By model** still shows one row per model — if that model served
+  more than one role this week, its tier cell lists all of them (e.g.
+  `orchestrator, heavy`) rather than repeating the model. When any of that
+  usage came from an escalation persona, a further **by ladder rung**
+  breakdown shows how much went to each escalation level; a `no rung
+  (fallback)` row covers ladder usage that didn't come through a named
+  escalation persona, so the rung rows always add up to the ladder total.
 - **Estimated cost** — a dollar estimate per model, worked out from current
   published pricing. This is an estimate for visibility, not a bill.
 - **By issue** — usage rolled up under a tracked issue key, when that

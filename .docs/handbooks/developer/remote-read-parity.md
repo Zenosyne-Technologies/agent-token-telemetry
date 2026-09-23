@@ -71,14 +71,21 @@ functions, hand-written and reviewed:
 - **Tier is role-based (AOS-141), not model-based**, mirroring the kit's
   `token-economics.md` verbatim: the main session (`kind=0`, `agent` NULL) is
   always `orchestrator`; named `marvin:*` personas route to their own tier;
-  any other agent falls back to its model's prefix. `by_model` now groups by
-  `(model, tier)` — the same model can land in more than one tier row (e.g.
-  the main session's `orchestrator` vs. a `marvin:developer` subagent's
-  `heavy`). `by_rung` breaks `by_tier`'s `ladder` rows down by escalation
-  rung (`high`/`xhigh`/`max`/`frontier`), read only from the named
-  `marvin:escalation-<rung>` persona; a `ladder` row reached via the
-  model-prefix fallback has no rung and is left out of `by_rung`, though it
-  still counts toward `by_tier`'s ladder total. Both `report.py`'s
+  any other agent falls back to its model's prefix. The role split shows up
+  in `by_tier` (and `by_rung`), NOT in `by_model` — that stays ONE row per
+  model, as before role tiering, but its tier column now lists EVERY tier the
+  model actually served that window, comma-joined in the kit's display order
+  (orchestrator, heavy, ladder, small, micro, `unknown` last) — e.g. a model
+  used both as the main session and as a `marvin:developer` subagent reads
+  `orchestrator, heavy` on its single row (`reports.sql`'s inner
+  per-`(model, tier)` grouping feeds an outer `string_agg(... ORDER BY
+  <tier rank>)`, mirroring `report.py`'s `tier_rank_case()`). `by_rung`
+  breaks `by_tier`'s `ladder` rows down by escalation rung
+  (`high`/`xhigh`/`max`/`frontier`), read only from the named
+  `marvin:escalation-<rung>` persona; a `ladder` row with no such name (the
+  model-prefix fallback, or an unrecognized `marvin:escalation-*` suffix) is
+  grouped under the `no rung (fallback)` label instead of dropped, so
+  `by_rung`'s rows always sum to `by_tier`'s ladder total. Both `report.py`'s
   `tier_case()`/`rung_case()` and `reports.sql`'s inline CASE expressions
   implement the SAME rule — see `docs/TELEMETRY-CONTRACT.md`'s "Tier mapping".
 

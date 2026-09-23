@@ -199,13 +199,17 @@ NOT the main session (e.g. `kind = 1` with no agent) — falls back to its model
 prefix: `claude-opus-*` heavy · `claude-sonnet-*` small · `claude-haiku-*` micro ·
 `claude-fable-*` ladder; no match is `unknown`. Tier names and order match the kit.
 
-`by_model` groups by `(model, tier)`, not model alone: the same model can legitimately
-land in more than one tier row (e.g. as the main session's `orchestrator` and as a
-`marvin:developer` subagent's `heavy`). `by_rung` breaks the `ladder` rows of `by_tier`
-down by escalation rung, read only from the named `marvin:escalation-<rung>` persona
-(`events.agent`) — never inferred from a model or effort setting; a `ladder` row that
-reached that tier through the model-prefix fallback has no rung and is left out of
-`by_rung`, though it still counts toward `by_tier`'s ladder total.
+The role split shows up in `by_tier` (and `by_rung`), NOT in `by_model`: that stays
+ONE row per model, as before role tiering, but its tier column now lists EVERY tier
+the model actually served that window, comma-joined in the kit's display order
+(orchestrator, heavy, ladder, small, micro — `unknown` last) — e.g. a model used both
+as the main session and as a `marvin:developer` subagent reads `orchestrator, heavy`
+on its single row. `by_rung` breaks the `ladder` rows of `by_tier` down by escalation
+rung, read only from the named `marvin:escalation-<rung>` persona (`events.agent`) —
+never inferred from a model or effort setting; a `ladder` row with no such name (the
+model-prefix fallback, or an unrecognized `marvin:escalation-*` suffix) is grouped
+under the `no rung (fallback)` label instead of dropped, so `by_rung`'s rows always
+sum to `by_tier`'s ladder total.
 
 ## Scoping recipes (with pre-v2 fallback)
 
