@@ -214,6 +214,16 @@ class TestFingerprint(Base):
         self.f.price("claude-sonnet-5", (3.0, 15.0, 0.3, 3.75, 6.0), D + 2 * DAY)
         self.assertNotEqual(self.fp(), before)
 
+    def test_pricing_change_within_the_horizon_changes_the_fingerprint(self):
+        # neither row moves the horizon (a later row of an existing prefix,
+        # a family-default rate change), so only the pricing-row hash sees it
+        before = self.fp()
+        self.f.price("claude-opus-5-5", (4.5, 22.0, 0.3, 5.5, 9.0), D + 2 * DAY)
+        later_row = self.fp()
+        self.assertNotEqual(later_row, before)
+        self.f.price("claude-opus-", (6.0, 30.0, 0.6, 7.5, 12.0), D - 10 * DAY)
+        self.assertNotEqual(self.fp(), later_row)
+
     def test_event_before_the_horizon_changes_the_fingerprint(self):
         before = self.fp()
         rid = self.f.event("claude-opus-5-5", D + 100)
