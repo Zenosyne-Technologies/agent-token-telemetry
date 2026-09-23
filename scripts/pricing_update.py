@@ -159,8 +159,17 @@ def _safe_error_text(value):
 # element concatenates with its neighbours with no inserted space (so
 # ``4<b>.5</b>`` reads ``4.5``, as it renders); a block-level element, a
 # ``<br>``, or a flex/grid ITEM is a boundary and inserts one space (so
-# ``5<br>1M-token`` reads ``5 1M-token``). Whitespace then collapses to single
-# spaces.
+# ``5<br>1M-token`` reads ``5 1M-token``). Every Unicode PRIVATE-USE code
+# point (category ``Co``) is then dropped (AOS-151 security correction,
+# round 2, R2-2) — these are icon-font glyphs, assigned per font and never
+# text, so the live page's retired/invite-only badge (a ``Co`` glyph sitting
+# right after the model version, e.g. U+E0F0) is removed rather than relied
+# on to be a whitespace boundary; before this, that boundary was recognized
+# only via the badge's exact ``inline-flex`` container class
+# (:data:`_FLEX_GRID_CLASSES`), so a class rename or an unstyled container
+# made the whole run refuse. Whitespace then collapses to single spaces —
+# again after the ``Co`` strip, so removing a glyph between two boundary
+# spaces never leaves a double space behind.
 #
 # Block-level: the HTML UA-stylesheet elements whose default ``display`` is
 # block, list-item or a table part.
@@ -185,9 +194,12 @@ _VOID_TAGS = frozenset((
 # ``<div class="flex min-w-0 flex-col"><a …>Claude Opus 5.5</a><span …>For
 # long-running…</span></div>`` — an ``<a>`` and a ``<span>``, both inline, with
 # no whitespace between them, shown on two lines only because their parent is
-# a flex column (and retired-model badges sit in ``<span class="inline-flex
-# …">``). The page's CSS is Tailwind utility classes, so a container is
-# recognized by an exact unprefixed class token below (a responsive/state
+# a flex column. (Retired-model badges also sit in a ``<span
+# class="inline-flex …">``, but their private-use glyph is dropped outright
+# by :func:`_strip_private_use` regardless of this container recognition —
+# round 2, R2-2 — so a class rename or an unstyled badge container no longer
+# blocks the run.) The page's CSS is Tailwind utility classes, so a container
+# is recognized by an exact unprefixed class token below (a responsive/state
 # variant such as ``md:flex`` is conditional and ignored) or by an inline
 # ``style`` declaring ``display: [inline-]flex|grid``. No other CSS is
 # modelled: an element restyled some other way reads as its tag's default,
@@ -256,18 +268,38 @@ def _is_flex_or_grid_container(attrs):
     return False
 
 
+def _strip_private_use(text):
+    """Drop every Unicode PRIVATE-USE code point (category ``Co``) from
+    ``text`` (AOS-151 security correction, round 2, R2-2).
+
+    A ``Co`` code point is an icon-font glyph — assigned per font, never
+    text — so it is removed outright rather than trusted to behave like a
+    character a page author could have typed (in particular, trusted to be
+    whitespace or to sit only where a container's flex/grid styling makes
+    it one). This runs before :class:`TableCollector`'s own whitespace
+    collapse, so a glyph removed from between two boundary spaces never
+    leaves a double space behind.
+
+    :param text: the raw, uncollapsed cell text.
+    :returns: ``text`` with every ``Co``-category character removed.
+    """
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Co")
+
+
 class TableCollector(HTMLParser):
     """Every <table> as a list of rows, each row a list of cell texts.
 
     A cell's text is its RENDERED text (AOS-151 security correction, round
     2, C1): comments contribute nothing, inline elements concatenate with no
     inserted space, block-level elements, ``<br>`` and flex/grid items
-    (:data:`_FLEX_GRID_CLASSES`) insert one boundary space, and whitespace
-    collapses to single spaces. Inside a cell an element stack tracks which
-    open element is a flex/grid container (its children are blockified) and
-    which ones must emit a boundary when they close; a per-tag count keeps
-    an end tag with no matching open element an O(1) no-op, so a flood of
-    stray end tags can never make each one rescan a deep stack."""
+    (:data:`_FLEX_GRID_CLASSES`) insert one boundary space, every Unicode
+    PRIVATE-USE code point (:func:`_strip_private_use`, round 2, R2-2) is
+    dropped, and whitespace collapses to single spaces. Inside a cell an
+    element stack tracks which open element is a flex/grid container (its
+    children are blockified) and which ones must emit a boundary when they
+    close; a per-tag count keeps an end tag with no matching open element an
+    O(1) no-op, so a flood of stray end tags can never make each one rescan
+    a deep stack."""
 
     def __init__(self):
         super().__init__()
@@ -334,10 +366,13 @@ class TableCollector(HTMLParser):
 
     def handle_endtag(self, tag):
         if tag in ("td", "th") and self._cell is not None:
-            # Collapse whitespace (any Unicode whitespace, as it always has)
-            # to single spaces and trim — the boundary spaces inserted above
-            # included.
-            self._row.append(" ".join("".join(self._cell).split()))
+            # Strip private-use glyphs (AOS-151 security correction, round
+            # 2, R2-2) BEFORE collapsing whitespace (any Unicode whitespace,
+            # as it always has) to single spaces and trimming — the
+            # boundary spaces inserted above included — so a glyph the
+            # strip removes never leaves a double space in the result.
+            text = _strip_private_use("".join(self._cell))
+            self._row.append(" ".join(text.split()))
             self._row.width += self._cell_span
             self._cell = None
         elif tag == "tr" and self._row is not None:
@@ -593,10 +628,14 @@ def _version_boundary_ok(text, pos):
     silently truncating ``4٫5`` to Opus 4. No punctuation is allowed: none of
     the committed page captures (tests/fixtures) has a rate-table model name
     followed by anything but end-of-cell or whitespace, so no legitimate
-    form needs an exception.
+    form needs an exception. A private-use icon glyph (category Co, such as
+    the live page's retired-model badge, U+E0F0) never reaches this check at
+    all — :class:`TableCollector` already dropped it (round 2, R2-2) — so it
+    can never itself force a refusal, and a genuine trailing whitespace
+    boundary is never obscured by a Co glyph sitting after it.
 
-    :param text: the row's name-cell text (rendered and collapsed to single
-        spaces by :class:`TableCollector`).
+    :param text: the row's name-cell text (rendered, private-use-stripped
+        and collapsed to single spaces by :class:`TableCollector`).
     :param pos: the index right after the matched version.
     :returns: ``True`` when the version is complete, else ``False``.
     """
@@ -632,10 +671,13 @@ def parse_models(html, skipped=None):
 
     :param html: the pricing page HTML.
     :param skipped: an optional list; each skipped model row is appended to
-        it as ``(family, version, row_number, cells, width, header_width,
-        name_text)`` — ``row_number`` is 1-based among the table's data rows
-        and ``name_text`` is the sanitized (:func:`_safe_error_text`) name
-        cell. :func:`run_update` renders them as SKIPPED-ROW warnings.
+        it as ``(family, version, row_number, cells, width, header_width)``
+        — ``row_number`` is 1-based among the table's data rows. No page
+        text (the row's name cell) is carried into this tuple, so nothing
+        page-controlled reaches the report the agent reads (AOS-151
+        security correction, R2-1); the row is identified by its family,
+        version and 1-based row index only. :func:`run_update` renders
+        these as SKIPPED-ROW warnings.
     :returns: the parsed entries, in page order.
     """
     tc = TableCollector()
@@ -685,8 +727,7 @@ def parse_models(html, skipped=None):
         width = getattr(row, "width", len(row))
         if len(row) != len(header) or width != len(header):
             skipped.append((m.group(1).lower(), m.group(2), row_number,
-                            len(row), width, len(header),
-                            _safe_error_text(row[0])))
+                            len(row), width, len(header)))
             continue
         condition = None
         dm = re.search(r"(through|starting)\s+([A-Z][a-z]+ [0-9]{1,2}, [0-9]{4})",
@@ -1142,7 +1183,9 @@ def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
         started yet.
     :param skipped_rows: :func:`parse_models`' ``skipped`` tuples — one
         SKIPPED-ROW WARNING line per model row whose width did not match
-        the header (AOS-151 security correction, round 2, C3).
+        the header (AOS-151 security correction, round 2, C3). The row is
+        identified only by its family, version and 1-based row index; no
+        page text reaches this report (AOS-151 security correction, R2-1).
     :returns: the report text.
     """
     out = ["| model prefix | in / out / cache-read / 5m-write / 1h-write"
@@ -1177,13 +1220,14 @@ def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
                 f" {name} are unchanged.")
 
     def _skipped_line(item):
-        fam, ver, row_number, cells, width, header_width, name_text = item
+        fam, ver, row_number, cells, width, header_width = item
         return (f"SKIPPED-ROW WARNING: Claude {fam.capitalize()} {ver}"
-                f" (rate-table row {row_number}: \"{name_text}\") — the row"
-                f" has {cells} cell(s) spanning {width} column(s) but the"
-                f" header has {header_width}; its rates were NOT read (never"
-                " shifted into other columns) and nothing was minted for it."
-                " Every other listed model was processed as usual.")
+                f" (skipped rate-table row {row_number}: its cell count/width"
+                f" does not match the header) — the row has {cells} cell(s)"
+                f" spanning {width} column(s) but the header has"
+                f" {header_width}; its rates were NOT read (never shifted"
+                " into other columns) and nothing was minted for it. Every"
+                " other listed model was processed as usual.")
 
     def _future_line(item):
         fam, ver, date = item

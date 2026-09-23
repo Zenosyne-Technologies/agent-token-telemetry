@@ -76,6 +76,11 @@ cell's text as follows:
 - A block-level element (`div`, `p`, `li`, headings, table parts, …, the list
   is `_BLOCK_TAGS`), a `<br>`, and a flex/grid item insert one boundary space,
   so `Claude Sonnet 5<br>1M-token` reads `Claude Sonnet 5 1M-token`.
+- Every Unicode private-use code point (category `Co` — an icon-font glyph,
+  never text, such as the retired-model badge's U+E0F0) is then stripped
+  outright, so a badge glyph can never glue onto a version regardless of
+  whether its container is recognized as a flex/grid item (AOS-151 round 2,
+  R2-2).
 - Whitespace then collapses to single spaces.
 
 A flex or grid container blockifies its children (CSS Display §2.7), and that
@@ -118,9 +123,10 @@ summed) must both equal the header's cell count. A model row that does not
 
 - its rates are never read, so they are never shifted into other columns
 - every other model on the page is still recorded
-- the report prints a `SKIPPED-ROW WARNING` naming the model, its rate-table
-  row number and its sanitized name-cell text; these lines are capped at
-  `WARNING_CAP` like the other warning categories
+- the report prints a `SKIPPED-ROW WARNING` naming the model (family and
+  version) and its 1-based rate-table row number only — no page-controlled
+  name-cell text reaches the report (AOS-151 round 2, R2-1); these lines are
+  capped at `WARNING_CAP` like the other warning categories
 
 The order of checks is: model name, then version boundary, then width. So a row
 with no model name at all (the live page's "Additional models" divider) is
