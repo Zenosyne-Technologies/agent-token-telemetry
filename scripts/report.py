@@ -84,15 +84,27 @@ def md_cell(value):
     characters that would break the table structure or bleed formatting
     into the surrounding document, strip leading markdown control
     characters, and cap length so one hostile value can't blow up the
-    render."""
+    render.
+
+    Backslashes are escaped BEFORE pipes, so every ``|`` in the result is
+    preceded by an odd number of backslashes. A GFM table-row scanner reads
+    a backslash plus the next character as one escaped pair: escaping only
+    the pipe would turn an input backslash-pipe into backslash-backslash-
+    pipe — an escaped backslash followed by a REAL cell delimiter that
+    splits the cell (mid-code-span, too). Outside a code span a doubled
+    backslash renders as one; inside one it shows as two (code spans take
+    backslashes literally) — cosmetic, never structural. The length cap
+    applies to the content before escaping, so an escape pair is never cut
+    in half."""
     s = str(value)
     s = re.sub(r"[\r\n\t  ]+", " ", s)
     s = re.sub(r"[\x00-\x1f\x7f‪-‮⁦-⁩]", "", s)
     s = s.lstrip("#>-*+= ")
-    s = s.replace("|", "\\|").replace("`", "'")
-    if len(s) > MD_CELL_MAX:
-        s = s[:MD_CELL_MAX] + "…"
-    return s
+    cut = len(s) > MD_CELL_MAX
+    if cut:
+        s = s[:MD_CELL_MAX]
+    s = s.replace("\\", "\\\\").replace("|", "\\|").replace("`", "'")
+    return s + "…" if cut else s
 
 
 def resolved_subquery(expr):

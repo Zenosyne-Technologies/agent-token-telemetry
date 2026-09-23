@@ -14,6 +14,7 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 import capture
 import pricing_update
+import report
 
 TODAY = datetime.date(2026, 9, 23)
 D = int(datetime.datetime(2026, 9, 22, tzinfo=datetime.timezone.utc).timestamp())
@@ -336,6 +337,8 @@ class TestRefusal(Base):
         _, out = self.f.cli("--backfill-plan")
         self.assertIn("Refused", out)
         self.assertNotIn("Backfill available", out)
+        self.assertTrue(out.startswith(
+            "No backfill can be offered — 1 candidate(s) refused:"), out)
 
     def test_apply_writes_nothing(self):
         rows, res = self.f.pricing_rows(), self.f.resolved()
@@ -492,6 +495,473 @@ class TestCrossBundleSafetyNet(Base):
         self.assertIn("ROLLED BACK", cm.exception.args[0])
         self.assertIn("resolved differently", cm.exception.args[0])
         self.assertEqual(self.f.pricing_rows(), rows)
+
+
+def gfm_row_cells(line):
+    """Split one markdown table row into cells by the GFM table-row rules
+    (cmark-gfm's cell scanner, which marked's table tokenizer mirrors),
+    written independently of the code under test: a backslash and the
+    character after it are ONE escaped pair and never a delimiter; an
+    unescaped ``|`` ends a cell; leading/trailing pipes are optional; each
+    cell is trimmed and a backslash-pipe then unescaped to ``|`` (left to
+    right, as both renderers do) BEFORE inline (code-span) parsing."""
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    cells, cur, i = [], [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            cur.append(s[i:i + 2])
+            i += 2
+        elif s[i] == "|":
+            cells.append("".join(cur))
+            cur, i = [], i + 1
+        else:
+            cur.append(s[i])
+            i += 1
+    if "".join(cur).strip():
+        cells.append("".join(cur))
+    return [c.strip().replace("\\|", "|") for c in cells]
+
+
+def code_spans(text):
+    """CommonMark code spans of one inline run: ``(inside, outside)`` —
+    the list of code-span contents, and the text outside every span. A
+    backslash-escaped character outside a span is literal (an escaped
+    backtick opens nothing); a backtick run opens a span only when a run of
+    the SAME length closes it, else it is literal."""
+    inside, outside, i = [], [], 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            outside.append(text[i:i + 2])
+            i += 2
+            continue
+        if ch != "`":
+            outside.append(ch)
+            i += 1
+            continue
+        j = i
+        while j < len(text) and text[j] == "`":
+            j += 1
+        n, k, close = j - i, j, -1
+        while k < len(text):
+            if text[k] != "`":
+                k += 1
+                continue
+            m = k
+            while m < len(text) and text[m] == "`":
+                m += 1
+            if m - k == n:
+                close = k
+                break
+            k = m
+        if close < 0:
+            outside.append(text[i:j])
+            i = j
+        else:
+            inside.append(text[j:close])
+            i = close + n
+    return inside, "".join(outside)
+
+
+def gfm_tables(md):
+    """Every table in ``md`` as ``(header_cells, [row_cells, ...])`` — a
+    table starts at a ``|`` line followed by a ``|---`` delimiter line and
+    runs while lines start with ``|`` (the plan/apply renderers' shape)."""
+    lines, out, i = md.splitlines(), [], 0
+    while i < len(lines):
+        if (lines[i].startswith("|") and i + 1 < len(lines)
+                and lines[i + 1].startswith("|---")):
+            head, rows, i = gfm_row_cells(lines[i]), [], i + 2
+            while i < len(lines) and lines[i].startswith("|"):
+                rows.append(gfm_row_cells(lines[i]))
+                i += 1
+            out.append((head, rows))
+        else:
+            i += 1
+    return out
+
+
+class GfmAssertions:
+    """Structural checks of rendered backfill markdown against hostile
+    names: every table row keeps the header's column count, no injection
+    marker ever appears OUTSIDE a code span (so no bold/link/heading text
+    can activate), and every marker the output carries sits inside one."""
+
+    MARK = "INJ"
+
+    def assert_structurally_safe(self, md, expect_markers=()):
+        tables = gfm_tables(md)
+        self.assertTrue(tables, md)
+        spans_all = []
+        for head, rows in tables:
+            for row in rows:
+                self.assertEqual(len(row), len(head), (head, row))
+                for cell in row:
+                    inside, outside = code_spans(cell)
+                    self.assertNotIn(self.MARK, outside, cell)
+                    self.assertNotIn("`", outside, cell)
+                    spans_all += inside
+        for line in md.splitlines():
+            if not line.startswith("|"):
+                inside, outside = code_spans(line)
+                self.assertNotIn(self.MARK, outside, line)
+                spans_all += inside
+        for m in expect_markers:
+            self.assertTrue(any(m in sp for sp in spans_all),
+                            f"{m} not inside any code span")
+        return spans_all
+
+
+class TestMdCellGfm(unittest.TestCase, GfmAssertions):
+    """report.md_cell (shared by every report and by the backfill's
+    _mdname): a value can never add, remove or split a GFM table cell,
+    in a code span or in plain text."""
+
+    HOSTILE = [
+        "a \\| **INJ1** \\| b", "a \\\\| **INJ2** |", "a \\\\\\| INJ3",
+        "a | INJ4 | b", "a `**INJ5**` b", "``INJ6``", "a\n| INJ7 | x |",
+        "trailing \\", "\\", "\\|", "|", "a [INJ8](https://e.test)",
+        "x" * 119 + "\\|INJ9", "x" * 119 + "|", "x" * 120 + "\\",
+    ]
+
+    def test_backslash_escaped_before_pipe(self):
+        self.assertEqual(report.md_cell("a\\|b"), "a\\\\\\|b")
+        self.assertEqual(report.md_cell("a|b"), "a\\|b")
+        self.assertEqual(report.md_cell("a\\b"), "a\\\\b")
+
+    def test_every_hostile_value_keeps_the_row_shape(self):
+        for v in self.HOSTILE:
+            cell = report.md_cell(v)
+            for row in (f"| `{cell}` | {cell} | end |",
+                        f"| {cell} | `{cell}` | end |"):
+                cells = gfm_row_cells(row)
+                self.assertEqual(len(cells), 3, (v, row, cells))
+                self.assertEqual(cells[2], "end", (v, row))
+            inside, outside = code_spans(gfm_row_cells(f"| `{cell}` |")[0])
+            self.assertEqual((len(inside), outside), (1, ""), (v, cell))
+
+    def test_cap_never_splits_an_escape_pair(self):
+        out = report.md_cell("x" * 119 + "\\|tail")
+        self.assertTrue(out.endswith("…"), out)
+        self.assertEqual(len(gfm_row_cells(f"| `{out}` | end |")), 2, out)
+
+
+HOSTILE_MODELS = [
+    "claude-opus-5-5 \\| **INJA bold** \\| x",      # the validator repro
+    "claude-opus-5-5 \\\\| **INJB** |",
+    "claude-opus-5-5 ` **INJC** `",
+    "claude-opus-5-5\n| INJD | fake | row |",
+    "claude-opus-5-5 **INJE**",
+    "claude-opus-5-5 [INJF](https://e.test)",
+    "claude-opus-5-5 INJG trailing \\",
+    "claude-opus-5-5 | INJH plain pipe",
+]
+HOSTILE_PREFIX = "claude-sonnet-9 \\| **INJP** [INJQ](https://e.test)"
+HOSTILE_SUCC = "claude-fable-5-5-\\| **INJR** [INJS](https://e.test) \\|"
+HOSTILE_OWN = "claude-haiku-5-1 \\| **INJT** \\| [INJU](https://e.test)"
+
+
+class TestHostileNamesRender(Base, GfmAssertions):
+    """F1: hostile model names and pricing prefixes — pipes, backslash-
+    pipes, backticks, newlines, bold, links — through the plan table, the
+    requires cell, the apply table and every refusal, parsed by the GFM
+    rules above: no row changes shape and nothing escapes its code span."""
+
+    def setUp(self):
+        super().setUp()
+        f = self.f
+        f.price("claude-opus-", FAM_OPUS, D - 30 * DAY)
+        f.price("claude-opus-5-5", OPUS_55, D + 20 * DAY)
+        for i, n in enumerate(HOSTILE_MODELS):
+            f.event(n, D + DAY + i * 60)
+        # hostile PREFIX offered as a candidate
+        f.price("claude-sonnet-", FAM_OPUS, D - 30 * DAY)
+        f.price(HOSTILE_PREFIX, OPUS_55, D + 20 * DAY)
+        f.event(HOSTILE_PREFIX + " tail", D + 2 * DAY)
+        # hostile successor prefix inside a "requires" cell
+        f.price("claude-fable-", FAM_OPUS, D - 30 * DAY)
+        f.price("claude-fable-5", OPUS_55, D + 20 * DAY)
+        f.price(HOSTILE_SUCC, (2.0, 10.0, 0.2, 2.5, 4.0), D + 20 * DAY)
+        f.event("claude-fable-5", D + DAY)
+        f.event(HOSTILE_SUCC + "x", D + 3 * DAY)
+        # hostile own-priced event in a REFUSED candidate's reason
+        f.price("claude-haiku-", FAM_OPUS, D - 30 * DAY)
+        f.price("claude-haiku-5", FAM_OPUS, D - 20 * DAY)
+        f.price("claude-haiku-5-1", OPUS_55, D + 20 * DAY)
+        f.event("claude-haiku-5-1", D + DAY)
+        f.event(HOSTILE_OWN, D + DAY + 5)
+
+    def test_plan_tables_keep_shape_and_names_stay_in_code_spans(self):
+        plan = self.f.plan()
+        self.assertEqual({c["prefix"] for c in plan["refused"]},
+                         {"claude-haiku-5-1"})
+        fable = [c for c in plan["candidates"]
+                 if c["prefix"] == "claude-fable-5"]
+        self.assertEqual(fable[0]["requires"], [HOSTILE_SUCC])
+        code, md = self.f.cli("--backfill-plan")
+        self.assertEqual(code, 0)
+        self.assert_structurally_safe(md, expect_markers=[
+            "INJA", "INJB", "INJC", "INJD", "INJE", "INJF", "INJG", "INJH",
+            "INJP", "INJQ", "INJR", "INJS", "INJT", "INJU"])
+        # the requires cell itself: the hostile successor is one code span
+        row = next(r for _h, rows in gfm_tables(md) for r in rows
+                   if r[0].startswith("`claude-fable-5` — requires"))
+        inside, outside = code_spans(row[0])
+        self.assertEqual(len(inside), 2, row[0])
+        self.assertIn("INJR", inside[1])
+
+    def test_apply_table_and_refusals_stay_structurally_safe(self):
+        _, js = self.f.cli("--backfill-plan", "--json")
+        data = json.loads(js)
+        offered = [c["prefix"] for c in data["candidates"]
+                   + data["confirm_only"]]
+        code, out = self.f.cli("--backfill-apply", *offered)
+        self.assertEqual(code, 0, out)
+        self.assert_structurally_safe(out, expect_markers=[
+            "INJA", "INJH", "INJP", "INJR"])
+        # refused + unknown hostile prefix: plain list lines, no table
+        code, out = self.f.cli("--backfill-apply", "claude-haiku-5-1",
+                               "claude-bogus \\| **INJV** `x`")
+        self.assertEqual(code, 1)
+        for line in out.splitlines():
+            self.assertNotIn(self.MARK, code_spans(line)[1], line)
+        self.assertIn("INJT", out)
+        self.assertIn("INJV", out)
+
+
+class TestBundleClosure(Base):
+    """F2/F3 pinned on the shared-prefix fixture: backfilling the
+    predecessor alone would leave the successor's event on an ANCESTOR row
+    (still an estimate), so the predecessor is offered only as a bundle with
+    the successor, its row shows the bundle's combined figures, and an apply
+    that names it without the successor is refused, writing nothing."""
+
+    FAM = (6.0, 30.0, 0.6, 7.5, 12.0)
+
+    def setUp(self):
+        super().setUp()
+        self.f.price("claude-opus-", self.FAM, D - 30 * DAY)
+        self.f.price("claude-opus-5", FAM_OPUS, D + 5 * DAY)
+        self.f.price("claude-opus-5-5", OPUS_55, D + 10 * DAY)
+        self.e5 = self.f.event("claude-opus-5", D + 60)
+        self.e55 = self.f.event("claude-opus-5-5", D + 2 * DAY)
+
+    def by(self):
+        return {c["prefix"]: c for c in self.f.plan()["candidates"]}
+
+    def test_predecessor_requires_successor(self):
+        by = self.by()
+        self.assertEqual(by["claude-opus-5"]["requires"], ["claude-opus-5-5"])
+        self.assertEqual(by["claude-opus-5-5"]["requires"], [])
+
+    def test_bundle_row_carries_the_bundles_combined_figures(self):
+        c5 = self.by()["claude-opus-5"]
+        fam, own5, own55 = (ev_cost(self.FAM), ev_cost(FAM_OPUS),
+                            ev_cost(OPUS_55))
+        self.assertAlmostEqual(c5["cost_now"], 2 * fam)
+        # the successor's event lands on ITS OWN row inside the bundle —
+        # the solo figure would have priced it at the predecessor's rate
+        self.assertAlmostEqual(c5["cost_after"], own5 + own55)
+        self.assertAlmostEqual(c5["delta"], own5 + own55 - 2 * fam)
+        per = {m["model"]: m["cost_after"] for m in c5["models"]}
+        self.assertAlmostEqual(per["claude-opus-5-5"], own55)
+        _, md = self.f.cli("--backfill-plan")
+        self.assertIn("| `claude-opus-5` — requires `claude-opus-5-5`"
+                      " (applied together) |", md)
+        self.assertIn(f"${2 * fam:,.2f} → ${own5 + own55:,.2f}", md)
+
+    def test_combined_total_equals_the_real_apply_of_everything(self):
+        plan = self.f.plan()
+        cb = plan["combined"]
+        self.assertIsNotNone(cb)
+        fam, own5, own55 = (ev_cost(self.FAM), ev_cost(FAM_OPUS),
+                            ev_cost(OPUS_55))
+        self.assertAlmostEqual(cb["cost_now"], 2 * fam)
+        self.assertAlmostEqual(cb["cost_after"], own5 + own55)
+        self.assertEqual(cb["events"], 2)
+        _, md = self.f.cli("--backfill-plan")
+        self.assertIn(f"If you apply everything offered: ${2 * fam:,.2f} →"
+                      f" ${own5 + own55:,.2f} (-${2 * fam - own5 - own55:,.2f}).",
+                      md)
+        self.f.apply("claude-opus-5", "claude-opus-5-5")
+        rates = {"claude-opus-5": FAM_OPUS, "claude-opus-5-5": OPUS_55}
+        real = sum(ev_cost(rates[p]) for p, _eff in self.f.resolved().values())
+        self.assertAlmostEqual(real, cb["cost_after"])
+
+    def test_apply_predecessor_alone_is_refused_naming_the_successor(self):
+        rows, res = self.f.pricing_rows(), self.f.resolved()
+        with self.assertRaises(pricing_update.BackfillRefused) as cm:
+            self.f.apply("claude-opus-5")
+        msg = cm.exception.args[0]
+        self.assertIn("not closed under the own-row requirement", msg)
+        self.assertIn("`claude-opus-5` requires `claude-opus-5-5`", msg)
+        self.assertEqual(self.f.pricing_rows(), rows)
+        self.assertEqual(self.f.resolved(), res)
+        code, out = self.f.cli("--backfill-apply", "claude-opus-5")
+        self.assertEqual(code, 1)
+        self.assertIn("not closed", out)
+
+    def test_post_apply_estimate_check_rolls_back_on_its_own(self):
+        # fault injection: with the closure computation disabled the
+        # predecessor claims to stand alone, passes the requires check and
+        # the resolved-row verification — only the post-apply est=0 check
+        # (every impacted event now OWN-priced) can catch it
+        orig = pricing_update._close_bundles
+        pricing_update._close_bundles = lambda sh, cands: None
+        self.addCleanup(setattr, pricing_update, "_close_bundles", orig)
+        rows = self.f.pricing_rows()
+        with self.assertRaises(pricing_update.BackfillRefused) as cm:
+            self.f.apply("claude-opus-5")
+        self.assertIn("ROLLED BACK", cm.exception.args[0])
+        self.assertIn("1 event(s) still estimated after apply",
+                      cm.exception.args[0])
+        self.assertEqual(self.f.pricing_rows(), rows)
+
+
+class TestTransitiveClosure(Base):
+    """A 3-level chain: claude-opus-5-5-1's events are reachable only via
+    claude-opus-5-5, so the predecessor's bundle must grow TRANSITIVELY."""
+
+    def setUp(self):
+        super().setUp()
+        f = self.f
+        f.price("claude-opus-", FAM_OPUS, D - 30 * DAY)
+        self.rates = {"claude-opus-5": (5.0, 0, 0, 0, 0),
+                      "claude-opus-5-5": (3.0, 0, 0, 0, 0),
+                      "claude-opus-5-5-1": (1.0, 0, 0, 0, 0)}
+        for p, r in self.rates.items():
+            f.price(p, r, D + 40 * DAY)
+        for m, t in [("claude-opus-5", D + 10 * DAY + 60),
+                     ("claude-opus-5", D + 12 * DAY),
+                     ("claude-opus-5-5", D + 60),
+                     ("claude-opus-5-5", D + 11 * DAY),
+                     ("claude-opus-5-5-1", D + 5 * DAY)]:
+            f.event(m, t)
+
+    def test_requires_is_the_transitive_closure(self):
+        by = {c["prefix"]: c for c in self.f.plan()["candidates"]}
+        self.assertEqual(by["claude-opus-5"]["requires"],
+                         ["claude-opus-5-5", "claude-opus-5-5-1"])
+        self.assertEqual(by["claude-opus-5-5"]["requires"],
+                         ["claude-opus-5-5-1"])
+        self.assertEqual(by["claude-opus-5-5-1"]["requires"], [])
+
+    def test_unclosed_subset_refused_closed_set_leaves_nothing_estimated(self):
+        rows = self.f.pricing_rows()
+        with self.assertRaises(pricing_update.BackfillRefused) as cm:
+            self.f.apply("claude-opus-5", "claude-opus-5-5")
+        self.assertIn("requires `claude-opus-5-5-1`", cm.exception.args[0])
+        self.assertEqual(self.f.pricing_rows(), rows)
+        self.f.apply("claude-opus-5", "claude-opus-5-5", "claude-opus-5-5-1")
+        names = dict(self.f.conn.execute(
+            "SELECT e.rowid, m.name FROM events e JOIN models m"
+            " ON m.id = e.model_id"))
+        for ev, (prefix, _eff) in self.f.resolved().items():
+            self.assertEqual(prefix, names[ev])   # every event own-priced
+
+
+class TestUnclosable(Base):
+    """A successor with no own row anywhere: the predecessor's backfill
+    would leave it on an ancestor row, and no candidate can close it —
+    refused (never offered), the reason naming the blocking model."""
+
+    def setUp(self):
+        super().setUp()
+        self.f.price("claude-opus-", FAM_OPUS, D - 30 * DAY)
+        self.f.price("claude-opus-5", OPUS_55, D + 20 * DAY)
+        self.f.event("claude-opus-5", D + DAY)
+        self.f.event("claude-opus-5-9", D + 2 * DAY)
+
+    def test_refused_not_offered_with_the_blocking_model_named(self):
+        c = self.only(self.f.plan(), "refused")
+        self.assertEqual(c["prefix"], "claude-opus-5")
+        self.assertEqual(c["refused_models"]["unclosable"],
+                         {"claude-opus-5-9": 1})
+        self.assertIn("no closing backfill for their own row:"
+                      " claude-opus-5-9 (1)", c["refused"])
+        _, md = self.f.cli("--backfill-plan")
+        self.assertTrue(md.startswith(
+            "No backfill can be offered — 1 candidate(s) refused:"), md)
+        self.assertIn("- `claude-opus-5` (window 2026-09-23 → 2026-09-24):"
+                      " would leave estimated events with no closing backfill"
+                      " for their own row: `claude-opus-5-9` (1)", md)
+        self.assertNotIn("If you apply everything offered", md)
+
+    def test_apply_refused_writes_nothing(self):
+        rows, res = self.f.pricing_rows(), self.f.resolved()
+        with self.assertRaises(pricing_update.BackfillRefused) as cm:
+            self.f.apply("claude-opus-5")
+        self.assertIn("no closing backfill for their own row:"
+                      " `claude-opus-5-9` (1)", cm.exception.args[0])
+        self.assertEqual(self.f.pricing_rows(), rows)
+        self.assertEqual(self.f.resolved(), res)
+
+
+class TestRefusedCloser(Base):
+    """The only candidate that could close the predecessor is itself
+    refused (it would re-price an own-priced event), so the predecessor is
+    unclosable too: a refused candidate never closes a bundle."""
+
+    def test_predecessor_refused_when_its_closer_is_refused(self):
+        self.f.price("claude-opus-", FAM_OPUS, D - 30 * DAY)
+        self.f.price("claude-opus-5", (5.0, 0, 0, 0, 0), D + 20 * DAY)
+        self.f.price("claude-opus-5-5", (3.0, 0, 0, 0, 0), D + 30 * DAY)
+        self.f.event("claude-opus-5", D + DAY)
+        self.f.event("claude-opus-5-5", D + 2 * DAY)
+        self.f.event("claude-opus-5-5x", D + 25 * DAY)   # own-priced by -5
+        plan = self.f.plan()
+        self.assertEqual((plan["candidates"], plan["confirm_only"]), ([], []))
+        by = {c["prefix"]: c for c in plan["refused"]}
+        self.assertEqual(by["claude-opus-5-5"]["refused_models"]["own"],
+                         {"claude-opus-5-5x": 1})
+        self.assertEqual(by["claude-opus-5"]["refused_models"]["unclosable"],
+                         {"claude-opus-5-5": 1})
+        self.assertIsNone(plan["combined"])
+
+
+class TestShownFiguresReconcile(Base):
+    """F3 LOW: every displayed "now → after (delta)" triple subtracts
+    exactly — the delta is the difference of the DISPLAYED totals."""
+
+    def test_usd_change_uses_the_displayed_totals(self):
+        chg = pricing_update._usd_change
+        self.assertEqual(chg(6450.372261, 6177.905747),
+                         ("$6,450.37", "$6,177.91", "-$272.46"))
+        self.assertEqual(chg(0.0012, 0.0005), ("$0.0012", "$0.0005", "-$0.0007"))
+        self.assertEqual(chg(1.0, 1.0), ("$1.00", "$1.00", "$0.00"))
+        self.assertEqual(chg(0.30, 0.29), ("$0.30", "$0.29", "-$0.01"))
+
+    def test_usd_change_reconciles_over_a_sweep(self):
+        import decimal
+        import random
+        rnd = random.Random(136)
+
+        def dec(t):
+            return decimal.Decimal(t.replace("$", "").replace(",", ""))
+        for _ in range(5000):
+            now = rnd.choice([rnd.uniform(0, 0.02), rnd.uniform(0, 10_000)])
+            after = rnd.choice([rnd.uniform(0, 0.02), rnd.uniform(0, 10_000)])
+            n, a, d = pricing_update._usd_change(now, after)
+            self.assertEqual(dec(a) - dec(n), dec(d), (now, after, n, a, d))
+
+    def test_plan_and_apply_lines_reconcile_where_rounding_used_to_differ(self):
+        # now 2,469,200 input tokens: $12.346 -> shown $12.35; after at
+        # $4.10/M: $10.12372 -> shown $10.12. The unrounded delta -2.22228
+        # rounds to -$2.22; the SHOWN figures subtract to -$2.23.
+        own = (4.1, 20.0, 0.2, 5.0, 8.0)
+        self.f.price("claude-opus-", FAM_OPUS, D - 30 * DAY)
+        self.f.price("claude-opus-5-5", own, D + DAY)
+        self.f.event("claude-opus-5-5", D + 60, tok=(2_469_200, 0, 0, 0, 0))
+        _, md = self.f.cli("--backfill-plan")
+        self.assertIn("($12.35 → $10.12, -$2.23)", md)
+        self.assertIn("| $12.35 → $10.12 | **-$2.23** |", md)
+        self.assertIn("If you apply everything offered: $12.35 → $10.12"
+                      " (-$2.23).", md)
+        self.assertNotIn("2.22", md)
+        _, out = self.f.cli("--backfill-apply", "claude-opus-5-5")
+        self.assertIn("| $12.35 → $10.12 | **-$2.23** |", out)
 
 
 class TestHumanSpan(unittest.TestCase):

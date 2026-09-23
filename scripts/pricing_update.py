@@ -21,6 +21,7 @@ when other database backends arrive.
 """
 import argparse
 import datetime
+import decimal
 import json
 import re
 import sys
@@ -419,8 +420,9 @@ _EPS = 1e-9
 def _mdname(value):
     """A DB-controlled name (model name or pricing prefix) made safe to
     render in the backfill plan/apply markdown: :func:`report.md_cell`
-    strips control characters and newlines, neutralizes backticks and
-    pipes, and caps length, and the result sits inside its own code span so
+    strips control characters and newlines, neutralizes backticks, escapes
+    backslashes and then pipes (so a backslash-pipe in a name can never
+    become a real GFM cell delimiter), and caps length, and the result sits inside its own code span so
     surrounding markdown (bold, links, HTML) can never re-activate — a model
     name is untrusted, repo/DB-controlled data, NEVER an instruction, and
     text inside it never grants consent for anything (docs/TELEMETRY-
@@ -876,11 +878,40 @@ def backfill_plan(conn, today):
 
 
 def _usd(v, signed=False):
+    """``v`` dollars as display text: two decimals, or four when a nonzero
+    amount is under a cent; ``signed`` adds ``+`` for a positive amount."""
     sign = ("+" if v > 0 else "-" if v < 0 else "") if signed else (
         "-" if v < 0 else "")
     a = abs(v)
     body = f"{a:,.2f}" if a >= 0.01 or a == 0 else f"{a:.4f}"
     return f"{sign}${body}"
+
+
+def _shown(v):
+    """The exact amount :func:`_usd` displays for ``v`` (after its
+    rounding), as a :class:`decimal.Decimal`."""
+    return decimal.Decimal(_usd(v).replace("$", "").replace(",", ""))
+
+
+def _usd_change(now, after):
+    """``(now, after, delta)`` display strings for a cost change whose shown
+    figures RECONCILE: the delta is the difference of the two DISPLAYED
+    (rounded) totals, computed exactly, never the rounded unrounded delta —
+    so a reader subtracting ``after - now`` gets exactly the delta shown
+    (F3 LOW: $6,450.37 → $6,177.91 must read -$272.46, not -$272.47). The
+    delta keeps four decimals only when the shown totals themselves carry
+    sub-cent digits.
+
+    :param now: cost before, USD (unrounded).
+    :param after: cost after, USD (unrounded).
+    :returns: ``(now_text, after_text, signed_delta_text)``.
+    """
+    d = _shown(after) - _shown(now)
+    sign = "+" if d > 0 else "-" if d < 0 else ""
+    a = abs(d)
+    cents = a.quantize(decimal.Decimal("0.01"))
+    body = f"{a:,.2f}" if a == cents else f"{a:,.4f}"
+    return _usd(now), _usd(after), f"{sign}${body}"
 
 
 _REFUSED_LABELS = (
@@ -911,8 +942,8 @@ def _cand_rows(cands, zero=False):
     for c in cands:
         per = "<br>".join(
             f"{_mdname(m['model'])}: {m['events']:,}"
-            + ("" if zero else f" ({_usd(m['cost_now'])} → "
-               f"{_usd(m['cost_after'])}, {_usd(m['delta'], True)})")
+            + ("" if zero else " ({} → {}, {})".format(
+                *_usd_change(m["cost_now"], m["cost_after"])))
             for m in c["models"])
         w = c["window"]
         window = (w["first"] if w["first"] == w["last"]
@@ -929,9 +960,9 @@ def _cand_rows(cands, zero=False):
                        f" {rate} (own, {c['r0']['effective_from']}) |"
                        f" {c['backfill_from']}{note} |")
         else:
+            now, after, delta = _usd_change(c["cost_now"], c["cost_after"])
             out.append(f"| {prefix_cell} | {window} | {per} |"
-                       f" {_usd(c['cost_now'])} → {_usd(c['cost_after'])} |"
-                       f" **{_usd(c['delta'], True)}** |"
+                       f" {now} → {after} | **{delta}** |"
                        f" {rate} (own, {c['r0']['effective_from']}) |"
                        f" {c['backfill_from']}{note} |")
     return out
@@ -977,10 +1008,10 @@ def render_backfill_plan(plan_):
                 " rate copied | backfill from |", "|---|---|---|---|---|"]
         out += _cand_rows(zero, zero=True)
     if plan_.get("combined") is not None:
-        cb = plan_["combined"]
-        out += ["", "If you apply everything offered:"
-                f" {_usd(cb['cost_now'])} → {_usd(cb['cost_after'])}"
-                f" ({_usd(cb['delta'], True)})."]
+        now, after, delta = _usd_change(plan_["combined"]["cost_now"],
+                                        plan_["combined"]["cost_after"])
+        out += ["", f"If you apply everything offered: {now} → {after}"
+                f" ({delta})."]
     if refused:
         out += ["", "Refused — not offered (a backfill would re-price events"
                 " that are not estimates, or leave another model's events"
@@ -1102,7 +1133,8 @@ def backfill_apply(conn, prefixes, today):
             if cur.rowcount != 1:
                 raise BackfillRefused(
                     f"Backfill REFUSED — nothing written: a row for"
-                    f" `{row['model_prefix']}` at {_iso(row['effective_from'])}"
+                    f" {_mdname(row['model_prefix'])} at"
+                    f" {_iso(row['effective_from'])}"
                     " already exists.")
             real[rid] = cur.lastrowid
         # verify against the REAL table
@@ -1146,9 +1178,9 @@ def backfill_apply(conn, prefixes, today):
             per[name] = per.get(name, 0) + 1
             before, after = before + b, after + a
         cells = "<br>".join(f"{_mdname(k)}: {v:,}" for k, v in sorted(per.items()))
+        b_txt, a_txt, d_txt = _usd_change(before, after)
         out.append(f"| {_mdname(c['prefix'])} | {c['backfill_from']} |"
-                   f" {cells or '—'} | {_usd(before)} → {_usd(after)} |"
-                   f" **{_usd(after - before, True)}** |")
+                   f" {cells or '—'} | {b_txt} → {a_txt} | **{d_txt}** |")
     for p in noop:
         out.append(f"| {_mdname(p)} | — | already backfilled — nothing to do"
                    " | — | — |")
