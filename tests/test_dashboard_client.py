@@ -377,33 +377,55 @@ class TestPriceWarnStaticMarkupAndCSS(unittest.TestCase):
     the initial ``hidden`` state has to be asserted on the markup the server
     actually ships, before any client-side render runs."""
 
-    CSS_CLASSES = ("price-warn", "price-warn-group")
+    # Whitespace-tolerant: collapses any run of whitespace (including
+    # newlines) to a single space before matching, so reformatting the
+    # guard rule across lines or re-indenting it does not break this test.
+    GUARD_RE = re.compile(
+        r"#price-warn\s*\[\s*hidden\s*\]\s*,\s*#price-warn\s+\[\s*hidden\s*\]"
+        r"\s*\{\s*display\s*:\s*none\s*!important\s*;?\s*\}"
+    )
 
-    def test_banner_and_group_display_only_set_under_not_hidden(self):
-        # C1/C2: an unconditional `display` rule for .price-warn or
-        # .price-warn-group would override the `hidden` attribute's UA
-        # default, and the banner (or a group within it) could never truly
-        # hide — see dashboard.html's "PRICE WARNING" comment block.
+    def test_id_guard_beats_any_display_override(self):
+        # D8b/D9/D11/D12: a static class-based check (the old version of
+        # this test) can be defeated by an id selector or an inline
+        # style="display:…" — neither is `.price-warn`/`.price-warn-group`,
+        # so it never appears in a class-based pattern, yet both can still
+        # override `hidden`. Instead, assert the page ships ONE guard rule
+        # that beats every one of those routes on its own terms: an
+        # `!important` declaration on #price-warn[hidden] and its hidden
+        # descendants always wins the cascade over a later selector (any
+        # specificity), an id selector, or a non-important inline style —
+        # see dashboard.html's "PRICE WARNING" comment block.
         source = DASHBOARD_HTML.read_text()
-        m = re.search(r"<style>(.*?)</style>", source, re.S)
-        self.assertIsNotNone(m, "no <style> block in dashboard.html")
-        style = m.group(1)
-        rules = re.findall(r"([^{}]+)\{([^{}]*)\}", style)
-        for cls in self.CSS_CLASSES:
-            bare = re.compile(r"\." + re.escape(cls) + r"(?![\w-])")
-            guarded = re.compile(r"\." + re.escape(cls) + r"(?![\w-]):not\(\[hidden\]\)")
-            display_selectors = [
-                sel.strip()
-                for sel_group, body in rules if "display" in body
-                for sel in sel_group.split(",")
-                if bare.search(sel.strip())
-            ]
-            self.assertTrue(display_selectors,
-                             f".{cls}: no CSS rule sets `display` for it at all")
-            for sel in display_selectors:
-                self.assertRegex(
-                    sel, guarded,
-                    f".{cls}: display rule {sel!r} is not guarded by :not([hidden])")
+        style_blocks = re.findall(r"<style>(.*?)</style>", source, re.S)
+        self.assertTrue(style_blocks, "no <style> block in dashboard.html")
+
+        guard_hits = sum(len(self.GUARD_RE.findall(block)) for block in style_blocks)
+        self.assertEqual(
+            guard_hits, 1,
+            "expected exactly one "
+            "`#price-warn[hidden], #price-warn [hidden]{display:none !important;}` "
+            "guard rule across all <style> blocks")
+
+        # (b) no OTHER rule, anywhere, sets `display` with `!important` on a
+        # selector that mentions price-warn: a second !important rule could
+        # itself win a later cascade tie-break (author order) against the
+        # guard, undoing the guarantee above. `price-warn` is checked as a
+        # substring so this catches the id and every class variant alike.
+        rule_re = re.compile(r"([^{}]+)\{([^{}]*)\}")
+        for block in style_blocks:
+            for sel_group, body in rule_re.findall(block):
+                rule_text = f"{sel_group}{{{body}}}"
+                if self.GUARD_RE.search(re.sub(r"\s+", " ", rule_text)):
+                    continue  # the guard rule itself
+                if "display" not in body or "!important" not in body:
+                    continue
+                for sel in sel_group.split(","):
+                    self.assertNotIn(
+                        "price-warn", sel,
+                        f"unexpected extra !important display rule on "
+                        f"{sel.strip()!r} — only the guard rule may use "
+                        f"!important on a price-warn selector")
 
     def test_banner_ships_hidden_before_any_render(self):
         # C3: the server-rendered markup must carry `hidden` on #price-warn

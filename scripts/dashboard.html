@@ -156,6 +156,13 @@
   .price-warn-model{font-weight:600;color:var(--ink);overflow-wrap:anywhere;}
   .price-warn-id{font-family:var(--font-mono);font-size:.82em;color:var(--ink-2);
     overflow-wrap:anywhere;}
+  /* Belt-and-suspenders: an id selector (this page already styles some
+     elements by id, e.g. #tfoot-l) or an inline style="display:…" on the
+     banner or a group would otherwise defeat the `:not([hidden])` rules
+     above. `!important` here beats any later selector, any id selector,
+     and any non-important inline style, so the banner and its groups stay
+     hidden whenever `hidden` is set, no matter what else targets them. */
+  #price-warn[hidden], #price-warn [hidden]{display:none !important;}
 
   /* ============ HEADER ============ */
   header.hd{display:flex;flex-wrap:wrap;align-items:flex-end;gap:18px 26px;justify-content:space-between;margin-bottom:22px;}
