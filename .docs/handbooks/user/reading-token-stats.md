@@ -2,15 +2,15 @@
 doc: Reading Token Stats
 type: handbook
 status: active
-summary: "What `/token-stats` shows, the all-time per-project table from `/project-stats`, scoped rollups by issue-key set and their three empty states, estimated-cost markers and the no-own-price footer, seed rates (undated) and the stale-price warning, cache hit rate, backfilling estimated pricing windows (bundles, the permission prompt, nothing applies unattended), and why the scheduled weekly refresh never backfills"
-keywords: [token-stats, project-stats, scoped-rollups, issue-keys, empty-states, estimated-cost, no-own-price-footer, seed-rates, stale-price-warning, cache-hit-rate, backfill, bundles, permission-prompt, scheduled-refresh]
+summary: "What `/token-stats` shows, the all-time per-project table from `/project-stats`, scoped rollups by issue-key set and their three empty states, estimated-cost markers and the no-own-price footer, seed rates (undated) and the stale-price warning, a skipped-row warning and a refused refresh for a malformed page, cache hit rate, backfilling estimated pricing windows (bundles, the permission prompt, nothing applies unattended), and why the scheduled weekly refresh never backfills"
+keywords: [token-stats, project-stats, scoped-rollups, issue-keys, empty-states, estimated-cost, no-own-price-footer, seed-rates, stale-price-warning, skipped-row-warning, refused-refresh, cache-hit-rate, backfill, bundles, permission-prompt, scheduled-refresh]
 level: project
 audience: user
 module: reporting
 sources: [commands/token-stats.md, commands/project-stats.md, scripts/report.py, commands/pricing-update.md, commands/schedule-pricing.md, scripts/pricing_update.py]
 related: ["[[enabling-telemetry]]", "[[enabling-remote-telemetry]]", "[[operating-remote-telemetry]]"]
 created: 2026-08-05
-updated: 2026-09-23
+updated: 2026-09-24
 ---
 
 # Reading Token Stats
@@ -99,6 +99,23 @@ rate for a given model — this means the published pricing page no longer
 lists a current rate for it (its introductory-rate period has ended and
 nothing has replaced it yet). Nothing changes for that model until the page
 is updated; its reports keep using the last rate that was recorded.
+
+## When a refresh reports a skipped row or refuses to run
+
+You may occasionally see a `SKIPPED-ROW WARNING` for one particular model
+instead of an updated rate — this means that model's entry on the pricing
+page didn't match the expected layout closely enough to read safely (for
+example, a merged "Contact sales" cell), so its rate was left untouched
+rather than risk recording the wrong number. Every other model on the page
+still updates normally, and there's nothing you need to do.
+
+Separately, if the pricing page's structure has changed in a bigger way, or a
+listed rate can't be read as a clean number, the whole refresh refuses to run
+rather than write anything at all — no rates change, and the report says why
+it stopped. This is deliberate: pricing history is never edited after the
+fact, so the script would rather record nothing than record a wrong rate.
+Nothing on your end needs fixing; if it keeps happening, that's worth
+reporting.
 
 ## Backfilling estimated pricing windows
 
