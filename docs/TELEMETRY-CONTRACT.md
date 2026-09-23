@@ -396,31 +396,50 @@ is listed only with a **future** `starting <d>` (`d > today`) — also mints no 
 it and no family row either; the run report prints a `FUTURE-RATE WARNING` line instead,
 saying the family default keeps its last recorded rate until the increase's date arrives.
 
-**Parser bounds (AOS-143) — what a fetched page can mint is bounded, because a bad row
-here is permanent.** A security review found the parser could be made to mint rows it
-should not; `pricing_update.py` now refuses on four axes, before any row reaches the
-database:
+**Parser bounds (AOS-143, corrected) — what a fetched page can mint is bounded, because
+a bad row here is permanent.** A security review found the parser could be made to mint
+rows it should not; `pricing_update.py` refuses on four axes, before any row reaches the
+database. The first fix shipped had its own bug (F1, found in a later validation pass)
+and has since been corrected — see below.
 
 - **Backdated `starting`.** An in-force `starting <d>` row is normally minted dated `d`
   however far back — `starting January 1, 1970` would mint `effective_from = 0`,
-  re-pricing that prefix's entire history. A `starting <d>` entry is now refused (its
-  own WARNING line, naming the version and date; the rest of the run proceeds normally)
-  when `d` is more than 365 days before today, **or** earlier than the latest
-  `effective_from` already recorded for the version's own prefix(es).
+  re-pricing that prefix's entire history. A `starting <d>` entry more than 365 days
+  before today is refused (its own WARNING line, naming the version, date and reason;
+  the rest of the run proceeds normally): "not recorded; the version's existing rows
+  are unchanged". Refusal skips ONLY that entry's `INSERT` — in-force status is still
+  decided from the page, exactly as it was before AOS-143, so a refused `starting` row
+  still suppresses its version's unconditional rate, and the family default still keys
+  off the newest version's in-force rate, minting nothing when *that* rate's row is
+  refused. Nothing that was suppressed before AOS-143 becomes mintable because of a
+  refusal. An earlier version of this rule also refused a `starting <d>` earlier than
+  the latest `effective_from` already recorded for the version's own prefix(es); that
+  rule was removed entirely, because in steady state the DB already holds later rows
+  for a prefix once a real increase has landed (the increase minted them when it first
+  arrived), so it refused every LEGITIMATE increase on the very next scheduled run —
+  and, combined with the in-force bug above, silently reverted the increase to the
+  pre-increase base rate. An arrived increase within 365 days mints at its date even
+  when later rows already exist for that prefix; `INSERT OR IGNORE` keeps a re-run at
+  an already-recorded date a no-op.
 - **Unbounded rate magnitude.** `money()`'s regex match is deliberately permissive about
   digit count — a several-hundred-digit rate cell overflows `float()` to `inf` with no
-  exception raised. Every parsed rate is now checked: non-finite, or over $10,000/MTok,
-  refuses the **whole run** (nothing written, single transaction, exit 2 — the existing
+  exception raised. Every parsed rate is checked: non-finite, over $10,000/MTok, or (for
+  `in_usd`/`out_usd` only — cache rates keep no lower bound) $0 or below, refuses the
+  **whole run** (nothing written, single transaction, exit 2 — the existing
   fetch/parse-failure code, since the check lives in `parse_models()` before any DB
-  connection is opened).
+  connection is opened). A number immediately followed by an exponent marker (`e`/`E`,
+  optional sign, digits — scientific notation, e.g. `$1e309`) is treated as malformed by
+  `money()` itself and refuses the whole run the same way, rather than silently
+  truncating to its mantissa (`$1e309` used to mint `$1`).
 - **Unbounded row count.** A page listing thousands of model rows would mint thousands
   of candidate pricing rows in one run. More than 500 candidate rows in one run refuses
   the whole run atomically (nothing planned or applied; exit 1).
 - **Raw page text in error messages.** The two parse-failure messages that embed page
-  text (an unrecognized header, an unparseable rate cell) now strip ASCII control
-  characters and Unicode bidi-control characters and cap length before the message is
-  ever constructed — a hostile page cell can no longer inject a terminal escape sequence
-  or an unbounded message into stderr.
+  text (an unrecognized header, an unparseable rate cell) strip ASCII control characters
+  and DEL, the C1 control range (U+0080-U+009F, including U+0085 NEL and U+009B — the
+  8-bit form of CSI, usable to start a terminal escape sequence without a 7-bit ESC
+  byte), and Unicode bidi-control characters, and cap length, before the message is ever
+  constructed.
 
 A model the page does not list is priced by the longest matching prefix, unchanged:
 an unlisted point release of a listed version (e.g. `claude-opus-5-5` while the page

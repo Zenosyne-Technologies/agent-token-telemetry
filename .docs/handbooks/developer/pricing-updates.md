@@ -106,38 +106,75 @@ default is intentionally holding its last recorded rate until then. A version
 mixing an expired `through` with a future `starting` is reported once, by
 `stale_intros()`, not twice.
 
-## Parser bounds (AOS-143)
+## Parser bounds (AOS-143, corrected)
 
 Pricing history is insert-only (`docs/TELEMETRY-CONTRACT.md` §Pricing table,
 "History is never mutated"), so a bad row minted from the parsed page is
 **permanent**. A security review found four ways a hostile or merely broken
-page could abuse that: `pricing_update.py` now bounds all four before any
-row reaches the database, and refuses cleanly rather than silently doing
-the wrong thing.
+page could abuse that: `pricing_update.py` bounds all four before any row
+reaches the database. The backdated-`starting` fix shipped with its own bug
+(F1), found by a later validation pass and corrected — see below; the claim
+"refuses cleanly rather than silently doing the wrong thing" was false until
+that correction landed, so this section states the corrected behavior only.
 
 **Backdated `starting` rows (`filter_backdated_starting()`).** An in-force
 `starting <d>` row is normally minted dated `d`, however far back that is —
 "starting January 1, 1970" would mint `effective_from = 0`, re-pricing every
-event of that prefix back to the epoch. `run_update()` now drops any in-force
-`starting` entry before it ever reaches `build_candidates()` when `d` is more
-than `BACKDATE_MAX_DAYS` (365) days before the run date, **or** earlier than
-the latest `effective_from` already recorded for the version's own prefix(es)
-— a real increase is never older than what is already on record. This is a
+event of that prefix back to the epoch. `filter_backdated_starting()` now
+names every `(family, version)` whose in-force `starting` row is more than
+`BACKDATE_MAX_DAYS` (365) days before the run date — it no longer removes
+entries from the page (see F1 below) — and `run_update()` passes that set to
+`build_candidates()`, which skips ONLY that row's `INSERT`. This is a
 per-entry refusal, not a whole-run refusal: the rest of the page still mints
 normally, and the run report prints a `BACKDATED-STARTING WARNING` line
-naming the family, version and the refused date. A future `starting`
-(`d > today`) is untouched here — it is never minted anyway (`in_force()`).
+naming the family, version, refused date and the reason ("not recorded; the
+version's existing rows are unchanged"). A future `starting` (`d > today`) is
+untouched here — it is never minted anyway (`in_force()`).
+
+There is deliberately no other bound: an earlier version of this rule also
+refused a `starting <d>` earlier than the latest `effective_from` already
+recorded for the version's own prefix(es). That rule was removed entirely —
+in steady state, the DB already holds later rows for a prefix once a real
+increase has landed (the increase minted them when it first arrived), so the
+rule refused the SAME legitimate increase on every scheduled run after the
+first. An arrived increase within 365 days now mints at its date even when
+later rows already exist for that prefix; `INSERT OR IGNORE` keeps a re-run
+at an already-recorded date a no-op.
+
+**F1: a refusal must not change in-force status.** The first cut of this
+fix removed a refused `starting` entry from the list `build_candidates()`
+sees, which also made that entry stop counting as an in-force conditional
+for its version — so the version's UNCONDITIONAL rate (the pre-increase base
+rate) was no longer suppressed, and got minted dated today instead, silently
+reverting the real increase. Combined with the now-removed "latest recorded
+row" rule, this was a time bomb: the real DB already holds later rows for a
+prefix once an increase has landed, so that rule refused the SAME legitimate
+increase on every scheduled run after the first — and each of those refusals
+reverted the increase back to the pre-increase rate. The fix is that
+`build_candidates()` always decides in-force status from the unfiltered page
+— exactly as it did before AOS-143 — and only consults the refused-versions
+set to skip an INSERT: a refused conditional still suppresses its version's
+unconditional rate, and the family default still takes the newest version's
+in-force rate, minting nothing when *that* rate's row is refused (its own
+row is absent from the candidate list, so the family-default lookup finds
+none). Nothing that was suppressed before AOS-143 becomes mintable because
+of a refusal.
 
 **Unbounded rate magnitude (`MAX_RATE_USD`, in `parse_models()`).**
 `money()` stays a permissive regex match on purpose — magnitude enforcement
 lives in one place, `parse_models()`, so every caller (including a future
 non-HTML source) shares the same check. A rate cell with several hundred
 digits overflows Python's `float()` to `inf` with **no exception raised**;
-`parse_models()` now rejects any rate that is non-finite or exceeds
-`MAX_RATE_USD` ($10,000/MTok) for **any** of the five columns. The check
-refuses the **whole run** — the `ValueError` propagates out of `parse_models`
-before `main()` ever opens the database connection, so nothing is written,
-and the script exits 2 (its existing fetch/parse-failure code).
+`parse_models()` rejects any rate that is non-finite, exceeds `MAX_RATE_USD`
+($10,000/MTok), or — for `in_usd`/`out_usd` only, cache rates keep no lower
+bound — is $0 or below, for **any** of the five columns. `money()` itself
+also now refuses a number immediately followed by an exponent marker
+(`e`/`E`, optional sign, digits — scientific notation, e.g. `$1e309`) by
+returning `None` (the same as no match) instead of silently truncating to
+its mantissa (`$1e309` used to mint `$1`). Any of these refuses the **whole
+run** — the `ValueError` propagates out of `parse_models` before `main()`
+ever opens the database connection, so nothing is written, and the script
+exits 2 (its existing fetch/parse-failure code).
 
 **Unbounded row count (`MAX_CANDIDATES`, in `run_update()`).** A page listing
 thousands of rows would mint thousands of candidate pricing rows in one run.
@@ -153,13 +190,14 @@ parse-failure messages that embed page text — "unexpected pricing table
 header" and "unparseable rate cell in row" — used to interpolate the raw
 cell text (and, for the header, a raw Python list of raw cells) directly into
 the exception message that `main()` prints to stderr on a parse failure.
-`_safe_error_text()` strips ASCII control characters (including a raw `ESC`
-or `CR` byte — a terminal escape sequence must never reach a viewer's
-terminal) and Unicode bidi-control characters (which can visually reorder or
-spoof the printed text), then caps the result to 200 characters — a header
-row is a Python list, whose `str()` has no length limit on its own, so even
-a single absurdly long or many-celled header now prints a short, bounded
-message.
+`_safe_error_text()` strips ASCII control characters and DEL (U+0000-U+001F,
+U+007F), the C1 control range (U+0080-U+009F — including U+0085 NEL and
+U+009B, the 8-bit form of CSI, usable to start a terminal escape sequence
+without a 7-bit `ESC` byte) and Unicode bidi-control characters (which can
+visually reorder or spoof the printed text), then caps the result to 200
+characters — a header row is a Python list, whose `str()` has no length
+limit on its own, so even a single absurdly long or many-celled header
+prints a short, bounded message.
 
 ## Own price vs estimate
 
