@@ -240,8 +240,12 @@ always did.
 URL, dated today — except an arrived `starting <d>` scheduled increase, which is dated
 `d` (its real start; see "`pricing-update` mints only the rate in force today" below).
 Rows are never `UPDATE`d or `DELETE`d, so a past event always re-prices identically no
-matter when the query runs. `INSERT OR IGNORE` against the unique key makes same-day
-reruns of `pricing-update` a no-op.
+matter when the query runs — with one explicit exception: the consent-gated backfill
+("Third narrow case" below) INSERTs a row dated in the past for events that were priced
+at an ESTIMATE, which does change what those specific events re-price to. It is still
+not a mutation (no row is ever `UPDATE`d or `DELETE`d) and it never touches an event
+that was already priced by its own row. `INSERT OR IGNORE` against the unique key makes
+same-day reruns of `pricing-update` a no-op.
 
 **Narrow exception — a withdrawn forecast may be deleted.** A pricing row may be
 `DELETE`d in exactly two cases: (1) it is **future-dated and not yet in effect**
@@ -275,7 +279,14 @@ estimated, only with the user's explicit consent in the interactive
 and as an `INSERT` recording its provenance in `source`
 (`backfill:<R0 source>; confirmed <YYYY-MM-DD>`). An event priced by a model's own row
 is never re-priced: a candidate whose row would change one (or price a previously
-unpriced event) is refused, not offered. Nothing is ever `UPDATE`d or `DELETE`d.
+unpriced event) is refused, not offered. **Own-row closure:** an apply is valid only if,
+after it, every event in its impact set resolves to its OWN model's row — a candidate
+whose row would otherwise move another model's estimated events onto a row that is
+still an estimate for them cannot apply alone; the plan offers it as a BUNDLE with that
+other model's own candidate when one exists, and refuses it, naming the model it cannot
+close, when none does. `--backfill-apply` refuses a named prefix set that is not closed
+under this requirement, and its post-apply verification additionally checks that every
+impacted event is no longer estimated. Nothing is ever `UPDATE`d or `DELETE`d.
 Limitation: the backfill writes the **local** central DB only; the remote (Supabase)
 backend's `pricing` table is not touched, and carrying such rows there is future work
 (remote pricing sync).

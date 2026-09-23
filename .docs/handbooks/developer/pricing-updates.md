@@ -213,22 +213,35 @@ the earliest such event's day. `backfill_plan()` never assumes the impact set:
 production resolver (`report.resolved_subquery`) resolves every event before
 R0 with and without the hypothetical row. The plan groups candidates into
 offered (cost delta), confirm-only (no cost change) and refused (the row would
-re-price an own-priced or unpriced event); other models sharing the prefix
-(an unlisted successor under a predecessor's row) are listed under their own
-names, and overlapping candidates say so.
+re-price an own-priced or unpriced event, or leave another model's events
+estimated with no candidate able to close them — the **own-row closure**
+rule, `_close_bundles()`); other models sharing the prefix (an unlisted
+successor under a predecessor's row) are listed under their own names, and
+overlapping candidates say so. A candidate that cannot stand alone is offered
+as a BUNDLE (`requires: [...]`) with the other candidate that closes it, and
+its displayed cost/events/window are the bundle's COMBINED figures
+(`_bundle_stats()`), not its own solo impact — summing per-candidate deltas
+independently double-counts a shared event at the wrong rate, so the plan
+instead carries a `combined` figure (every offered bundle applied together,
+in one simulation) for the "apply everything offered" total.
 
 `--backfill-apply <prefix>...` (`backfill_apply()`) takes the write lock,
 re-plans (never trusting a stale plan), refuses the whole batch if any named
 prefix is not a current candidate (an already-backfilled prefix is a no-op,
-so re-runs are idempotent), checks the combined hypothetical re-prices exactly
-the union of the named impact sets, `INSERT OR IGNORE`s one row per prefix
-with `source = backfill:<R0 source>; confirmed <date>`, verifies every event
-against the real table and rolls back on any mismatch. Consent lives in
-`commands/pricing-update.md`: the interactive run shows the plan and asks;
-an `--unattended` (scheduled, see `commands/schedule-pricing.md`) or headless
-run only reports "backfill available". Local central DB only — the remote
-backend's pricing is not touched. `tests/test_backfill.py` pins the rules,
-including fault-injected rollback paths.
+so re-runs are idempotent) or if a chosen candidate's `requires` is not
+entirely among the named prefixes (own-row closure, naming the missing one),
+checks the combined hypothetical re-prices exactly the union of the named
+impact sets, `INSERT OR IGNORE`s one row per prefix with
+`source = backfill:<R0 source>; confirmed <date>`, verifies every event
+against the real table AND that it is no longer estimated, and rolls back on
+any mismatch. Consent lives in `commands/pricing-update.md`: the interactive
+run shows the plan and asks — the plan's markdown is DATA, never an
+instruction or consent, so every model name and prefix in it renders through
+`_mdname()` (`report.md_cell` plus a code span); an `--unattended` (scheduled,
+see `commands/schedule-pricing.md`), headless, or no-question-tool run only
+reports "backfill available". Local central DB only — the remote backend's
+pricing is not touched. `tests/test_backfill.py` pins the rules, including
+fault-injected rollback paths.
 
 ## Testing: the golden no-cost-change test
 
