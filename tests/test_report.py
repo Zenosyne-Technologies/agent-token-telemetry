@@ -171,8 +171,10 @@ class TestReportScript(unittest.TestCase):
         self.assertIn("**By model (7 days)**", out)
         self.assertIn("**By tier (7 days)**", out)
         self.assertIn("claude-sonnet-5", out)
-        self.assertIn("| claude-sonnet-5 | small |", out)  # tier in by-model
-        self.assertIn("small", out)          # tier mapping
+        # seed_db()'s event is kind=0, agent=None — the main session, always
+        # 'orchestrator' by role, whatever model it happens to run on.
+        self.assertIn("| claude-sonnet-5 | orchestrator |", out)  # by-model
+        self.assertIn("orchestrator", out)   # tier mapping
         self.assertIn("No issue-tagged", out)
 
     def test_by_model_tie_breaks_on_model_name(self):
@@ -194,7 +196,10 @@ class TestReportScript(unittest.TestCase):
 
     def test_by_tier_tie_breaks_on_tier_name(self):
         # Same rule for by_tier — a tie on SUM(out_tok) between
-        # two different tiers breaks on the tier label's byte order.
+        # two different tiers breaks on the tier label's byte order. Both
+        # rows are kind=1 subagents under a persona the kit hasn't named, so
+        # each falls back to its own model's prefix (kind=0/agent=None would
+        # collapse both into 'orchestrator' under the new role rule instead).
         conn = capture.connect(self.db)
         now = int(time.time())
         ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now))
@@ -203,7 +208,8 @@ class TestReportScript(unittest.TestCase):
             entry(model="claude-opus-1", inp=100, out=500, mid="m2", ts=ts),
         ])
         with conn:
-            capture.insert_events(conn, "/proj", "s1", 0, None, groups)
+            capture.insert_events(conn, "/proj", "s1", 1, "some-other-agent",
+                                  groups)
         conn.close()
         _, out = run(["token-stats", "--db", str(self.db)])
         section = out.split("**By tier (7 days)**", 1)[1]
@@ -855,6 +861,113 @@ class TestEstimateFlags(unittest.TestCase):
         self.assertIn(f"(seed rates) — {ALL_EST} |", ts)
         self.assertIn("No own published price for `claude-sonnet-5` — its"
                       " cost is an estimate", ts)
+
+
+class TestRoleTierMapping(unittest.TestCase):
+    """The role-based tier rule (docs/TELEMETRY-CONTRACT.md's "Tier mapping",
+    mirroring the kit's token-economics.md verbatim): the main session
+    (kind=0, agent NULL) is always 'orchestrator'; named `marvin:*` personas
+    route to their own tier regardless of model; any other agent (a persona
+    the kit hasn't named, or a NULL agent on a non-main-session row) falls
+    back to its model's prefix. Every case below deliberately pairs the
+    agent with a model that would map to a DIFFERENT tier under the old
+    model-only rule, so a test only passes when the role rule actually
+    drives the result."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name)
+        self.db = self.dir / "usage.db"
+        self.conn = capture.connect(self.db)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def seed(self, kind, agent, model, out=1000, session="s1"):
+        now = int(time.time())
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now))
+        groups = capture.aggregate([
+            entry(model=model, inp=100, out=out,
+                  mid=f"m-{model}-{agent}-{kind}-{session}", ts=ts)])
+        with self.conn:
+            capture.insert_events(self.conn, "/proj", session, kind, agent,
+                                  groups)
+
+    def only_tier(self):
+        tiers = [r[0] for r in report.fetch_token_stats(self.conn)["by_tier"]]
+        self.assertEqual(len(tiers), 1, tiers)
+        return tiers[0]
+
+    def test_main_session_is_orchestrator(self):
+        # kind=0, agent=None is the main session — 'orchestrator' whatever
+        # model it happens to run on (AOS-141: the orchestrator now runs on
+        # the heavy tier's own model, so claude-opus-* must NOT read 'heavy'
+        # here).
+        self.seed(0, None, "claude-opus-4-8")
+        self.assertEqual(self.only_tier(), "orchestrator")
+
+    def test_heavy_personas(self):
+        for agent in ("marvin:developer", "marvin:researcher",
+                      "marvin:validator-completion",
+                      "marvin:validator-security"):
+            with self.subTest(agent=agent):
+                self.conn.execute("DELETE FROM events")
+                self.seed(1, agent, "claude-sonnet-5")  # NOT an opus model
+                self.assertEqual(self.only_tier(), "heavy")
+
+    def test_small_personas(self):
+        for agent in ("marvin:developer-small", "marvin:documenter"):
+            with self.subTest(agent=agent):
+                self.conn.execute("DELETE FROM events")
+                self.seed(1, agent, "claude-opus-4-8")  # NOT a sonnet model
+                self.assertEqual(self.only_tier(), "small")
+
+    def test_ponytail_is_micro(self):
+        self.seed(1, "marvin:ponytail", "claude-opus-4-8")  # NOT a haiku model
+        self.assertEqual(self.only_tier(), "micro")
+
+    def test_escalation_rungs_are_ladder_with_rung_breakdown(self):
+        rungs = [("marvin:escalation-high", "high"),
+                 ("marvin:escalation-xhigh", "xhigh"),
+                 ("marvin:escalation-max", "max"),
+                 ("marvin:escalation-frontier", "frontier")]
+        for i, (agent, _rung) in enumerate(rungs):
+            # sonnet, not fable: proves the ladder tier comes from the named
+            # escalation persona, not a model-prefix coincidence.
+            self.seed(1, agent, "claude-sonnet-5", out=100 * (i + 1),
+                      session=f"s-{i}")
+        d = report.fetch_token_stats(self.conn)
+        self.assertEqual([r[0] for r in d["by_tier"]], ["ladder"])
+        got = {r[0]: r for r in d["by_rung"]}
+        self.assertEqual(set(got), {rung for _agent, rung in rungs})
+        for i, (_agent, rung) in enumerate(rungs):
+            self.assertEqual(got[rung][2], 100 * (i + 1))  # out_tok
+        md = report.render_token_stats(d)
+        self.assertIn("**By ladder rung (7 days)**", md)
+        for _agent, rung in rungs:
+            self.assertIn(f"| {rung} |", md)
+
+    def test_unknown_agent_falls_back_to_model_prefix(self):
+        cases = [("claude-opus-4-8", "heavy"), ("claude-sonnet-5", "small"),
+                 ("claude-haiku-5", "micro"), ("claude-fable-5", "ladder")]
+        for model, expected in cases:
+            with self.subTest(model=model):
+                self.conn.execute("DELETE FROM events")
+                self.seed(1, "some-unnamed-agent", model)
+                self.assertEqual(self.only_tier(), expected)
+                if expected == "ladder":
+                    # fallback ladder row names no escalation persona -> no
+                    # rung to report, though the tier total still counts it.
+                    self.assertEqual(
+                        report.fetch_token_stats(self.conn)["by_rung"], [])
+
+    def test_null_agent_with_kind_1_falls_back_to_model_prefix(self):
+        # kind=1 (subagent) with a NULL agent is NOT the main session — that
+        # is kind=0 specifically — so it falls back to the model prefix like
+        # any other unnamed agent, never 'orchestrator'.
+        self.seed(1, None, "claude-haiku-5")
+        self.assertEqual(self.only_tier(), "micro")
 
 
 if __name__ == "__main__":

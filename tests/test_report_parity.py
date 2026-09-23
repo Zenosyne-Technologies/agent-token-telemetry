@@ -98,13 +98,23 @@ SESSIONS = [("s-a1", "/home/user/alpha"), ("s-a2", "/home/user/alpha"),
 
 # (session_uuid, model_name, ts, kind, agent, in, out, cr, cw, cw1h,
 #  issue_key, note)
+#
+# Tier (AOS-141) is now role-based: kind=0/agent=NULL is ALWAYS 'orchestrator',
+# whatever the model — so a row whose comment or an assertion elsewhere relies
+# on its OLD model-prefix tier (e.g. 'small' for a sonnet model) must NOT be
+# kind=0/agent=NULL, or it would silently become 'orchestrator' instead. Those
+# rows use kind=1 with "other-agent" — a persona the kit hasn't named — which
+# falls back to the model prefix, the same tier the old rule gave it. "dev"/
+# "doc" (also not named personas) already behaved this way and are unchanged.
+# Row 1 (claude-sonnet-5 @ NOW) stays genuinely kind=0/agent=NULL, so the
+# corpus also exercises a real 'orchestrator' row in both dialects.
 EVENTS = [
     ("s-a1", "claude-sonnet-5",     NOW,        0, None,  100000, 50000, 10000, 5000, 5000, "AOS-1", None),
     ("s-a1", "claude-opus-4-8",     NOW,        1, "dev",  20000,  8000,  2000, 1000,    0, "AOS-1", None),
-    ("s-a2", "claude-sonnet-4-5-8", NOW - 3 * D, 0, None,  40000, 30000,  4000, 2000, 1000, "AOS-2", None),
+    ("s-a2", "claude-sonnet-4-5-8", NOW - 3 * D, 1, "other-agent", 40000, 30000, 4000, 2000, 1000, "AOS-2", None),
     ("s-a2", "claude-haiku-5",      NOW - 3 * D, 1, "doc",  5000,  1000,   500,    0,    0, None,    None),
     ("s-b1", "claude-sonnet-5",     NOW - 30 * D, 0, None, 200000, 90000,     0,    0,    0, "AOS-3", None),
-    ("s-b1", "gpt-4o",              NOW - 3 * D, 0, None,   1000,  2000,     0,    0,    0, None,    None),
+    ("s-b1", "gpt-4o",              NOW - 3 * D, 1, "other-agent", 1000, 2000, 0,   0,    0, None,    None),
     ("s-b1", "claude-sonnet-5",     NOW - 2 * D, 0, None,   3000,  3000,     0,    0,    0, None, "backlog-capture"),
     # legacy-prefix model priced by its OWN row -> not estimated
     ("s-b1", "claude-3-5-haiku-20241022", NOW - 4 * D, 0, None, 7000, 1500, 0, 0, 0, None, None),
@@ -114,7 +124,7 @@ EVENTS = [
     ("s-b1", "claude-sonnet-4-5-8", NOW - 12 * D, 1, "dev",  6000,  2500,     0,    0,    0, None,    None),
     # unlisted successor priced by its nearest listed ancestor's row
     # ('claude-opus-5', R = '-5') -> estimated; the model has no own price
-    ("s-b1", "claude-opus-5-5",     NOW - 5 * D, 0, None,   9000,  3000,   900,  400,  100, None,    None),
+    ("s-b1", "claude-opus-5-5",     NOW - 5 * D, 1, "other-agent", 9000, 3000, 900, 400, 100, None, None),
     # date snapshot priced by its version's OWN row ('claude-haiku-4-5',
     # R = '-20251001') -> not estimated
     ("s-b1", "claude-haiku-4-5-20251001", NOW - 5 * D, 1, "doc", 4000, 800, 0, 0, 0, None, None),
@@ -201,6 +211,13 @@ def build_sqlite_corpus(path):
 # so no single insertion order can satisfy all of them. (On Postgres the tests
 # also run each order on a database whose collation reverses b..z, so an order
 # inherited from a sort-based GROUP BY cannot pass either.)
+#
+# Tier (AOS-141) is role-based, not model-based: 'orchestrator' is reachable
+# ONLY via kind=0/agent=NULL (the main session), never via a model prefix — so
+# the 'claude-fable-' family reaches its tier that way, while the other four
+# reach theirs via the fallback (kind=1, an agent the kit hasn't named), which
+# lands on the same model-prefix tier the old rule gave every family. See
+# :func:`tie_kind_agent`.
 # ---------------------------------------------------------------------------
 TIE_TIERS = {"claude-fable-": "orchestrator", "claude-haiku-": "micro",
              "claude-opus-": "heavy", "claude-sonnet-": "small",
@@ -220,16 +237,28 @@ TIE_PERMUTATIONS = (
 )
 
 
+def tie_kind_agent(fam):
+    """(kind, agent) for a tie-fixture row of family ``fam``: the
+    'orchestrator' family reaches its tier via the main-session role rule
+    (kind=0, agent NULL); the other four reach theirs via the model-prefix
+    fallback (kind=1, an agent the kit hasn't named) — under the role-based
+    rule, 'orchestrator' is not reachable through any model fallback."""
+    return (0, None) if fam == "claude-fable-" else (1, "other-agent")
+
+
 def tie_rows(order, base_tier_out):
-    """The (model_name, out_tok) tie rows in insertion ``order`` (families);
-    within a family the '-9' row goes first (reverse name order too).
-    ``base_tier_out`` maps tier -> the corpus's own windowed SUM(out_tok)."""
+    """The (model_name, out_tok, kind, agent) tie rows in insertion ``order``
+    (families); within a family the '-9' row goes first (reverse name order
+    too). ``base_tier_out`` maps tier -> the corpus's own windowed
+    SUM(out_tok)."""
     rows = []
     for fam in order:
         top_up = (TIE_TIER_TOTAL - base_tier_out.get(TIE_TIERS[fam], 0)
                   - TIE_MODEL_OUT)
         assert top_up > 0 and top_up != TIE_MODEL_OUT, "corpus drifted"
-        rows += [(fam + "9", top_up), (fam + "8", TIE_MODEL_OUT)]
+        kind, agent = tie_kind_agent(fam)
+        rows += [(fam + "9", top_up, kind, agent),
+                 (fam + "8", TIE_MODEL_OUT, kind, agent)]
     return rows
 
 
@@ -253,14 +282,14 @@ def sqlite_tie_orders(path, order):
             sid = conn.execute(
                 "INSERT INTO sessions(uuid, project_id, owner_id) VALUES"
                 " (?,?,?)", ("s-tie", pid, OWNER)).lastrowid
-            for name, otok in tie_rows(order, base):
+            for name, otok, kind, agent in tie_rows(order, base):
                 mid = conn.execute("INSERT INTO models(name) VALUES (?)",
                                    (name,)).lastrowid
                 conn.execute(
                     "INSERT INTO events(ts, session_id, kind, agent, model_id,"
                     " in_tok, out_tok, cache_r, cache_w, cache_w_1h)"
                     " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (NOW, sid, 0, None, mid, 10, otok, 0, 0, 0))
+                    (NOW, sid, kind, agent, mid, 10, otok, 0, 0, 0))
         return tie_orders(report.fetch_token_stats(conn))
     finally:
         conn.close()
@@ -380,8 +409,11 @@ class TestSqliteReference(unittest.TestCase):
 
     def test_token_stats_reference_prefix_and_tiers(self):
         md = report.render_token_stats(report.fetch_token_stats(self.conn))
-        self.assertIn("| claude-sonnet-4-5-8 | small |", md)  # longest-prefix tier
+        # fallback (unnamed agent) tier: longest-prefix model match
+        self.assertIn("| claude-sonnet-4-5-8 | small |", md)
         self.assertIn("| gpt-4o | unknown |", md)             # unpriced model tier
+        # role tier: kind=0/agent=NULL is 'orchestrator' regardless of model
+        self.assertIn("| claude-sonnet-5 | orchestrator |", md)
         self.assertIn("unpriced", md)                         # gpt-4o cost cell
         self.assertIn("| AOS-3 |", md)                        # all-time by-issue
 
@@ -870,16 +902,17 @@ class TestPostgresEquivalence(unittest.TestCase):
                 sql = [f"INSERT INTO public.sessions(owner_id, uuid,"
                        f" project_path) VALUES ('{OWNER}', 's-tie',"
                        " '/home/user/alpha');"]
-                for name, otok in rows:
+                for name, otok, kind, agent in rows:
                     sql.append(f"INSERT INTO public.models(owner_id, name)"
                                f" VALUES ('{OWNER}', {_sql_lit(name)});")
-                for name, otok in rows:
+                for name, otok, kind, agent in rows:
                     sql.append(
                         "INSERT INTO public.events(owner_id, session_uuid,"
                         " model_name, ts, kind, agent, in_tok, out_tok,"
                         " cache_r, cache_w, cache_w_1h, issue_key, note)"
                         f" VALUES ('{OWNER}', 's-tie', {_sql_lit(name)},"
-                        f" {NOW}, 0, NULL, 10, {otok}, 0, 0, 0, NULL, NULL);")
+                        f" {NOW}, {kind}, {_sql_lit(agent)}, 10, {otok}, 0, 0,"
+                        " 0, NULL, NULL);")
                 self._run_sql_file(db, "\n".join(sql))
                 models, tiers = tie_orders(supabase_backend._map_token_stats(
                     self._rpc("SELECT public.report_token_stats();", db)))
