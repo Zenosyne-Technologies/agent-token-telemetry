@@ -2,7 +2,7 @@
 doc: Pricing Updates
 type: handbook
 status: active
-summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, minting only the rate in force today per listed version (with warnings for an expired intro or a future-only-newest version), the own-price-vs-estimate definitions, the dashboard's own-price warning banner (AOS-135) that now surfaces them with its node-gated client tests, the consent-gated backfill of estimated events, the narrow exceptions to the pricing table's immutability contract, and the AOS-143 parser bounds (backdated-starting refusal, malformed-token rejection extended in round 2 to separator/suffix/notation characters, rate-magnitude/floor and row-count caps, capped per-row warnings, three distinct exit codes so the command's fallback can never bypass a bound, a wall-clock fetch deadline and body-size cap closing a hang/DoS gap, an unopenable-DB error mapped to its documented exit code, sanitized error and fetch-failure text, and round 2's F1b fix that closed the fallback itself — it now only ever re-fetches the page and re-runs this same script, never on an unattended/scheduled run) that keep a hostile or broken page from minting permanent bad rows.
+summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection across the live page's two-row header and the older single-row one, minting only the rate in force today per listed version (with warnings for an expired intro or a future-only-newest version), the own-price-vs-estimate definitions, the dashboard's own-price warning banner (AOS-135) that now surfaces them with its node-gated client tests, the consent-gated backfill of estimated events, the narrow exceptions to the pricing table's immutability contract, and the AOS-143 parser bounds (backdated-starting refusal, malformed-token rejection extended in round 2 to separator/suffix/notation characters, rate-magnitude/floor and row-count caps, capped per-row warnings, three distinct exit codes so the command's fallback can never bypass a bound, a wall-clock fetch deadline and body-size cap closing a hang/DoS gap, an unopenable-DB error mapped to its documented exit code, sanitized error and fetch-failure text, and round 2's F1b fix that closed the fallback itself — it now only ever re-fetches the page and re-runs this same script, never on an unattended/scheduled run) that keep a hostile or broken page from minting permanent bad rows.
 keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning, future-rate-warning, backdated-starting-warning, parser-bounds, max-rate-usd, min-inout-rate-usd, max-candidates, warning-cap, exit-bounds-refused, exit-fetch-failed, exit-other-error, dashboard, price-warning-banner, node-gated-tests, require-node, backfill, backfill-plan, backfill-apply, f1b, fetch-timeout-s, fetch-max-bytes, strict-number-token]
 level: project
 audience: developer
@@ -23,25 +23,44 @@ a maintainer: `parse_models()` turns the raw HTML into rate entries, and
 `build_candidates()` turns those entries into the dated rows the script
 inserts.
 
-## Case-insensitive table and column detection
+## Table and column detection
 
-`parse_models()` finds the pricing table on the page by a predicate over its
-header row, and then locates each of its five columns (`in`, `w5`, `w1h`,
-`cr`, `out`) the same way — both match by lower-casing the header cell before
-comparing it against the needle (`"base input tokens"`, `"5m cache"`, `"1h
-cache"`, `"cache hits"`, `"output"`). Anthropic's page has shipped the same
-columns under both Title Case ("Base Input Tokens") and sentence case ("Base
-input tokens"); a case-sensitive match failed to find the table at all the
-moment the casing changed on a page that was otherwise unchanged, and the
-script exited with its structural-parse-failure code (`EXIT_OTHER_ERROR`,
-AOS-143 correction — a "table not found" is a parse failure, not a fetch
-one) with nothing actually wrong with the data.
+`parse_models()` hands the page's tables to `_locate_rate_table()`, which
+takes the first table, in page order, matching one of two header layouts, and
+then to `_map_rate_columns()`, which finds each of the five rate columns
+(`in`, `out`, `w5`, `w1h`, `cr`) in that layout's header row. All header text
+is lower-cased before comparing, since Anthropic's page has shipped the same
+columns in both Title Case and sentence case.
 
-The guard stays strict where it matters: `if set(col) != {"in", "w5", "w1h",
-"cr", "out"}: raise ValueError(...)` still fires when a column is genuinely
-absent from the header. Case-insensitivity only widens what counts as a
-match for a column that IS there — it never suppresses the check that all
-five were found.
+- **Two-row header** (the live page since at least 2026-09-23, fixture
+  `tests/fixtures/pricing-page-two-row-header-2026-09-23.html`): a
+  column-group row (`Model` | `Base tokens` | `Prompt caching`) above the
+  per-column row (`Name` | `Input` | `Output` | `5m writes` | `1h writes` |
+  `Hits and refreshes`). The table is recognized by the group row carrying
+  both `"base tokens"` and `"prompt caching"`; the columns are mapped from
+  the SECOND row, which is the one aligned with the data cells. The page's
+  batch table (`Model` | `Batch tokens`) and fast-mode table (`Model` |
+  `Input` | `Output`) carry neither marker pair and are never read as rates.
+- **Single-row header** (the page before 2026-09, and the older fixtures):
+  one header row recognized by a `"base input tokens"` cell, mapped with the
+  needles `"base input"`, `"output"`, `"5m cache"`, `"1h cache"`, `"cache
+  hits"`. Kept so an `--html` save of the older page still parses.
+
+When no table matches either layout the script exits with its
+structural-parse-failure code (`EXIT_OTHER_ERROR` — a "table not found" is a
+parse failure, not a fetch one); that is how AOS-151 surfaced, when the live
+page moved to the two-row header and every bare refresh exited 3.
+
+The column guard is strict: every needle must match exactly ONE header cell,
+no two rate keys may share a column, and no rate may sit in column 0 (the
+model name every row is identified by) — otherwise `ValueError`
+("unexpected pricing table header", with the header text sanitized). Only the
+header's position and wording differ between layouts: every data row below
+either header goes through the same row loop, so the strict rate token, the
+value bounds, and the sanitization below apply identically.
+`tests/test_pricing_bounds.py` runs every class that builds a page twice,
+once per layout (the generated `...TwoRowLayout` twins), and fails if a new
+page-building class is added without a twin.
 
 ## Never mint a future-dated row
 
