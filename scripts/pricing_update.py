@@ -29,14 +29,21 @@ argument is not a well-formed pricing prefix (:func:`is_pricing_prefix`), and 1
 when the apply is refused or rolled back (nothing written). `--backfill-apply`
 consumes every remaining raw argument as a candidate prefix (validated before
 argument parsing even runs — see :func:`_reject_option_shaped_backfill_apply`),
-so `--db`/`--html` MUST be given before `--backfill-apply` on the command line;
-anything after it that is not a well-formed prefix, including another flag,
-is rejected by position, never echoed. `--backfill-plan` and
+so `--db` (only — see below) MUST be given before `--backfill-apply` on the
+command line; anything after it that is not a well-formed prefix, including
+another flag, is rejected by position, never echoed. `--backfill-plan` and
 `--backfill-apply` are mutually exclusive — rejected with exit 2 before any
 DB is opened if both appear anywhere on the command line
 (:func:`_reject_combined_backfill_flags`), and again by the argparse parser
 itself, so a pre-approved `--backfill-plan ...` prefix match can never also
-apply.
+apply. `--html` is refresh-only: backfill modes never fetch or parse a page,
+so `--html` (or `--html=...`) is rejected with exit 2 alongside either
+`--backfill-plan` or `--backfill-apply`, anywhere on the command line, before
+argparse runs and before the DB or the HTML file is ever opened
+(:func:`_reject_html_with_backfill`), and again as a third layer by the
+argparse mutually-exclusive group — so a pre-approved `--html ...` prefix
+match can never reach a backfill apply or plan, regardless of what other
+flags precede or follow it.
 
 Backend seam: DB work goes through capture.connect() (the schema owner);
 parsing and planning are pure functions over plain data, reusable unchanged
@@ -1734,6 +1741,33 @@ def _reject_combined_backfill_flags(argv):
     return "--backfill-plan" in argv and "--backfill-apply" in argv
 
 
+def _reject_html_with_backfill(argv):
+    """Defence in depth, same style and exit code as
+    :func:`_reject_combined_backfill_flags`: refuse ``--html`` (or
+    ``--html=...``) together with either ``--backfill-plan`` or
+    ``--backfill-apply``, BEFORE argparse ever runs and before any DB is
+    opened or file read (AOS-143, round 3, security review). Backfill modes
+    never fetch or parse a page, so ``--html`` has no meaning with either —
+    and, critically, the command prompt pre-approves any ``Bash(... --html
+    <file> ...)`` invocation by prefix match on the leading tokens alone,
+    with no regard for what backfill flag follows later on the same command
+    line. Checking membership in ``argv`` (rather than relying on argument
+    order or on argparse) catches every ordering: ``--html`` before or after
+    ``--db``, before or after the backfill flag, and both the space-separated
+    and ``--html=FILE`` forms. ``--html`` is also declared mutually exclusive
+    with both backfill flags in the argparse parser itself, as a third,
+    independent layer.
+
+    :param argv: the raw argument list, before ``argparse.parse_args``.
+    :returns: ``True`` when ``--html``/``--html=...`` appears anywhere in
+        ``argv`` together with ``--backfill-plan`` or ``--backfill-apply``,
+        else ``False``.
+    """
+    has_html = any(tok == "--html" or tok.startswith("--html=") for tok in argv)
+    has_backfill = "--backfill-plan" in argv or "--backfill-apply" in argv
+    return has_html and has_backfill
+
+
 def _reject_option_shaped_backfill_apply(argv):
     """Defence in depth against option injection: reject any raw argv token
     after ``--backfill-apply`` that is not a well-formed pricing prefix,
@@ -1797,12 +1831,28 @@ def main(argv=None):
         print("Backfill REFUSED — nothing written: --backfill-plan and"
               " --backfill-apply are mutually exclusive.")
         return 2
+    # Third: --html has no meaning with either backfill mode (neither fetches
+    # or parses a page), and — the point of this guard (AOS-143, round 3) —
+    # the command prompt's `Bash(... --html:*)` pre-approval matches on the
+    # command's leading tokens alone, with no regard for a backfill flag
+    # appearing later on the same command line. Reject the combination by
+    # plain membership in argv, before argparse ever runs and before the DB
+    # or the HTML file is opened, so no ordering of --html relative to --db
+    # or the backfill flag can let a pre-approved --html invocation apply or
+    # plan.
+    if _reject_html_with_backfill(raw_argv):
+        print("Backfill REFUSED — nothing written: --html is rejected"
+              " together with --backfill-plan or --backfill-apply"
+              " (backfill modes never fetch or parse a page).")
+        return 2
 
     ap = _ArgumentParser(prog="pricing_update.py", allow_abbrev=False)
     ap.add_argument("--db", default=None)
-    ap.add_argument("--html", default=None,
-                    help="parse a local HTML file instead of fetching (tests)")
     group = ap.add_mutually_exclusive_group()
+    group.add_argument("--html", default=None,
+                       help="parse a local HTML file instead of fetching"
+                            " (tests); mutually exclusive with"
+                            " --backfill-plan/--backfill-apply")
     group.add_argument("--backfill-plan", action="store_true",
                        help="print the read-only backfill plan and exit")
     ap.add_argument("--json", action="store_true",
@@ -1810,8 +1860,8 @@ def main(argv=None):
     group.add_argument("--backfill-apply", nargs="+", metavar="PREFIX",
                        help="insert the backfill row for each confirmed"
                             " prefix (all-or-nothing; re-plans first;"
-                            " --db/--html must be given BEFORE this flag;"
-                            " mutually exclusive with --backfill-plan)")
+                            " --db must be given BEFORE this flag;"
+                            " mutually exclusive with --backfill-plan/--html)")
     args = ap.parse_args(argv)
     if args.backfill_apply:
         # Second layer, defence in depth, before the DB is opened: only the

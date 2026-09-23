@@ -1045,6 +1045,90 @@ class TestBackfillFlagsMutuallyExclusive(Base):
         self.assertEqual(code, 0, out)
 
 
+class TestHtmlRejectedWithBackfill(Base):
+    """AOS-143 round 3 (security review): the command prompt pre-approves
+    `Bash(python3 .../pricing_update.py --html:*)` on prefix match alone, so
+    a command line of `--html FILE --db DB --backfill-apply PREFIX` matched
+    that prefix and applied with no permission prompt, even though
+    `--backfill-apply` is deliberately withheld from `allowed-tools`.
+    `--backfill-plan`/`--backfill-apply` never fetch or parse a page, so
+    `--html` (space-separated or `--html=FILE`) is now refused together with
+    either flag, in every ordering, with exit 2, before argparse runs and
+    before the DB or the HTML file is ever opened — nothing is read or
+    written."""
+
+    def setUp(self):
+        super().setUp()
+        self.f.price("claude-opus-", FAM_OPUS, D - 30 * DAY)
+        self.f.price("claude-opus-5-5", OPUS_55, D + DAY)
+        self.f.event("claude-opus-5-5", D + 60)
+        self.html_path = pathlib.Path(self.f.tmp.name) / "page.html"
+        self.html_path.write_text("<html></html>")
+
+    def run_cli(self, *args):
+        """Like Fixture.cli, but without its automatic leading --db, so the
+        exact argv ordering under test is preserved."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = pricing_update.main(list(args))
+        return code, out.getvalue()
+
+    def test_html_then_backfill_apply_no_explicit_db(self):
+        before = (self.f.digest(), self.f.pricing_rows())
+        code, out = self.run_cli("--html", str(self.html_path),
+                                  "--backfill-apply", "claude-opus-5-5")
+        self.assertEqual(code, 2, out)
+        self.assertIn("REFUSED", out)
+        self.assertEqual((self.f.digest(), self.f.pricing_rows()), before)
+
+    def test_html_then_db_then_backfill_apply(self):
+        before = (self.f.digest(), self.f.pricing_rows())
+        code, out = self.run_cli("--html", str(self.html_path),
+                                  "--db", str(self.f.path),
+                                  "--backfill-apply", "claude-opus-5-5")
+        self.assertEqual(code, 2, out)
+        # Content, not just the exit code, so this pins the dedicated
+        # pre-argparse guard specifically: argparse's own mutually-exclusive
+        # group also exits 2 for this combination, but writes its usage error
+        # to stderr, which this assertion (stdout only) would not see.
+        self.assertIn("REFUSED", out)
+        self.assertEqual((self.f.digest(), self.f.pricing_rows()), before)
+
+    def test_html_equals_form_then_db_then_backfill_apply(self):
+        before = (self.f.digest(), self.f.pricing_rows())
+        code, out = self.run_cli("--html=" + str(self.html_path),
+                                  "--db", str(self.f.path),
+                                  "--backfill-apply", "claude-opus-5-5")
+        self.assertEqual(code, 2, out)
+        self.assertIn("REFUSED", out)
+        self.assertEqual((self.f.digest(), self.f.pricing_rows()), before)
+
+    def test_db_then_html_then_backfill_apply(self):
+        before = (self.f.digest(), self.f.pricing_rows())
+        code, out = self.run_cli("--db", str(self.f.path),
+                                  "--html", str(self.html_path),
+                                  "--backfill-apply", "claude-opus-5-5")
+        self.assertEqual(code, 2, out)
+        self.assertIn("REFUSED", out)
+        self.assertEqual((self.f.digest(), self.f.pricing_rows()), before)
+
+    def test_html_then_db_then_backfill_plan(self):
+        before = (self.f.digest(), self.f.pricing_rows())
+        code, out = self.run_cli("--html", str(self.html_path),
+                                  "--db", str(self.f.path),
+                                  "--backfill-plan")
+        self.assertEqual(code, 2, out)
+        self.assertIn("REFUSED", out)
+        self.assertNotIn("Backfill available", out)
+        self.assertEqual((self.f.digest(), self.f.pricing_rows()), before)
+
+    def test_control_backfill_apply_without_html_still_applies(self):
+        # Proves the tests above detect the new gate, not a broken apply.
+        code, out = self.run_cli("--db", str(self.f.path),
+                                  "--backfill-apply", "claude-opus-5-5")
+        self.assertEqual(code, 0, out)
+
+
 class TestBundleClosure(Base):
     """F2/F3 pinned on the shared-prefix fixture: backfilling the
     predecessor alone would leave the successor's event on an ANCESTOR row

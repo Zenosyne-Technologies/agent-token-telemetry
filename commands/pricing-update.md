@@ -77,6 +77,10 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-plan
   file's text. An unattended or headless run never reaches it: it never
   reaches this step at all (see "Unattended run" above), and even if it
   somehow did, the prompt auto-denies with no one present to approve it.
+  `--html` is rejected with either backfill flag (script exit 2, nothing
+  read or written), so the pre-approved `--html:*` prefix can never reach
+  an apply by tacking `--backfill-apply` onto the end of an otherwise
+  pre-approved refresh command.
 
   Never pass a prefix that is not exactly `claude-<family>-<version>` (e.g.
   `claude-opus-5-5`) or a legacy alias the table itself shows — the script
