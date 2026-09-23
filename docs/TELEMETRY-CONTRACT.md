@@ -236,10 +236,12 @@ the 5-minute write rate (1.25× input); `cache_w_1h_usd` (v4) is the 1-hour writ
 `COALESCE(cache_w_1h_usd, cache_w_usd)` so pre-v4 rows keep producing the estimate they
 always did.
 
-**History is never mutated.** A rate change is always a new `INSERT` with today's date
-as `effective_from` and a `source` URL — rows are never `UPDATE`d or `DELETE`d, so a
-past event always re-prices identically no matter when the query runs. `INSERT OR
-IGNORE` against the unique key makes same-day reruns of `pricing-update` a no-op.
+**History is never mutated.** A rate change is always a new `INSERT` with a `source`
+URL, dated today — except an arrived `starting <d>` scheduled increase, which is dated
+`d` (its real start; see "`pricing-update` mints only the rate in force today" below).
+Rows are never `UPDATE`d or `DELETE`d, so a past event always re-prices identically no
+matter when the query runs. `INSERT OR IGNORE` against the unique key makes same-day
+reruns of `pricing-update` a no-op.
 
 **Narrow exception — a withdrawn forecast may be deleted.** A pricing row may be
 `DELETE`d in exactly two cases: (1) it is **future-dated and not yet in effect**
@@ -254,6 +256,29 @@ actually charged — is immutable and is never `UPDATE`d or `DELETE`d. `pricing-
 itself never mints a future-dated row: a scheduled increase is recorded only on the
 first run on or after its effective date (so case (2) cannot arise from the script and
 is only reachable by a manual fallback that recorded a forecast by hand).
+
+**Third narrow case — a consent-gated backfill may date an INSERT in the past.** Not a
+`DELETE` and not an `UPDATE`: the two cases above stay the only deletions. When a
+model's events were priced at an **estimate** (their resolved row was a family default
+or ancestor row — "Own price vs estimate" below) before that model's own row was first
+minted, `pricing_update.py --backfill-plan` offers, per such prefix P, one extra row: a
+copy of P's earliest own row R0, dated the UTC start of the day of the earliest
+estimated event P is the own row for. The plan is read-only; it lists every event whose
+resolved row would change (other models sharing the prefix included, under their own
+names), the window and its span, and cost now → after. `--backfill-apply <prefix>...`
+re-plans, writes all named rows in one transaction or none, and verifies that exactly
+the planned events changed, rolling back otherwise. This is not a history rewrite: it
+replaces an ESTIMATE — a family-default or ancestor rate that was never that model's
+own published rate — with the model's own published rate, only for events that were
+estimated, only with the user's explicit consent in the interactive
+`/token-telemetry:pricing-update` flow (an unattended or scheduled run never applies),
+and as an `INSERT` recording its provenance in `source`
+(`backfill:<R0 source>; confirmed <YYYY-MM-DD>`). An event priced by a model's own row
+is never re-priced: a candidate whose row would change one (or price a previously
+unpriced event) is refused, not offered. Nothing is ever `UPDATE`d or `DELETE`d.
+Limitation: the backfill writes the **local** central DB only; the remote (Supabase)
+backend's `pricing` table is not touched, and carrying such rows there is future work
+(remote pricing sync).
 
 **`effective_from = 0` is the seed marker, not a timestamp.** The v0.2.0 migration
 seeds four rows (`claude-fable-`, `claude-opus-`, `claude-sonnet-`, `claude-haiku-`,
@@ -342,8 +367,10 @@ an unlisted point release of a listed version (e.g. `claude-opus-5-5` while the 
 lists Opus 5) prices at its nearest listed ancestor's own row (`claude-opus-5`) for
 events on or after that row's `effective_from`, and before it at whatever row resolved
 before — typically the family default. Either way its events are **estimated** until a
-refresh lands its own row. This is forward-only: minted rows are dated today (or at an
-arrived `starting` date), so events before them keep the rate they already had.
+refresh lands its own row. A refresh is forward-only: minted rows are dated today (or at
+an arrived `starting` date), so events before them keep the rate they already had —
+unless the user confirms the consent-gated backfill described under "History is never
+mutated".
 
 ## Context sidecar (kit → telemetry)
 

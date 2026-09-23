@@ -181,10 +181,14 @@ claude plugin install token-telemetry@agent-token-telemetry
   `pricing` table
 - `/token-telemetry:pricing-update` — agent-driven refresh: fetches Anthropic's
   currently published per-model pricing and inserts new effective-dated rows on
-  change (history is never mutated — a rate change is always a new row)
+  change (history is never mutated — a rate change is always a new row); when a
+  model's earlier events were priced at an estimate before its own rate was
+  published, it shows a backfill timeline (window, events per model, cost now →
+  after) and asks whether to backfill — nothing is applied without your answer
 - `/token-telemetry:schedule-pricing` — registers `pricing-update` as a weekly
   background scheduled agent where the host supports it, else prints the
-  manual-cadence advice
+  manual-cadence advice; the scheduled run never applies a backfill, it only
+  reports that one is available
 
 Data lives in `~/.claude/telemetry/usage.db` (SQLite, WAL) — plus
 `<root>/.claude/telemetry-usage.db` in project mode. `/token-telemetry:token-stats`

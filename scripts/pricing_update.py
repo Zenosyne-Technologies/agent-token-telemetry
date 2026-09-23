@@ -12,7 +12,7 @@ fetch/parse failure — the page layout changed or the network is down).
 `--backfill-plan [--json]` prints the read-only consent-gated backfill plan
 (estimated events that a copy of their model's own, later-minted rate would
 re-price) and `--backfill-apply PREFIX...` applies the user-confirmed prefixes
-— contract §Pricing table, "History is never mutated", case 3. Neither
+— contract §Pricing table, "Third narrow case" (consent-gated backfill). Neither
 fetches the page.
 
 Backend seam: DB work goes through capture.connect() (the schema owner);
@@ -397,8 +397,8 @@ def run_update(conn, entries, today, source=URL):
 
 # ------------------------------------------------------------------ backfill
 #
-# Consent-gated backfill (docs/TELEMETRY-CONTRACT.md §Pricing table, "History
-# is never mutated", case 3). When a model's events were priced at an ESTIMATE
+# Consent-gated backfill (docs/TELEMETRY-CONTRACT.md §Pricing table, "Third
+# narrow case"). When a model's events were priced at an ESTIMATE
 # (a family default or ancestor row) before its own row was first minted, the
 # plan offers ONE extra INSERT per such prefix: a copy of the prefix's earliest
 # own row R0, dated the UTC start of the day of the earliest estimated event it

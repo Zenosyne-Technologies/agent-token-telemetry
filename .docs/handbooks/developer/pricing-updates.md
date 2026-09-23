@@ -2,12 +2,12 @@
 doc: Pricing Updates
 type: handbook
 status: active
-summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, minting only the rate in force today per listed version (with a stale-price warning for an expired intro with nothing else listed), the own-price-vs-estimate definitions, and the dashboard's own-price warning banner (AOS-135) that now surfaces them, with its node-gated client tests.
-keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning, dashboard, price-warning-banner, node-gated-tests, require-node]
+summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, minting only the rate in force today per listed version (with a stale-price warning for an expired intro with nothing else listed), the own-price-vs-estimate definitions, the dashboard's own-price warning banner (AOS-135) that now surfaces them with its node-gated client tests, the consent-gated backfill of estimated events, and the narrow exceptions to the pricing table's immutability contract.
+keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning, dashboard, price-warning-banner, node-gated-tests, require-node, backfill, backfill-plan, backfill-apply]
 level: project
 audience: developer
 module: pricing-update
-sources: [scripts/pricing_update.py, commands/pricing-update.md, docs/TELEMETRY-CONTRACT.md, tests/pricing_golden.py, scripts/dashboard.py, scripts/dashboard.html, tests/test_dashboard_client.py, tests/dashboard_dom_harness.js]
+sources: [scripts/pricing_update.py, commands/pricing-update.md, commands/schedule-pricing.md, docs/TELEMETRY-CONTRACT.md, tests/pricing_golden.py, scripts/dashboard.py, scripts/dashboard.html, tests/test_dashboard_client.py, tests/dashboard_dom_harness.js, tests/test_backfill.py]
 related: ["[[capture-pipeline]]", "[[remote-read-parity]]"]
 created: 2026-09-22
 updated: 2026-09-23
@@ -199,6 +199,37 @@ failure instead of a skip; `.github/workflows/checks.yml` sets it and
 asserts `node --version` on the runner first, so this gate can never
 silently skip in CI.
 
+## Backfilling estimated events (consent-gated)
+
+A refresh is forward-only, so a model whose events were priced at an estimate
+(a family default or ancestor row) before its own row was first minted keeps
+that estimate forever — e.g. `claude-opus-5-5` events priced at the
+`claude-opus-` default the day before its own, cheaper row landed.
+`--backfill-plan` (read-only; `--json` for machines) finds each non-family
+prefix P whose earliest own row R0 was preceded by estimated events of models
+P is the own row for, and offers one INSERT: R0's rates dated the UTC start of
+the earliest such event's day. `backfill_plan()` never assumes the impact set:
+`_Shadow` copies `pricing` into a TEMP table that shadows it, so the unchanged
+production resolver (`report.resolved_subquery`) resolves every event before
+R0 with and without the hypothetical row. The plan groups candidates into
+offered (cost delta), confirm-only (no cost change) and refused (the row would
+re-price an own-priced or unpriced event); other models sharing the prefix
+(an unlisted successor under a predecessor's row) are listed under their own
+names, and overlapping candidates say so.
+
+`--backfill-apply <prefix>...` (`backfill_apply()`) takes the write lock,
+re-plans (never trusting a stale plan), refuses the whole batch if any named
+prefix is not a current candidate (an already-backfilled prefix is a no-op,
+so re-runs are idempotent), checks the combined hypothetical re-prices exactly
+the union of the named impact sets, `INSERT OR IGNORE`s one row per prefix
+with `source = backfill:<R0 source>; confirmed <date>`, verifies every event
+against the real table and rolls back on any mismatch. Consent lives in
+`commands/pricing-update.md`: the interactive run shows the plan and asks;
+an `--unattended` (scheduled, see `commands/schedule-pricing.md`) or headless
+run only reports "backfill available". Local central DB only — the remote
+backend's pricing is not touched. `tests/test_backfill.py` pins the rules,
+including fault-injected rollback paths.
+
 ## Testing: the golden no-cost-change test
 
 `tests/pricing_golden.py` records, per (page fixture or inline entry list,
@@ -220,7 +251,7 @@ to move a cost, and nothing else. See [[remote-read-parity]] for the
 Postgres-gated tests that guard the estimated flag's SQLite/Postgres
 expressions against their Python definition.
 
-## Immutability and its two DELETE exceptions
+## Immutability, its two DELETE exceptions and the backfill
 
 `docs/TELEMETRY-CONTRACT.md`'s "Pricing table" section is authoritative on
 the pricing table's shape and its default immutability (`INSERT OR IGNORE`
@@ -234,6 +265,10 @@ Both share the same justification: neither row ever priced a real charge, so
 removing it corrects the table rather than rewriting history. Every row whose
 `effective_from <= now` — one that was, at some point, the rate actually
 charged — stays immutable regardless.
+
+The contract's third narrow case is not a deletion: the consent-gated backfill
+above is an INSERT dated in the past that replaces an estimate — never a
+model's own published rate — for estimated events only.
 
 Because `build_candidates()` never mints a `starting` row ahead of its date
 (above), case (2) cannot arise from this script's own normal run — it is only

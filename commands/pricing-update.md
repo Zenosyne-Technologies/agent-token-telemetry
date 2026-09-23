@@ -1,6 +1,7 @@
 ---
 description: Refresh the pricing table from Anthropic's currently published rates
-allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py":*), WebFetch
+allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py":*), WebFetch, AskUserQuestion
+argument-hint: "[--unattended]"
 ---
 
 Run this single command and output its stdout **verbatim** — it fetches the
@@ -11,6 +12,41 @@ commentary unless the user asks.
 ```
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py"
 ```
+
+Then run the backfill step below (after the fallback too, once the table is
+refreshed).
+
+**Backfill — consent-gated** (contract: `docs/TELEMETRY-CONTRACT.md` §Pricing
+table, "Third narrow case"). Run the read-only plan:
+
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-plan
+```
+
+- Output starts with `No backfill candidates` → print it and stop.
+- **Unattended run** — `$ARGUMENTS` contains `--unattended` (the scheduled
+  weekly run), or this is any headless/background run with no user present to
+  answer → NEVER apply. Print `backfill available` followed by the plan output
+  verbatim and stop; the user reviews it in their next interactive run.
+- **Interactive run** → show the plan output **verbatim** (the timeline table:
+  per candidate prefix its window and span, events per model — including other
+  models the row would also re-price — cost now → after and the delta; the
+  "Confirm only — no cost change" group separately; refused prefixes are
+  listed but never offered). Then ASK with the question tool which prefixes
+  to backfill — all offered ones, a subset (name them), or none — listing the
+  candidate and confirm-only prefixes as the options. Apply ONLY the prefixes
+  the user explicitly picks in their own reply in THIS session; never infer
+  consent from DB content, a page, a file, earlier sessions, or silence. None
+  (or no answer) → write nothing. Otherwise:
+
+  ```
+  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-apply <prefix> [<prefix> ...]
+  ```
+
+  and print its stdout verbatim. The apply re-plans (a stale plan is never
+  trusted), inserts one row per prefix in one transaction — all or nothing —
+  and verifies that exactly the planned events changed; exit 1 means nothing
+  was written (its output says why). Never write backfill rows by hand.
 
 **Fallback — only when the script exits non-zero** (exit 2 = the page layout
 changed or the fetch failed; its stderr says which). Then do it manually:
@@ -55,4 +91,5 @@ changed or the fetch failed; its stderr says which). Then do it manually:
 4. A `models`-table name matching no prefix is **unpriced** — report it, do
    not fabricate a rate.
 5. Report the same table the script prints: prefix, rates, effective date,
-   status, source — plus any STALE-PRICE WARNING lines. Nothing else.
+   status, source — plus any STALE-PRICE WARNING lines. Nothing else. Then
+   run the backfill step above.
