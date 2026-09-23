@@ -2,7 +2,7 @@
 doc: Remote Read Parity
 type: handbook
 status: active
-summary: How reports read from the remote (Supabase/Postgres) backend with the same numbers as local SQLite — the SECURITY INVOKER reports.sql RPC/views (incl. report_model_pricing, the one Postgres definition of the estimated flag and the no-own-price footer's source), the client read_for_report mapping, report.py routing on active_backend, the by_model/by_tier name tie-break proven insertion-order- and collation-independent, and the dual-dialect drift risk guarded by the cross-dialect golden test and the estimated-flag three-way parity test (SQLite reference in CI, Postgres-gated equivalence, maintainer live step).
+summary: How reports read from the remote (Supabase/Postgres) backend with the same numbers as local SQLite — the SECURITY INVOKER reports.sql RPC/views (incl. report_model_pricing, the one Postgres definition of the estimated flag and the no-own-price footer's source), the client read_for_report mapping, report.py routing on active_backend, the by_model/by_tier/by_rung name tie-break proven insertion-order- and collation-independent, the tier/rung rule stated once per dialect, and the dual-dialect drift risk guarded by the cross-dialect golden test and the estimated-flag three-way parity test (SQLite reference in CI, Postgres-gated equivalence, maintainer live step).
 keywords: [read-parity, reports, supabase, postgres, rpc, security-invoker, rls, golden-test, dual-dialect, drift, pricing, windows, tiers, estimated, family-default, ancestor-row, tie-break, collation]
 level: project
 audience: developer
@@ -86,8 +86,14 @@ functions, hand-written and reviewed:
   model-prefix fallback, or an unrecognized `marvin:escalation-*` suffix) is
   grouped under the `no rung (fallback)` label instead of dropped, so
   `by_rung`'s rows always sum to `by_tier`'s ladder total. Both `report.py`'s
-  `tier_case()`/`rung_case()` and `reports.sql`'s inline CASE expressions
-  implement the SAME rule — see `docs/TELEMETRY-CONTRACT.md`'s "Tier mapping".
+  `tier_case()`/`rung_case()` and `reports.sql`'s CASE expressions implement
+  the SAME rule — see `docs/TELEMETRY-CONTRACT.md`'s "Tier mapping". Each
+  dialect states it exactly ONCE: `report_token_stats()` computes `tier` and
+  `rung` per event in one `tagged` CTE, and `fetch_token_stats` splices
+  `tier_case()`/`rung_case()` into its own single `tagged` CTE; `by_model`,
+  `by_tier` and `by_rung` only read those columns, so they cannot classify an
+  event differently. `TestTierRuleDefinedOnce` fails if the rule is restated,
+  and `assert_breakdowns_agree` checks the three agree event-for-event.
 
 Each returns `jsonb` the client maps 1:1 into the shape `report.py`'s matching
 `fetch_*` returns, so the **same `render_*` functions** produce the markdown.
@@ -127,7 +133,7 @@ this-week / outside-week / backlog windows, tiers, cache-TTL splits, NULLs, an
 unpriced model, a model with only estimated (family-default/ancestor) pricing —
 proving `models_without_own_price` and the estimated-event counts agree —
 prefix-shadowing and `effective_from` supersession) is defined once and loaded
-identically into both dialects. The by_model/by_tier tie-break is proven
+identically into both dialects. The by_model/by_tier/by_rung tie-break is proven
 separately (see "Known cross-dialect nuances" below) since it needs fresh,
 purpose-built databases rather than the shared corpus. Three layers:
 
@@ -201,13 +207,16 @@ clean skip with none of that in place.
 - **Pricing ties.** A pricing tie on `(prefix length, effective_from)` is ambiguous
   in **both** dialects (SQLite could even mix columns across rows); the pricing
   UNIQUE key and curated data avoid it.
-- **`by_model` / `by_tier` ties order by name.** A tie on `SUM(out_tok)` breaks on
-  the model name / tier label, byte order (SQLite's default `ORDER BY ... ,
-  model_name` / `, 1`; Postgres `ORDER BY o DESC, model_name COLLATE
-  pg_catalog."C"` / `, tier COLLATE pg_catalog."C"` — `COLLATE "C"` is what makes
-  the Postgres order match SQLite's regardless of the database's own default
-  collation). `tests/test_report_parity.py`'s tie-break tests prove this is
-  insertion-order-independent (every permutation in `TIE_PERMUTATIONS` is tried,
+- **`by_model` / `by_tier` / `by_rung` ties order by name.** A tie on
+  `SUM(out_tok)` breaks on the model name / tier label / rung label, byte order
+  (SQLite: the one shared `ORDER BY part, o DESC, label` of
+  `fetch_token_stats`' single statement, BINARY collation; Postgres `ORDER BY o
+  DESC, model_name COLLATE pg_catalog."C"` / `, tier COLLATE pg_catalog."C"` /
+  `, rung COLLATE pg_catalog."C"` — `COLLATE "C"` is what makes the Postgres
+  order match SQLite's regardless of the database's own default collation).
+  `tests/test_report_parity.py`'s tie-break tests prove this is
+  insertion-order-independent (every permutation in `TIE_PERMUTATIONS` /
+  `RUNG_TIE_PERMUTATIONS` is tried,
   each against a fresh DB) and, on the Postgres side, collation-independent too: a
   `reversed_collation=True` fixture builds a throwaway database with an ICU
   default collation that sorts `b`..`z` backwards (`REVERSED_ICU_RULES`), so a

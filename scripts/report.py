@@ -171,7 +171,8 @@ def rung_case(agent="agent"):
 
 
 # The by-rung label for a ladder-tier event with no named rung (see
-# rung_case). Mirrored verbatim in supabase/reports.sql's by_rung CASE.
+# rung_case). Mirrored verbatim by report_token_stats' v_rung_fallback in
+# supabase/reports.sql.
 RUNG_FALLBACK_LABEL = "no rung (fallback)"
 
 # The kit's tier display order (docs/TELEMETRY-CONTRACT.md's "Tier mapping"),
@@ -489,7 +490,27 @@ def fetch_token_stats(conn):
         " FROM events WHERE ts >= strftime('%s','now','-7 days')"
         f" AND {NOT_BACKLOG}"
         " GROUP BY 1 ORDER BY SUM(out_tok) DESC").fetchall()
-    by_model = conn.execute(f"""
+    # by_model, by_tier and by_rung are ONE statement over ONE `tagged` CTE,
+    # which splices tier_case() and rung_case() exactly once: every breakdown
+    # reads the same per-event `tier`/`rung` columns, so the three can never
+    # classify the same event differently (twin of reports.sql's `tagged` CTE
+    # in report_token_stats). Each output row carries its breakdown name in
+    # column 0; the shared ORDER BY sorts every breakdown by output DESC, then
+    # by its label's byte order (BINARY) as the deterministic tie-break —
+    # model name, tier name or rung name — matching Postgres' COLLATE "C".
+    #
+    # by_model is ONE row per model (F1): a role-tiered model that served more
+    # than one tier lists them ALL, comma-joined in the kit's display order
+    # (tier_rank_case), rather than repeating the model; its
+    # estimated/event/unpriced counts are summed across those tiers in SQL.
+    # by_rung breaks the 'ladder' rows of by_tier down by escalation rung
+    # (high / xhigh / max / frontier, read only from the named
+    # marvin:escalation-* persona — see rung_case). A ladder row with no such
+    # name (the model-prefix fallback, or an unrecognized marvin:escalation-*
+    # suffix) is COALESCEd into RUNG_FALLBACK_LABEL rather than dropped, so
+    # the rung breakdown always sums to the tier total; the label is a real
+    # GROUP BY key, so it only appears when at least one such row exists.
+    rows = conn.execute(f"""
 WITH priced AS (
   SELECT e.in_tok, e.out_tok, e.cache_r, e.cache_w, {cw1h} AS cache_w_1h,
          e.kind AS kind, e.agent AS agent,
@@ -507,6 +528,11 @@ WITH priced AS (
 tiered AS (
   SELECT *, {tier_case()} AS tier FROM priced
 ),
+tagged AS (
+  SELECT *, CASE WHEN tier = 'ladder'
+                 THEN COALESCE({rung_case()}, :rung_fallback) END AS rung
+  FROM tiered
+),
 per_model_tier AS (
   SELECT model_name, tier,
          SUM(in_tok) AS i, SUM(out_tok) AS o,
@@ -519,25 +545,33 @@ per_model_tier AS (
          SUM(CASE WHEN estimated = 1 THEN 1 ELSE 0 END) AS est_n,
          COUNT(*) AS ev_n,
          SUM(CASE WHEN rate_from IS NULL THEN 1 ELSE 0 END) AS unpriced_n
-  FROM tiered GROUP BY model_name, tier
+  FROM tagged GROUP BY model_name, tier
 )
-SELECT p1.model_name,
+SELECT 'by_model' AS part, p1.model_name AS label,
        (SELECT group_concat(t, ', ') FROM (
           SELECT tier AS t FROM per_model_tier p2
           WHERE p2.model_name = p1.model_name
-          ORDER BY """ + tier_rank_case("tier") + f"""
-        )),
-       SUM(p1.i), SUM(p1.o), ROUND(SUM(p1.cost), 4), MAX(p1.rate_from),
-       SUM(p1.est_n), SUM(p1.ev_n), SUM(p1.unpriced_n)
+          ORDER BY """ + tier_rank_case("tier") + """
+        )) AS tiers,
+       SUM(p1.i) AS i, SUM(p1.o) AS o, ROUND(SUM(p1.cost), 4) AS cost,
+       MAX(p1.rate_from) AS rate_from, SUM(p1.est_n) AS est_n,
+       SUM(p1.ev_n) AS n, SUM(p1.unpriced_n) AS unpriced_n
 FROM per_model_tier p1
 GROUP BY p1.model_name
-ORDER BY SUM(p1.o) DESC, p1.model_name;""").fetchall()
-    # by_model is ONE row per model again (F1): a role-tiered model that
-    # served more than one tier lists them ALL, comma-joined in the kit's
-    # display order (tier_rank_case), rather than repeating the model. The
-    # per-model estimated/event/unpriced counts are exactly what main always
-    # computed (each is now already summed across tiers by the SQL above, not
-    # in Python) — the role split lives ONLY in by_tier (and by_rung) below.
+UNION ALL
+SELECT 'by_tier', tier, NULL, SUM(in_tok), SUM(out_tok), NULL, NULL, NULL,
+       COUNT(*), NULL
+FROM tagged
+GROUP BY tier
+UNION ALL
+SELECT 'by_rung', rung, NULL, SUM(in_tok), SUM(out_tok), NULL, NULL, NULL,
+       COUNT(*), NULL
+FROM tagged
+WHERE tier = 'ladder'
+GROUP BY rung
+ORDER BY part, o DESC, label;""",
+                        {"rung_fallback": RUNG_FALLBACK_LABEL}).fetchall()
+    by_model = [r[1:] for r in rows if r[0] == "by_model"]
     d["by_model"] = [tuple(r[:6]) for r in by_model]
     d["estimated_by_model"] = {r[0]: r[6] for r in by_model if r[6]}
     d["events_by_model"] = {r[0]: r[7] for r in by_model}
@@ -550,33 +584,10 @@ ORDER BY SUM(p1.o) DESC, p1.model_name;""").fetchall()
         " FROM events WHERE ts >= strftime('%s','now','-7 days')"
         f" AND {NOT_BACKLOG}"
         " GROUP BY kind").fetchall()
-    d["by_tier"] = conn.execute(
-        "SELECT " + tier_case(model="m.name", kind="e.kind", agent="e.agent") +
-        ", SUM(e.in_tok), SUM(e.out_tok), COUNT(*)"
-        " FROM events e JOIN models m ON m.id = e.model_id"
-        " WHERE e.ts >= strftime('%s','now','-7 days')"
-        f" AND {NOT_BACKLOG}"
-        " GROUP BY 1 ORDER BY SUM(e.out_tok) DESC, 1").fetchall()
-    # Ladder rungs, broken out from the 'ladder' tier rows above: high / xhigh
-    # / max / frontier, read only from the named marvin:escalation-* persona
-    # (see rung_case). A ladder row with no such name (the model-prefix
-    # fallback, or an unrecognized marvin:escalation-* suffix) is COALESCEd
-    # into RUNG_FALLBACK_LABEL rather than dropped, so the rung breakdown
-    # always sums to the tier total; the label is a real GROUP BY key, so it
-    # only appears — "shown only when non-zero" — when at least one such row
-    # exists in the window.
-    d["by_rung"] = conn.execute(
-        "SELECT rung, SUM(in_tok), SUM(out_tok), COUNT(*) FROM ("
-        " SELECT COALESCE(" + rung_case(agent="e.agent") + ", ?) AS rung,"
-        " e.in_tok AS in_tok, e.out_tok AS out_tok"
-        " FROM events e JOIN models m ON m.id = e.model_id"
-        " WHERE e.ts >= strftime('%s','now','-7 days')"
-        f" AND {NOT_BACKLOG}"
-        " AND (" + tier_case(model="m.name", kind="e.kind", agent="e.agent") +
-        ") = 'ladder'"
-        ") r"
-        " GROUP BY rung ORDER BY SUM(out_tok) DESC, rung",
-        (RUNG_FALLBACK_LABEL,)).fetchall()
+    d["by_tier"] = [(r[1], r[3], r[4], r[8]) for r in rows
+                    if r[0] == "by_tier"]
+    d["by_rung"] = [(r[1], r[3], r[4], r[8]) for r in rows
+                    if r[0] == "by_rung"]
     d["by_issue"] = conn.execute(
         "SELECT issue_key, SUM(in_tok), SUM(out_tok), SUM(cache_r),"
         " SUM(cache_w), COUNT(*) FROM events WHERE issue_key IS NOT NULL"

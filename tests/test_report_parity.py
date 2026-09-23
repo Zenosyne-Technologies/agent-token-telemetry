@@ -1241,13 +1241,44 @@ ROLE_ROWS = [
     (1, "Explore", "H", 2029, "micro", None),
     (0, "marvin:developer", "S", 2030, "heavy", None),   # kind=0, named agent
     (1, "unknown-thing", "F", 2031, "ladder", None),
+    # named personas hosted on a claude-fable-* model (val141b N1): the role
+    # wins over the model's 'ladder' prefix, so a copy of the rule that lost a
+    # persona branch would drop these into ladder / the fallback rung.
+    (1, "marvin:developer", "F", 2032, "heavy", None),
+    (1, "marvin:researcher", "F", 2033, "heavy", None),
+    (1, "marvin:validator-completion", "F", 2034, "heavy", None),
+    (1, "marvin:developer-small", "F", 2035, "small", None),
+    (1, "marvin:ponytail", "F", 2036, "micro", None),
+    (1, "marvin:escalation-high", "F", 2037, "ladder", "high"),
+    (0, "marvin:documenter", "F", 2038, "small", None),  # kind=0, named agent
 ]
 
 
-def role_corpus_sql(owner):
+def role_event_rows(per_event_model=False):
+    """ROLE_ROWS as (kind, agent, model_name, out_tok) load rows.
+
+    ``per_event_model`` gives every row its OWN model (the family model name
+    plus an ``-evNN`` suffix, so the model-prefix fallback still sees the
+    same family) and an ``out_tok`` of ``2**i``: by_model then carries one
+    row per event, and any by_tier / by_rung output sum decodes to exactly
+    the set of events in that bucket (see :func:`decode_events`)."""
+    if not per_event_model:
+        return [(kind, agent, ROLE_MODELS[mk], out_tok)
+                for kind, agent, mk, out_tok, _t, _r in ROLE_ROWS]
+    return [(kind, agent, f"{ROLE_MODELS[mk]}-ev{i:02d}", 2 ** i)
+            for i, (kind, agent, mk, _o, _t, _r) in enumerate(ROLE_ROWS)]
+
+
+def decode_events(out_sum):
+    """The ROLE_ROWS indexes whose ``2**i`` out_tok make up ``out_sum``."""
+    return {i for i in range(len(ROLE_ROWS)) if out_sum >> i & 1}
+
+
+def role_corpus_sql(owner, per_event_model=False):
     """ROLE_ROWS as owner/natural-keyed Postgres INSERTs (schema.sql shape),
     in one project/session — pricing is irrelevant to tier/rung, so none is
-    loaded."""
+    loaded. ``per_event_model``: see :func:`role_event_rows`."""
+    rows = role_event_rows(per_event_model)
     out = [
         f"INSERT INTO public.users(uuid, name, created_at) VALUES"
         f" ({_sql_lit(owner)}, 'RoleTester', {NOW});",
@@ -1256,22 +1287,24 @@ def role_corpus_sql(owner):
         f"INSERT INTO public.sessions(owner_id, uuid, project_path) VALUES"
         f" ({_sql_lit(owner)}, 's-role', '/role');",
     ]
-    for name in ROLE_MODELS.values():
+    for name in dict.fromkeys(r[2] for r in rows):
         out.append(f"INSERT INTO public.models(owner_id, name) VALUES"
                    f" ({_sql_lit(owner)}, {_sql_lit(name)});")
-    for kind, agent, mk, out_tok, _tier, _rung in ROLE_ROWS:
+    for kind, agent, model, out_tok in rows:
         out.append(
             "INSERT INTO public.events(owner_id, session_uuid, model_name, ts,"
             " kind, agent, in_tok, out_tok, cache_r, cache_w, cache_w_1h,"
             " issue_key, note) VALUES ("
-            f"{_sql_lit(owner)}, 's-role', {_sql_lit(ROLE_MODELS[mk])}, {NOW},"
+            f"{_sql_lit(owner)}, 's-role', {_sql_lit(model)}, {NOW},"
             f" {kind}, {_sql_lit(agent)}, 1, {out_tok}, 0, 0, 0, NULL, NULL);")
     return "\n".join(out)
 
 
-def build_sqlite_role_corpus(path):
+def build_sqlite_role_corpus(path, per_event_model=False):
     """The SAME ROLE_ROWS fixture in a fresh SQLite DB — the local half of
-    the role-rule fixture's local<->remote parity check."""
+    the role-rule fixture's local<->remote parity check.
+    ``per_event_model``: see :func:`role_event_rows`."""
+    rows = role_event_rows(per_event_model)
     conn = capture.connect(path)
     conn.execute("DELETE FROM pricing")
     pid = conn.execute(
@@ -1280,14 +1313,14 @@ def build_sqlite_role_corpus(path):
         "INSERT INTO sessions(uuid, project_id) VALUES ('s-role', ?)",
         (pid,)).lastrowid
     mid = {}
-    for key, name in ROLE_MODELS.items():
-        mid[key] = conn.execute(
+    for name in dict.fromkeys(r[2] for r in rows):
+        mid[name] = conn.execute(
             "INSERT INTO models(name) VALUES (?)", (name,)).lastrowid
-    for kind, agent, mk, out_tok, _tier, _rung in ROLE_ROWS:
+    for kind, agent, model, out_tok in rows:
         conn.execute(
             "INSERT INTO events(ts, session_id, kind, agent, model_id, in_tok,"
             " out_tok, cache_r, cache_w, cache_w_1h) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (NOW, sid, kind, agent, mid[mk], 1, out_tok, 0, 0, 0))
+            (NOW, sid, kind, agent, mid[model], 1, out_tok, 0, 0, 0))
     conn.commit()
     conn.close()
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
@@ -1310,6 +1343,157 @@ def role_expected_totals():
             r[0] += out_tok
             r[1] += 1
     return tiers, rungs
+
+
+def assert_breakdowns_agree(tc, d):
+    """N1: by_model's tier list, by_tier and by_rung classify every event of
+    the per-event-model ROLE_ROWS fixture (:func:`role_event_rows`) the SAME
+    way — and the way ROLE_ROWS expects. by_model has one row per event, so
+    its tier cell IS that event's tier; each by_tier / by_rung output sum
+    decodes (:func:`decode_events`) to the exact set of events in the bucket.
+    A divergent copy of the tier or rung rule in any one breakdown therefore
+    shows up as a set mismatch here, even where the bucket totals of another
+    fixture would happen to coincide."""
+    full = 2 ** len(ROLE_ROWS)
+    exp_tier = {i: r[4] for i, r in enumerate(ROLE_ROWS)}
+    exp_rung = {}
+    for i, r in enumerate(ROLE_ROWS):
+        if r[4] == "ladder":
+            exp_rung.setdefault(r[5] or report.RUNG_FALLBACK_LABEL,
+                                set()).add(i)
+    model_tier = {}
+    for name, tier, inp, outp, _cost, _rf in d["by_model"]:
+        ev = decode_events(outp)
+        tc.assertTrue(outp < full and len(ev) == 1 and inp == 1,
+                      (name, tier, inp, outp))
+        model_tier[ev.pop()] = tier
+    tc.assertEqual(model_tier, exp_tier)          # by_model, per event
+    tier_sets = {}
+    for tier, inp, outp, n in d["by_tier"]:
+        ev = decode_events(outp)
+        tc.assertTrue(outp < full and len(ev) == n == inp, (tier, inp, outp, n))
+        tier_sets[tier] = ev
+    tc.assertEqual(tier_sets, {                    # by_tier == by_model
+        t: {i for i, x in model_tier.items() if x == t}
+        for t in set(model_tier.values())})
+    rung_sets = {}
+    for rung, inp, outp, n in d["by_rung"]:
+        ev = decode_events(outp)
+        tc.assertTrue(outp < full and len(ev) == n == inp, (rung, inp, outp, n))
+        rung_sets[rung] = ev
+    # by_rung partitions EXACTLY by_tier's (and by_model's) ladder events
+    tc.assertEqual(sum(len(v) for v in rung_sets.values()),
+                   len(tier_sets.get("ladder", set())))
+    tc.assertEqual(set().union(*rung_sets.values()),
+                   tier_sets.get("ladder", set()))
+    tc.assertEqual(rung_sets, exp_rung)
+
+
+class TestBreakdownsAgreeLocal(unittest.TestCase):
+    """N1, local half (always on): the SQLite dialect's by_model tier list,
+    by_tier and by_rung agree event-for-event (see
+    :func:`assert_breakdowns_agree`); the Postgres half is
+    TestPostgresRoleRuleFixture.test_breakdowns_agree_event_for_event_remote."""
+
+    def test_breakdowns_agree_event_for_event_local(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        conn = build_sqlite_role_corpus(pathlib.Path(tmp.name) / "usage.db",
+                                        per_event_model=True)
+        self.addCleanup(conn.close)
+        assert_breakdowns_agree(self, report.fetch_token_stats(conn))
+
+
+# ---------------------------------------------------------------------------
+# by_rung tie fixture (val141b N2): the four named rungs plus the fallback
+# label, every one at the SAME output, so by_rung is a five-way tie on its
+# sort key and only the final tie-break on the rung name (SQLite BINARY /
+# Postgres COLLATE "C") decides the order. Each permutation differs from the
+# expected byte order; on Postgres each also runs on a database whose default
+# collation reverses b..z, where a sort-based GROUP BY hands the rungs to the
+# final sort in reversed order.
+# ---------------------------------------------------------------------------
+RUNG_TIE_OUT = 5000
+# (agent, model) per rung label; 'claude' on a fable model is a model-prefix
+# ladder row with no named rung -> the fallback label.
+RUNG_TIE_ROWS = {
+    "frontier": ("marvin:escalation-frontier", "claude-sonnet-5"),
+    "high": ("marvin:escalation-high", "claude-sonnet-5"),
+    "max": ("marvin:escalation-max", "claude-sonnet-5"),
+    report.RUNG_FALLBACK_LABEL: ("claude", "claude-fable-5-1"),
+    "xhigh": ("marvin:escalation-xhigh", "claude-sonnet-5"),
+}
+EXPECTED_TIED_RUNGS = sorted(RUNG_TIE_ROWS)      # byte order
+RUNG_TIE_PERMUTATIONS = (
+    tuple(reversed(EXPECTED_TIED_RUNGS)),
+    ("max", "xhigh", "frontier", report.RUNG_FALLBACK_LABEL, "high"),
+    ("high", report.RUNG_FALLBACK_LABEL, "xhigh", "frontier", "max"),
+)
+
+
+def sqlite_rung_tie_order(path, order):
+    """Fresh SQLite DB at ``path`` holding only the rung tie rows, inserted
+    in ``order``; returns the local dialect's by_rung labels, in order."""
+    conn = capture.connect(path)
+    try:
+        with conn:
+            pid = conn.execute("INSERT INTO projects(path, name)"
+                               " VALUES ('/rt', 'RT')").lastrowid
+            sid = conn.execute("INSERT INTO sessions(uuid, project_id)"
+                               " VALUES ('s-rt', ?)", (pid,)).lastrowid
+            mid = {}
+            for label in order:
+                agent, model = RUNG_TIE_ROWS[label]
+                if model not in mid:
+                    mid[model] = conn.execute(
+                        "INSERT INTO models(name) VALUES (?)",
+                        (model,)).lastrowid
+                conn.execute(
+                    "INSERT INTO events(ts, session_id, kind, agent, model_id,"
+                    " in_tok, out_tok, cache_r, cache_w, cache_w_1h)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (NOW, sid, 1, agent, mid[model], 1, RUNG_TIE_OUT, 0, 0, 0))
+        return [r[0] for r in report.fetch_token_stats(conn)["by_rung"]]
+    finally:
+        conn.close()
+
+
+def pg_rung_tie_sql(owner, order):
+    """The rung tie rows as Postgres INSERTs, inserted in ``order``."""
+    out = [f"INSERT INTO public.users(uuid, name, created_at) VALUES"
+           f" ({_sql_lit(owner)}, 'RungTie', {NOW});",
+           f"INSERT INTO public.projects(owner_id, path, name) VALUES"
+           f" ({_sql_lit(owner)}, '/rt', 'RT');",
+           f"INSERT INTO public.sessions(owner_id, uuid, project_path) VALUES"
+           f" ({_sql_lit(owner)}, 's-rt', '/rt');"]
+    for model in dict.fromkeys(RUNG_TIE_ROWS[label][1] for label in order):
+        out.append(f"INSERT INTO public.models(owner_id, name) VALUES"
+                   f" ({_sql_lit(owner)}, {_sql_lit(model)});")
+    for label in order:
+        agent, model = RUNG_TIE_ROWS[label]
+        out.append(
+            "INSERT INTO public.events(owner_id, session_uuid, model_name, ts,"
+            " kind, agent, in_tok, out_tok, cache_r, cache_w, cache_w_1h,"
+            " issue_key, note) VALUES ("
+            f"{_sql_lit(owner)}, 's-rt', {_sql_lit(model)}, {NOW}, 1,"
+            f" {_sql_lit(agent)}, 1, {RUNG_TIE_OUT}, 0, 0, 0, NULL, NULL);")
+    return "\n".join(out)
+
+
+class TestRungTieBreakLocal(unittest.TestCase):
+    """N2, local half (always on): a by_rung tie on output orders by the
+    rung name's byte order, whatever the insertion order."""
+
+    def test_by_rung_tie_breaks_on_rung_name_local(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for i, order in enumerate(RUNG_TIE_PERMUTATIONS):
+            with self.subTest(permutation=i):
+                self.assertNotEqual(list(order), EXPECTED_TIED_RUNGS)
+                self.assertEqual(
+                    sqlite_rung_tie_order(
+                        pathlib.Path(tmp.name) / f"rt{i}.db", order),
+                    EXPECTED_TIED_RUNGS)
 
 
 @unittest.skipUnless(PG_TOOLS, PG_REASON)
@@ -1407,6 +1591,78 @@ class TestPostgresRoleRuleFixture(unittest.TestCase):
         self.assertEqual(sum(o for _r, _i, o, _n in loc["by_rung"]), ladder)
         self.assertEqual(sum(o for _r, _i, o, _n in pg["by_rung"]), ladder)
 
+    def _fresh_db(self, tag, sql, reversed_collation=False):
+        """A throwaway DB holding schema + reports + ``sql``, dropped at test
+        end; ``reversed_collation`` as TestPostgresEquivalence's
+        _fresh_corpus_db (ICU default collation with b..z reversed)."""
+        db = f"{self.dbname}_{tag}"
+        env = os.environ.copy()
+        subprocess.run(["dropdb", "--if-exists", db], capture_output=True,
+                       env=env, timeout=30)
+        if reversed_collation:
+            r = subprocess.run(
+                ["psql", "-X", "-q", "-d", "postgres", "-c",
+                 f"CREATE DATABASE {db} TEMPLATE template0"
+                 " LOCALE_PROVIDER icu ICU_LOCALE 'und' ICU_RULES"
+                 f" '{REVERSED_ICU_RULES}';"],
+                capture_output=True, text=True, env=env, timeout=30)
+            if r.returncode != 0:
+                self.skipTest("server lacks ICU collation rules: "
+                              + r.stderr.strip())
+        else:
+            subprocess.run(["createdb", db], check=True, capture_output=True,
+                           env=env, timeout=30)
+        self.addCleanup(subprocess.run, ["dropdb", "--if-exists", db],
+                        capture_output=True, env=env, timeout=30)
+        TestPostgresEquivalence._run_sql_file(
+            db, "\n".join([PG_SHIM, SCHEMA_SQL, REPORTS_SQL, sql]))
+        return db
+
+    def _rpc_on(self, db):
+        r = subprocess.run(
+            ["psql", "-X", "-A", "-t", "-d", db, "-c",
+             "SELECT public.report_token_stats();"],
+            capture_output=True, text=True, env=os.environ.copy(), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return supabase_backend._map_token_stats(json.loads(r.stdout.strip()))
+
+    def test_breakdowns_agree_event_for_event_remote(self):
+        # N1, remote half: through the REAL RPC, by_model's tier list,
+        # by_tier and by_rung classify every event identically (and as
+        # ROLE_ROWS expects) — see assert_breakdowns_agree.
+        db = self._fresh_db("agree", role_corpus_sql(ROLE_OWNER,
+                                                     per_event_model=True))
+        pg = self._rpc_on(db)
+        assert_breakdowns_agree(self, pg)
+        # and the local dialect returns the very same three breakdowns
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        conn = build_sqlite_role_corpus(pathlib.Path(tmp.name) / "usage.db",
+                                        per_event_model=True)
+        self.addCleanup(conn.close)
+        loc = report.fetch_token_stats(conn)
+        for key in ("by_model", "by_tier", "by_rung"):
+            self.assertEqual([tuple(r[:4]) for r in pg[key]],
+                             [tuple(r[:4]) for r in loc[key]], key)
+
+    def test_by_rung_tie_breaks_on_rung_name_remote(self):
+        # N2, remote half: a by_rung tie on output orders by COLLATE "C" on
+        # the rung name — whatever the insertion order and whatever the
+        # database's default collation — and equals the local order.
+        cases = [(i, order, rev) for rev in (False, True)
+                 for i, order in enumerate(RUNG_TIE_PERMUTATIONS)]
+        for i, order, rev in cases:
+            with self.subTest(permutation=i, reversed_collation=rev):
+                db = self._fresh_db(f"rt{i}{'r' if rev else ''}",
+                                    pg_rung_tie_sql(ROLE_OWNER, order),
+                                    reversed_collation=rev)
+                got = [r[0] for r in self._rpc_on(db)["by_rung"]]
+                self.assertEqual(got, EXPECTED_TIED_RUNGS)
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                self.assertEqual(sqlite_rung_tie_order(
+                    pathlib.Path(tmp.name) / "rt.db", order), got)
+
 
 class TestReportsSecurityHardening(unittest.TestCase):
     """Always-on structural guards on supabase/reports.sql (no Postgres needed).
@@ -1444,6 +1700,74 @@ class TestReportsSecurityHardening(unittest.TestCase):
             self.assertIn(f"REVOKE ALL ON {v} FROM PUBLIC, anon;",
                           REPORTS_SQL)
             self.assertIn(f"DROP VIEW IF EXISTS {v};", REPORTS_SQL)
+
+
+class TestTierRuleDefinedOnce(unittest.TestCase):
+    """N1: the role tier rule and the rung rule are written exactly ONCE per
+    dialect, so a single-copy edit cannot make by_model, by_tier and by_rung
+    disagree. Postgres: one CASE, in report_token_stats' `tagged` CTE, which
+    the three aggregates read (tests/test_family_default.py pins the
+    `estimated` expression the same way). SQLite: tier_case()/rung_case()
+    are each spliced by exactly one call site (fetch_token_stats' own
+    `tagged` CTE). The behavioural twin is assert_breakdowns_agree."""
+
+    # one distinctive fragment per branch of each rule (comments stripped)
+    TIER_FRAGMENTS = (
+        "kind = 0 AND pe.agent IS NULL THEN 'orchestrator'",
+        "IN ('marvin:developer', 'marvin:researcher')",
+        "LIKE 'marvin:validator-%' THEN 'heavy'",
+        "LIKE 'marvin:escalation-%' THEN 'ladder'",
+        "IN ('marvin:developer-small', 'marvin:documenter')",
+        "= 'marvin:ponytail' THEN 'micro'",
+        "LIKE 'claude-opus-%'", "LIKE 'claude-sonnet-%'",
+        "LIKE 'claude-haiku-%'", "LIKE 'claude-fable-%'",
+        "ELSE 'unknown' END",
+    )
+    RUNG_FRAGMENTS = tuple(f"'marvin:escalation-{r}'"
+                           for r in ("high", "xhigh", "max", "frontier"))
+
+    @staticmethod
+    def _code(sql):
+        return "\n".join(l.split("--", 1)[0] for l in sql.splitlines())
+
+    def test_reports_sql_states_each_rule_exactly_once(self):
+        code = self._code(REPORTS_SQL)
+        flat = re.sub(r"\s+", " ", code)
+        for frag in self.TIER_FRAGMENTS + self.RUNG_FRAGMENTS:
+            with self.subTest(fragment=frag):
+                self.assertEqual(flat.count(frag), 1, frag)
+        # the CTE carrying them is what the three breakdowns read
+        self.assertEqual(flat.count("WITH tagged AS ("), 1)
+        for key in ("'by_model'", "'by_tier'", "'by_rung'"):
+            body = flat.split(key + ", (", 1)[1].split("'by_", 1)[0]
+            with self.subTest(breakdown=key):
+                self.assertIn("FROM tagged t", body)
+                self.assertNotIn("CASE WHEN", body.replace(
+                    "CASE tier WHEN", ""))  # no restated rule
+                self.assertNotIn("report_priced_events", body)
+
+    def test_report_py_splices_each_rule_exactly_once(self):
+        import ast
+        import warnings
+        # ast.parse allocates enough to trigger a GC pass, which would report
+        # other tests' already-leaked sqlite handles as ResourceWarnings here
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            tree = ast.parse(pathlib.Path(report.__file__).read_text())
+        calls = {"tier_case": 0, "rung_case": 0}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in calls):
+                calls[node.func.id] += 1
+        self.assertEqual(calls, {"tier_case": 1, "rung_case": 1})
+        # and no other script restates the rule text
+        for path in (REPO / "scripts").glob("*.py"):
+            if path.name == "report.py":
+                continue
+            with self.subTest(script=path.name):
+                src = path.read_text()
+                self.assertNotIn("'marvin:ponytail'", src)
+                self.assertNotIn("marvin:escalation-high", src)
 
 
 if __name__ == "__main__":

@@ -243,6 +243,10 @@ GRANT EXECUTE ON FUNCTION public.report_project_stats() TO authenticated;
 -- unrecognized marvin:escalation-* suffix) is grouped under v_rung_fallback
 -- ('no rung (fallback)') instead of dropped, so by_rung's rows always sum to
 -- by_tier's ladder total.
+-- The tier and rung rules are written ONCE, in the `tagged` CTE at the top of
+-- the function body: by_model, by_tier and by_rung all read its `tier`/`rung`
+-- columns, so the three breakdowns cannot classify the same event differently
+-- (tests/test_report_parity.py pins that the CASE appears exactly once here).
 -- Raw path+name are returned for by_project (basename stays client-side).
 -- The estimate figures (estimated_by_model, events_by_model, unpriced_by_model,
 -- models_without_own_price) mirror report.py's keys of the same names; they
@@ -266,6 +270,39 @@ DECLARE
   v_rung_fallback text := 'no rung (fallback)';
   result  jsonb;
 BEGIN
+  -- `tagged` — every event in the by_model/by_tier/by_rung window (7 days,
+  -- backlog excluded), with its ROLE tier and, for a ladder-tier event, its
+  -- escalation rung. This is the ONE Postgres definition of both rules (twin
+  -- of report.py's tier_case()/rung_case(), which fetch_token_stats likewise
+  -- splices once into its own shared CTE); the three aggregates below only
+  -- ever read t.tier / t.rung, never restate a CASE.
+  WITH tagged AS (
+    SELECT tt.*,
+           CASE WHEN tt.tier = 'ladder' THEN coalesce(CASE
+             WHEN tt.agent = 'marvin:escalation-high'     THEN 'high'
+             WHEN tt.agent = 'marvin:escalation-xhigh'    THEN 'xhigh'
+             WHEN tt.agent = 'marvin:escalation-max'      THEN 'max'
+             WHEN tt.agent = 'marvin:escalation-frontier' THEN 'frontier'
+           END, v_rung_fallback) END AS rung
+    FROM (
+      SELECT pe.*,
+             CASE
+               WHEN pe.kind = 0 AND pe.agent IS NULL THEN 'orchestrator'
+               WHEN pe.agent IN ('marvin:developer', 'marvin:researcher')
+                    OR pe.agent LIKE 'marvin:validator-%' THEN 'heavy'
+               WHEN pe.agent LIKE 'marvin:escalation-%' THEN 'ladder'
+               WHEN pe.agent IN ('marvin:developer-small', 'marvin:documenter')
+                    THEN 'small'
+               WHEN pe.agent = 'marvin:ponytail' THEN 'micro'
+               WHEN pe.model_name LIKE 'claude-opus-%'   THEN 'heavy'
+               WHEN pe.model_name LIKE 'claude-sonnet-%' THEN 'small'
+               WHEN pe.model_name LIKE 'claude-haiku-%'  THEN 'micro'
+               WHEN pe.model_name LIKE 'claude-fable-%'  THEN 'ladder'
+               ELSE 'unknown' END AS tier
+      FROM public.report_priced_events pe
+      WHERE pe.ts >= v_week AND coalesce(pe.note, '') <> 'backlog-capture'
+    ) tt
+  )
   SELECT jsonb_build_object(
     'today', (
       SELECT jsonb_build_array(
@@ -316,7 +353,7 @@ BEGIN
     -- INNER per-(model,tier) grouping's `string_agg(... ORDER BY tier_rank)`
     -- — a documented Postgres aggregate-ORDER-BY extension. `tier_rank` is a
     -- rank over the tier TEXT only (mirrors report.py's tier_rank_case), so
-    -- it cannot itself drift from a role-rule edit to the tier CASE below.
+    -- it cannot itself drift from a role-rule edit to the `tagged` CTE's CASE.
     'by_model', (
       SELECT coalesce(jsonb_agg(
                jsonb_build_array(model_name, tier_list, i, o, cost, rate_from)
@@ -332,36 +369,19 @@ BEGIN
                round(sum(cost)::numeric, 4) AS cost,
                max(rate_from) AS rate_from
         FROM (
-          SELECT pe.model_name AS model_name,
-                 CASE
-                   WHEN pe.kind = 0 AND pe.agent IS NULL THEN 'orchestrator'
-                   WHEN pe.agent IN ('marvin:developer', 'marvin:researcher')
-                        OR pe.agent LIKE 'marvin:validator-%' THEN 'heavy'
-                   WHEN pe.agent LIKE 'marvin:escalation-%' THEN 'ladder'
-                   WHEN pe.agent IN ('marvin:developer-small', 'marvin:documenter')
-                        THEN 'small'
-                   WHEN pe.agent = 'marvin:ponytail' THEN 'micro'
-                   WHEN pe.model_name LIKE 'claude-opus-%'   THEN 'heavy'
-                   WHEN pe.model_name LIKE 'claude-sonnet-%' THEN 'small'
-                   WHEN pe.model_name LIKE 'claude-haiku-%'  THEN 'micro'
-                   WHEN pe.model_name LIKE 'claude-fable-%'  THEN 'ladder'
-                   ELSE 'unknown' END AS tier,
-                 sum(pe.in_tok) AS i, sum(pe.out_tok) AS o,
+          SELECT t.model_name AS model_name, t.tier AS tier,
+                 sum(t.in_tok) AS i, sum(t.out_tok) AS o,
                  sum(
-                   pe.in_tok  * coalesce(pe.in_usd, 0)
-                 + pe.out_tok * coalesce(pe.out_usd, 0)
-                 + pe.cache_r * coalesce(pe.cache_r_usd, 0)
-                 + (pe.cache_w - pe.cache_w_1h) * coalesce(pe.cache_w_usd, 0)
-                 + pe.cache_w_1h
-                     * coalesce(pe.cache_w_1h_usd, pe.cache_w_usd, 0)
+                   t.in_tok  * coalesce(t.in_usd, 0)
+                 + t.out_tok * coalesce(t.out_usd, 0)
+                 + t.cache_r * coalesce(t.cache_r_usd, 0)
+                 + (t.cache_w - t.cache_w_1h) * coalesce(t.cache_w_usd, 0)
+                 + t.cache_w_1h
+                     * coalesce(t.cache_w_1h_usd, t.cache_w_usd, 0)
                  ) / 1000000.0 AS cost,
-                 max(pe.rate_from) AS rate_from
-          FROM public.report_priced_events pe
-          WHERE pe.ts >= v_week AND coalesce(pe.note, '') <> 'backlog-capture'
-          -- grouping by the output alias `tier` (not repeating the CASE) is a
-          -- documented Postgres extension: GROUP BY may reference an output
-          -- column's name, same as ORDER BY.
-          GROUP BY pe.model_name, tier
+                 max(t.rate_from) AS rate_from
+          FROM tagged t
+          GROUP BY t.model_name, t.tier
         ) per_model_tier
         GROUP BY model_name
       ) q),
@@ -383,23 +403,10 @@ BEGIN
                jsonb_build_array(tier, i, o, n)
                ORDER BY o DESC, tier COLLATE pg_catalog."C"), '[]'::jsonb)
       FROM (
-        SELECT CASE
-                 WHEN pe.kind = 0 AND pe.agent IS NULL THEN 'orchestrator'
-                 WHEN pe.agent IN ('marvin:developer', 'marvin:researcher')
-                      OR pe.agent LIKE 'marvin:validator-%' THEN 'heavy'
-                 WHEN pe.agent LIKE 'marvin:escalation-%' THEN 'ladder'
-                 WHEN pe.agent IN ('marvin:developer-small', 'marvin:documenter')
-                      THEN 'small'
-                 WHEN pe.agent = 'marvin:ponytail' THEN 'micro'
-                 WHEN pe.model_name LIKE 'claude-opus-%'   THEN 'heavy'
-                 WHEN pe.model_name LIKE 'claude-sonnet-%' THEN 'small'
-                 WHEN pe.model_name LIKE 'claude-haiku-%'  THEN 'micro'
-                 WHEN pe.model_name LIKE 'claude-fable-%'  THEN 'ladder'
-                 ELSE 'unknown' END AS tier,
-               sum(pe.in_tok) AS i, sum(pe.out_tok) AS o, count(*) AS n
-        FROM public.report_priced_events pe
-        WHERE pe.ts >= v_week AND coalesce(pe.note, '') <> 'backlog-capture'
-        GROUP BY tier
+        SELECT t.tier AS tier,
+               sum(t.in_tok) AS i, sum(t.out_tok) AS o, count(*) AS n
+        FROM tagged t
+        GROUP BY t.tier
       ) q),
     -- Ladder rungs, broken out from the 'ladder' rows of by_tier above: high /
     -- xhigh / max / frontier, read only from the named marvin:escalation-*
@@ -414,36 +421,11 @@ BEGIN
                jsonb_build_array(rung, i, o, n)
                ORDER BY o DESC, rung COLLATE pg_catalog."C"), '[]'::jsonb)
       FROM (
-        SELECT rung, pg_catalog.sum(in_tok) AS i, pg_catalog.sum(out_tok) AS o,
-               pg_catalog.count(*) AS n
-        FROM (
-          SELECT
-            coalesce(CASE
-              WHEN pe.agent = 'marvin:escalation-high'     THEN 'high'
-              WHEN pe.agent = 'marvin:escalation-xhigh'    THEN 'xhigh'
-              WHEN pe.agent = 'marvin:escalation-max'      THEN 'max'
-              WHEN pe.agent = 'marvin:escalation-frontier' THEN 'frontier'
-            END, v_rung_fallback) AS rung,
-            pe.in_tok AS in_tok, pe.out_tok AS out_tok
-          FROM public.report_priced_events pe
-          WHERE pe.ts >= v_week AND coalesce(pe.note, '') <> 'backlog-capture'
-            AND (
-              CASE
-                WHEN pe.kind = 0 AND pe.agent IS NULL THEN 'orchestrator'
-                WHEN pe.agent IN ('marvin:developer', 'marvin:researcher')
-                     OR pe.agent LIKE 'marvin:validator-%' THEN 'heavy'
-                WHEN pe.agent LIKE 'marvin:escalation-%' THEN 'ladder'
-                WHEN pe.agent IN ('marvin:developer-small', 'marvin:documenter')
-                     THEN 'small'
-                WHEN pe.agent = 'marvin:ponytail' THEN 'micro'
-                WHEN pe.model_name LIKE 'claude-opus-%'   THEN 'heavy'
-                WHEN pe.model_name LIKE 'claude-sonnet-%' THEN 'small'
-                WHEN pe.model_name LIKE 'claude-haiku-%'  THEN 'micro'
-                WHEN pe.model_name LIKE 'claude-fable-%'  THEN 'ladder'
-                ELSE 'unknown' END
-            ) = 'ladder'
-        ) r
-        GROUP BY rung
+        SELECT t.rung AS rung, pg_catalog.sum(t.in_tok) AS i,
+               pg_catalog.sum(t.out_tok) AS o, pg_catalog.count(*) AS n
+        FROM tagged t
+        WHERE t.tier = 'ladder'
+        GROUP BY t.rung
       ) q),
     'by_issue', (
       SELECT coalesce(jsonb_agg(
