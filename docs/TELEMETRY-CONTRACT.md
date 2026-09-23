@@ -289,12 +289,16 @@ rather than re-deriving it):
   unchanged) is a family default row **or** an ancestor row for its model. Its cost is
   an estimate, not necessarily that model's published price. An unpriced event (no row
   resolves) is neither estimated nor own-priced.
-- **Model without own price** — a model name with at least one event for which **no**
+- **Model without own price** — a model name with at least one event bearing a
+  non-zero token count (input, output, cache read or cache write) for which **no**
   pricing row whose prefix is a prefix of the name is its own row (neither a family
   default row nor an ancestor row for that name), at any `effective_from`. Every event
   of such a model is estimated or unpriced (a model with no matching row at all, e.g.
   a non-Claude model, is therefore included). A model that has an own row is not one,
-  even if some of its older events predate that row and are still estimated.
+  even if some of its older events predate that row and are still estimated. A model
+  whose events are **all** zero-token (e.g. a synthetic bookkeeping model such as
+  `<synthetic>`) is excluded even when it has no own row: there is nothing of theirs
+  to price, so naming them in the footer would be noise.
 
 The report data carries these flags (`report_priced_events.estimated` — sourced
 from `report_model_pricing.estimated`, not recomputed — per-row estimated-event

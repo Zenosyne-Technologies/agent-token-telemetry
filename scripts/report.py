@@ -279,9 +279,11 @@ def own_price_footer(models):
     if not models:
         return None
     names = ", ".join(f"`{md_cell(m)}`" for m in models)
-    return (f"No own published price for {names} — their cost is an estimate"
-            " (family default or nearest listed ancestor rate) or unpriced;"
-            " `/token-telemetry:pricing-update` refreshes the pricing table.")
+    pronoun = "its" if len(models) == 1 else "their"
+    return (f"No own published price for {names} — {pronoun} cost is an"
+            " estimate (family default or nearest listed ancestor rate) or"
+            " unpriced; `/token-telemetry:pricing-update` refreshes the"
+            " pricing table.")
 
 
 def split_cell(total, left, right, bold=False):

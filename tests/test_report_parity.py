@@ -733,10 +733,22 @@ class TestPostgresEquivalence(unittest.TestCase):
             "DELETE FROM public.events WHERE session_uuid = 's-tie';"
             " DELETE FROM public.sessions WHERE uuid = 's-tie';"
             " DELETE FROM public.models WHERE name IN"
-            " ('claude-opus-9', 'claude-opus-8');"))
+            " ('claude-opus-9', 'claude-opus-8', 'claude-haiku-9');"))
+        # Baseline 'heavy'/'micro' by_tier totals from the base corpus, read
+        # BEFORE the insert below, so the third (micro-tier) row's out_tok can
+        # be sized to land EXACTLY on the new 'heavy' total — a genuine tie
+        # between two DIFFERENT tiers (by_tier's own ORDER BY), not just two
+        # models tied within the same one (by_model's).
+        base = supabase_backend._map_token_stats(
+            self._rpc("SELECT public.report_token_stats();"))
+        base_out = {t: o for t, i, o, n in base["by_tier"]}
+        heavy_total = base_out.get("heavy", 0) + 20  # the two opus rows below
+        micro_out = heavy_total - base_out.get("micro", 0)
+        self.assertGreater(micro_out, 0, "corpus drifted; recompute the tie")
         self._run_sql_file(self.dbname, "\n".join([
             f"INSERT INTO public.models(owner_id, name) VALUES"
-            f" ('{OWNER}', 'claude-opus-9'), ('{OWNER}', 'claude-opus-8');",
+            f" ('{OWNER}', 'claude-opus-9'), ('{OWNER}', 'claude-opus-8'),"
+            f" ('{OWNER}', 'claude-haiku-9');",
             "INSERT INTO public.sessions(owner_id, uuid, project_path)"
             f" VALUES ('{OWNER}', 's-tie', '/home/user/alpha');",
             "INSERT INTO public.events(owner_id, session_uuid, model_name, ts,"
@@ -745,13 +757,77 @@ class TestPostgresEquivalence(unittest.TestCase):
             f" ('{OWNER}', 's-tie', 'claude-opus-9', {NOW}, 0, NULL, 10, 10,"
             " 0, 0, 0, NULL, NULL),"
             f" ('{OWNER}', 's-tie', 'claude-opus-8', {NOW}, 0, NULL, 10, 10,"
-            " 0, 0, 0, NULL, NULL);",
+            " 0, 0, 0, NULL, NULL),"
+            f" ('{OWNER}', 's-tie', 'claude-haiku-9', {NOW}, 0, NULL, 10,"
+            f" {micro_out}, 0, 0, 0, NULL, NULL);",
         ]))
         ts = supabase_backend._map_token_stats(
             self._rpc("SELECT public.report_token_stats();"))
         names = [r[0] for r in ts["by_model"] if r[0].startswith("claude-opus-")
                  and r[0] not in ("claude-opus-4-8", "claude-opus-5-5")]
         self.assertEqual(names, ["claude-opus-8", "claude-opus-9"])
+        remote_tiers = [t for t, i, o, n in ts["by_tier"] if o == heavy_total]
+        self.assertEqual(remote_tiers, ["heavy", "micro"])
+
+        # Local (SQLite) dialect: the SAME base corpus plus the SAME tie
+        # insert must produce the SAME tier order — the parity this file
+        # exists to pin, not just each dialect's own internal ordering.
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        db_path = tmp / "usage.db"
+        build_sqlite_corpus(db_path)   # writes + closes; reopened rw below
+        conn = sqlite3.connect(db_path)
+        with conn:
+            mid = {}
+            for name in ("claude-opus-9", "claude-opus-8", "claude-haiku-9"):
+                mid[name] = conn.execute(
+                    "INSERT INTO models(name) VALUES (?)", (name,)).lastrowid
+            proj_id = conn.execute(
+                "SELECT id FROM projects WHERE path = ?",
+                ("/home/user/alpha",)).fetchone()[0]
+            sess_id = conn.execute(
+                "INSERT INTO sessions(uuid, project_id, owner_id) VALUES"
+                " (?,?,?)", ("s-tie", proj_id, OWNER)).lastrowid
+            for name, otok in (("claude-opus-9", 10), ("claude-opus-8", 10),
+                               ("claude-haiku-9", micro_out)):
+                conn.execute(
+                    "INSERT INTO events(ts, session_id, kind, agent, model_id,"
+                    " in_tok, out_tok, cache_r, cache_w, cache_w_1h)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (NOW, sess_id, 0, None, mid[name], 10, otok, 0, 0, 0))
+        local = report.fetch_token_stats(conn)
+        local_names = [r[0] for r in local["by_model"]
+                       if r[0].startswith("claude-opus-")
+                       and r[0] not in ("claude-opus-4-8", "claude-opus-5-5")]
+        self.assertEqual(local_names, ["claude-opus-8", "claude-opus-9"])
+        local_tiers = [r[0] for r in local["by_tier"] if r[2] == heavy_total]
+        self.assertEqual(local_tiers, ["heavy", "micro"])
+        conn.close()
+
+    def test_models_without_own_price_excludes_all_zero_token_models_remote(self):
+        # AOS-134 F2: a model whose every event is zero-token (e.g. a
+        # synthetic bookkeeping entry) has nothing to price and is excluded
+        # from models_without_own_price on the REMOTE (Postgres) dialect too
+        # — matching the local (SQLite) rule pinned by tests/test_report.py's
+        # test_models_without_own_price_excludes_all_zero_token_models.
+        self.addCleanup(lambda: self._run_sql_file(
+            self.dbname,
+            "DELETE FROM public.events WHERE session_uuid = 's-zero';"
+            " DELETE FROM public.sessions WHERE uuid = 's-zero';"
+            " DELETE FROM public.models WHERE name = '<synthetic>';"))
+        self._run_sql_file(self.dbname, "\n".join([
+            f"INSERT INTO public.models(owner_id, name) VALUES"
+            f" ('{OWNER}', '<synthetic>');",
+            "INSERT INTO public.sessions(owner_id, uuid, project_path)"
+            f" VALUES ('{OWNER}', 's-zero', '/home/user/alpha');",
+            "INSERT INTO public.events(owner_id, session_uuid, model_name, ts,"
+            " kind, agent, in_tok, out_tok, cache_r, cache_w, cache_w_1h,"
+            " issue_key, note) VALUES"
+            f" ('{OWNER}', 's-zero', '<synthetic>', {NOW}, 0, NULL, 0, 0,"
+            " 0, 0, 0, NULL, NULL);",
+        ]))
+        ts = supabase_backend._map_token_stats(
+            self._rpc("SELECT public.report_token_stats();"))
+        self.assertNotIn("<synthetic>", ts["models_without_own_price"])
 
     def test_models_without_own_price_requires_an_event(self):
         # AOS-134 F3: a model row with NO events at all (a pricing-less name

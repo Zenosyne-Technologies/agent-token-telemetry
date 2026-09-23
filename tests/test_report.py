@@ -719,6 +719,19 @@ class TestEstimateFlags(unittest.TestCase):
             " ancestor rate) or unpriced; `/token-telemetry:pricing-update`"
             " refreshes the pricing table.")
 
+    def test_footer_uses_singular_pronoun_for_one_model(self):
+        # a single named model reads oddly with the plural "their cost" —
+        # the footer must use "its cost" when there is exactly one.
+        md = report.render_token_stats(token_data(
+            estimated=10, without=["claude-opus-5-5"]))
+        last = md.splitlines()[-1]
+        self.assertEqual(
+            last, "No own published price for `claude-opus-5-5` — its cost"
+            " is an estimate (family default or nearest listed ancestor"
+            " rate) or unpriced; `/token-telemetry:pricing-update` refreshes"
+            " the pricing table.")
+        self.assertNotIn("their cost", last)
+
     def test_footer_sanitizes_hostile_model_name(self):
         hostile = ("evil|name\n# Heading\r\n| a | b |\t**bold** `tick`"
                    " [x](http://evil.example)\x1b[31m‮")
@@ -786,7 +799,8 @@ class TestEstimateFlags(unittest.TestCase):
         self.assertIn(f"— {ALL_EST} |", ps)
         _, ts = run(["token-stats", "--db", str(db)])
         self.assertIn(f"(seed rates) — {ALL_EST} |", ts)
-        self.assertIn("No own published price for `claude-sonnet-5` —", ts)
+        self.assertIn("No own published price for `claude-sonnet-5` — its"
+                      " cost is an estimate", ts)
 
 
 if __name__ == "__main__":
