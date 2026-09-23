@@ -723,7 +723,11 @@ def _map_token_stats(data):
     (``estimated_by_model``, ``events_by_model``, ``unpriced_by_model``,
     ``models_without_own_price``) map 1:1; each is ``None`` (not reported —
     the renderer then says nothing) only against a remote whose
-    ``reports.sql`` predates it, so the keys always match the local fetch."""
+    ``reports.sql`` predates it, so the keys always match the local fetch.
+    ``by_tier`` is now ROLE-tiered (mirrors ``report.tier_case``) and
+    ``by_rung`` breaks its 'ladder' rows down by escalation rung (mirrors
+    ``report.rung_case``); ``by_rung`` is likewise ``None`` against an older
+    ``reports.sql`` that predates it."""
     data = data or {}
 
     def counts(key):
@@ -753,6 +757,11 @@ def _map_token_stats(data):
                     for k, i, o, pct in (data.get("by_kind") or [])],
         "by_tier": [(t, _i(i), _i(o), _i(n))
                     for t, i, o, n in (data.get("by_tier") or [])],
+        # None (not [] ) when the RPC predates by_rung, mirroring the
+        # estimate-figure keys below — the renderer's `d.get("by_rung")`
+        # treats both None and [] as "nothing to show".
+        "by_rung": ([(r, _i(i), _i(o), _i(n)) for r, i, o, n in data["by_rung"]]
+                    if isinstance(data.get("by_rung"), list) else None),
         "by_issue": [(k, _i(i), _i(o), _i(cr), _i(cw), _i(n))
                      for k, i, o, cr, cw, n in (data.get("by_issue") or [])],
         "estimated_by_model": counts("estimated_by_model"),

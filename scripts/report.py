@@ -120,6 +120,55 @@ def resolved_subquery(expr):
             " LIMIT 1)")
 
 
+def tier_case(model="model_name", kind="kind", agent="agent"):
+    """Role-based cost tier for one event, as a SQL CASE expression. Mirrors
+    the kit's ``token-economics.md`` "Tier mapping" verbatim (restated in
+    ``docs/TELEMETRY-CONTRACT.md``'s own "Tier mapping" section): the main
+    session (``kind = 0``, ``agent`` NULL) is always 'orchestrator' — since kit
+    v0.30.0 the orchestrator runs on the heavy tier's own model, so a model
+    prefix can no longer tell them apart. Named ``marvin:*`` personas route to
+    their tier directly. ANY other agent (a persona the kit hasn't named, or a
+    NULL agent on a non-main-session row) falls back to its ``{model}``'s
+    prefix — the pre-v0.30 rule, kept as the catch-all, with 'unknown' for a
+    model matching no known family. ``{model}``/``{kind}``/``{agent}`` are the
+    SQL expressions for those three columns in the query this is spliced
+    into."""
+    return (
+        "CASE"
+        f" WHEN {kind} = 0 AND {agent} IS NULL THEN 'orchestrator'"
+        f" WHEN {agent} IN ('marvin:developer', 'marvin:researcher')"
+        f" OR {agent} LIKE 'marvin:validator-%' THEN 'heavy'"
+        f" WHEN {agent} LIKE 'marvin:escalation-%' THEN 'ladder'"
+        f" WHEN {agent} IN ('marvin:developer-small', 'marvin:documenter')"
+        " THEN 'small'"
+        f" WHEN {agent} = 'marvin:ponytail' THEN 'micro'"
+        f" WHEN {model} LIKE 'claude-opus-%' THEN 'heavy'"
+        f" WHEN {model} LIKE 'claude-sonnet-%' THEN 'small'"
+        f" WHEN {model} LIKE 'claude-haiku-%' THEN 'micro'"
+        f" WHEN {model} LIKE 'claude-fable-%' THEN 'ladder'"
+        " ELSE 'unknown' END"
+    )
+
+
+def rung_case(agent="agent"):
+    """Escalation rung for a ladder-tier event, read only from the exact
+    ``marvin:escalation-<rung>`` persona name — never inferred from a model or
+    effort setting. NULL for a ladder row that reached that tier through the
+    model-prefix fallback (a ``claude-fable-*`` model under an agent that is
+    not a named escalation persona): there is no rung to report for it, so it
+    contributes to the tier total but is left out of the by-rung breakdown.
+    ``{agent}`` is the SQL expression for the agent column in the query this
+    is spliced into."""
+    return (
+        "CASE"
+        f" WHEN {agent} = 'marvin:escalation-high' THEN 'high'"
+        f" WHEN {agent} = 'marvin:escalation-xhigh' THEN 'xhigh'"
+        f" WHEN {agent} = 'marvin:escalation-max' THEN 'max'"
+        f" WHEN {agent} = 'marvin:escalation-frontier' THEN 'frontier'"
+        " END"
+    )
+
+
 def rate_subquery(column):
     return resolved_subquery(f"pr.{column}")
 
@@ -372,7 +421,13 @@ def fetch_token_stats(conn):
     none omitted) — the ``M`` and ``U`` the per-model and headline cost
     qualifiers need (:func:`cost_notes`). ``models_without_own_price`` is
     :func:`fetch_models_without_own_price` (all-time), rendered as the
-    :func:`own_price_footer`."""
+    :func:`own_price_footer`.
+
+    ``by_model`` and ``by_tier`` are ROLE-tiered (see :func:`tier_case`), not
+    model-tiered: a model can appear once per tier it was actually used at.
+    ``by_rung`` breaks the 'ladder' tier rows of ``by_tier`` down by
+    escalation rung (see :func:`rung_case`); a ladder row with no named rung
+    (the model-prefix fallback) counts in ``by_tier`` but not here."""
     cw1h, cw1h_usd = priced_cte(conn)
     name = "p.name" if has_column(conn, "projects", "name") else "NULL"
 
@@ -405,6 +460,7 @@ def fetch_token_stats(conn):
     by_model = conn.execute(f"""
 WITH priced AS (
   SELECT e.in_tok, e.out_tok, e.cache_r, e.cache_w, {cw1h} AS cache_w_1h,
+         e.kind AS kind, e.agent AS agent,
          m.name AS model_name,
          {rate_subquery('in_usd')} AS in_usd,
          {rate_subquery('out_usd')} AS out_usd,
@@ -415,14 +471,11 @@ WITH priced AS (
          {estimated_subquery()} AS estimated
   FROM events e JOIN models m ON m.id = e.model_id
   WHERE e.ts >= strftime('%s','now','-7 days') AND {NOT_BACKLOG}
+),
+tiered AS (
+  SELECT *, {tier_case()} AS tier FROM priced
 )
-SELECT model_name,
-       CASE
-         WHEN model_name LIKE 'claude-fable-%' THEN 'orchestrator'
-         WHEN model_name LIKE 'claude-opus-%' THEN 'heavy'
-         WHEN model_name LIKE 'claude-sonnet-%' THEN 'small'
-         WHEN model_name LIKE 'claude-haiku-%' THEN 'micro'
-         ELSE 'unknown' END,
+SELECT model_name, tier,
        SUM(in_tok), SUM(out_tok),
        ROUND(SUM(in_tok*COALESCE(in_usd,0) + out_tok*COALESCE(out_usd,0)
              + cache_r*COALESCE(cache_r_usd,0)
@@ -433,15 +486,24 @@ SELECT model_name,
        SUM(CASE WHEN estimated = 1 THEN 1 ELSE 0 END),
        COUNT(*),
        SUM(CASE WHEN rate_from IS NULL THEN 1 ELSE 0 END)
-FROM priced GROUP BY model_name
+FROM tiered GROUP BY model_name, tier
 ORDER BY SUM(out_tok) DESC, model_name;""").fetchall()
     # by_model keeps its 6-tuple shape (the renderer and the remote mapper
-    # depend on it); the per-model estimated/event/unpriced counts ride
-    # alongside.
+    # depend on it); grouping is now (model, tier) — a role-tiered model can
+    # legitimately appear once per tier it was actually used at (e.g. the
+    # same model as both the main session's 'orchestrator' and a
+    # 'marvin:developer' subagent's 'heavy'), so the estimated/event/unpriced
+    # counts below are summed ACROSS tiers back onto the model name — those
+    # three dicts stay model-only, exactly as before this change.
     d["by_model"] = [tuple(r[:6]) for r in by_model]
-    d["estimated_by_model"] = {r[0]: r[6] for r in by_model if r[6]}
-    d["events_by_model"] = {r[0]: r[7] for r in by_model}
-    d["unpriced_by_model"] = {r[0]: r[8] for r in by_model if r[8]}
+    est_totals, ev_totals, unpriced_totals = {}, {}, {}
+    for name, _tier, _i, _o, _cost, _rf, est_n, ev_n, unpriced_n in by_model:
+        est_totals[name] = est_totals.get(name, 0) + est_n
+        ev_totals[name] = ev_totals.get(name, 0) + ev_n
+        unpriced_totals[name] = unpriced_totals.get(name, 0) + unpriced_n
+    d["estimated_by_model"] = {k: v for k, v in est_totals.items() if v}
+    d["events_by_model"] = ev_totals
+    d["unpriced_by_model"] = {k: v for k, v in unpriced_totals.items() if v}
     d["models_without_own_price"] = fetch_models_without_own_price(conn)
     d["by_kind"] = conn.execute(
         "SELECT CASE kind WHEN 0 THEN 'main' ELSE 'subagent' END,"
@@ -451,17 +513,28 @@ ORDER BY SUM(out_tok) DESC, model_name;""").fetchall()
         f" AND {NOT_BACKLOG}"
         " GROUP BY kind").fetchall()
     d["by_tier"] = conn.execute(
-        "SELECT CASE"
-        " WHEN m.name LIKE 'claude-fable-%' THEN 'orchestrator'"
-        " WHEN m.name LIKE 'claude-opus-%' THEN 'heavy'"
-        " WHEN m.name LIKE 'claude-sonnet-%' THEN 'small'"
-        " WHEN m.name LIKE 'claude-haiku-%' THEN 'micro'"
-        " ELSE 'unknown' END,"
-        " SUM(e.in_tok), SUM(e.out_tok), COUNT(*)"
+        "SELECT " + tier_case(model="m.name", kind="e.kind", agent="e.agent") +
+        ", SUM(e.in_tok), SUM(e.out_tok), COUNT(*)"
         " FROM events e JOIN models m ON m.id = e.model_id"
         " WHERE e.ts >= strftime('%s','now','-7 days')"
         f" AND {NOT_BACKLOG}"
         " GROUP BY 1 ORDER BY SUM(e.out_tok) DESC, 1").fetchall()
+    # Ladder rungs, broken out from the 'ladder' tier rows above: high / xhigh
+    # / max / frontier, read only from the named marvin:escalation-* persona
+    # (see rung_case). A ladder row that reached 'ladder' via the model-prefix
+    # fallback rather than a named escalation persona has no rung and is
+    # dropped here — it still counts toward the tier total above.
+    d["by_rung"] = conn.execute(
+        "SELECT rung, SUM(in_tok), SUM(out_tok), COUNT(*) FROM ("
+        " SELECT " + rung_case(agent="e.agent") + " AS rung,"
+        " e.in_tok AS in_tok, e.out_tok AS out_tok"
+        " FROM events e JOIN models m ON m.id = e.model_id"
+        " WHERE e.ts >= strftime('%s','now','-7 days')"
+        f" AND {NOT_BACKLOG}"
+        " AND (" + tier_case(model="m.name", kind="e.kind", agent="e.agent") +
+        ") = 'ladder'"
+        ") r WHERE rung IS NOT NULL"
+        " GROUP BY rung ORDER BY SUM(out_tok) DESC, rung").fetchall()
     d["by_issue"] = conn.execute(
         "SELECT issue_key, SUM(in_tok), SUM(out_tok), SUM(cache_r),"
         " SUM(cache_w), COUNT(*) FROM events WHERE issue_key IS NOT NULL"
@@ -550,6 +623,12 @@ def render_token_stats(d):
                     ["---", "---:", "---:", "---:"],
                     [[r[0], fmt_n(r[1]), fmt_n(r[2]), str(r[3])]
                      for r in d["by_tier"]])
+    if d.get("by_rung"):
+        out += ["", "**By ladder rung (7 days)**", ""]
+        out += md_table(["rung", "input", "output", "events"],
+                        ["---", "---:", "---:", "---:"],
+                        [[r[0], fmt_n(r[1]), fmt_n(r[2]), str(r[3])]
+                         for r in d["by_rung"]])
     if d["by_issue"]:
         out += ["", "**By issue (all-time)**", ""]
         out += md_table(
