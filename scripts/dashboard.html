@@ -129,10 +129,13 @@
 
   /* ============ PRICE WARNING ============ */
   /* Populated client-side by renderPriceWarning() from /api/data's
-     modelsWithoutOwnPriceDetail (AOS-135). No `display` here — only under
-     `:not([hidden])` — so the `hidden` attribute's UA default keeps winning;
-     an author rule that set `display` unconditionally would override it and
-     the banner would never truly hide. Empty + hidden on every load until
+     priceWarning (AOS-135 S3) — every heading/count/date/cost string it
+     places into the DOM is already formatted server-side (dashboard.py's
+     build_price_warning()); the renderer only builds nodes and never uses
+     innerHTML. No `display` here — only under `:not([hidden])` — so the
+     `hidden` attribute's UA default keeps winning; an author rule that set
+     `display` unconditionally would override it and the banner (or a group
+     within it) would never truly hide. Empty + hidden on every load until
      that data says otherwise, so the no-warning DOM is unchanged. */
   .price-warn{flex-direction:column;gap:10px;margin:0 0 14px;padding:12px 16px;
     border-radius:14px;background:var(--panel-2);border:1px solid var(--panel-brd);
@@ -142,11 +145,17 @@
   .price-warn-dot{width:8px;height:8px;border-radius:50%;background:var(--warn);flex:0 0 auto;margin-top:6px;}
   .price-warn code{background:var(--track);padding:1px 6px;border-radius:6px;
     font-family:var(--font-mono);font-size:.85em;}
+  .price-warn-group{flex-direction:column;gap:4px;}
+  .price-warn-group:not([hidden]){display:flex;}
+  .price-warn-subhead{margin:2px 0 0;font-size:.76rem;font-weight:700;
+    letter-spacing:.02em;text-transform:uppercase;color:var(--ink-2);}
   .price-warn-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;}
   .price-warn-list li{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 14px;
-    padding:6px 0 6px 18px;border-top:1px solid var(--panel-brd);}
+    padding:6px 0 6px 18px;border-top:1px solid var(--panel-brd);max-width:100%;}
   .price-warn-list li:first-child{border-top:none;}
-  .price-warn-model{font-weight:600;color:var(--ink);}
+  .price-warn-model{font-weight:600;color:var(--ink);overflow-wrap:anywhere;}
+  .price-warn-id{font-family:var(--font-mono);font-size:.82em;color:var(--ink-2);
+    overflow-wrap:anywhere;}
 
   /* ============ HEADER ============ */
   header.hd{display:flex;flex-wrap:wrap;align-items:flex-end;gap:18px 26px;justify-content:space-between;margin-bottom:22px;}
@@ -389,15 +398,26 @@
       </div>
     </header>
 
-    <!-- Populated client-side from /api/data's modelsWithoutOwnPriceDetail
-         (AOS-135, see renderPriceWarning()); stays empty and hidden when
-         every logged model has its own price. -->
+    <!-- Populated client-side from /api/data's priceWarning (AOS-135 S3, see
+         renderPriceWarning()). All display text is pre-formatted server-side;
+         the renderer only builds DOM nodes via createElement/textContent —
+         no innerHTML anywhere in this element's subtree. Stays empty and
+         hidden when every logged model has its own price; the empty path
+         never removes any of these shipped nodes, only clears each list's
+         rows and re-hides, so it stays correct across repeated refreshes. -->
     <div class="price-warn" id="price-warn" hidden role="note" aria-live="polite">
       <div class="price-warn-head">
         <span class="price-warn-dot" aria-hidden="true"></span>
         <span id="price-warn-msg"></span>
       </div>
-      <ul class="price-warn-list" id="price-warn-list"></ul>
+      <div class="price-warn-group" id="price-warn-estimated" hidden>
+        <h4 class="price-warn-subhead" id="price-warn-estimated-head"></h4>
+        <ul class="price-warn-list" id="price-warn-estimated-list"></ul>
+      </div>
+      <div class="price-warn-group" id="price-warn-unpriced" hidden>
+        <h4 class="price-warn-subhead" id="price-warn-unpriced-head"></h4>
+        <ul class="price-warn-list" id="price-warn-unpriced-list"></ul>
+      </div>
     </div>
 
     <section class="filters scope glass" aria-label="Window and measure">
@@ -792,32 +812,64 @@
     $("tfoot-r").textContent=`\u03a3 ${fmtUSD(ev.sums.cost)} \u00b7 ${fmtTok(ev.sums.total)} tokens (all ${total})`;
   }
 
-  // ---- own-price warning (AOS-135) ----
-  // Model names are untrusted — they come straight from transcripts — so
-  // every one goes through esc(), same as every other transcript-sourced
-  // string rendered on this page (event/project tables, filter chips).
-  function renderPriceWarning(items){
+  // ---- own-price warning (AOS-135 S3) ----
+  // Every string here (heading, group labels, per-model event/date/cost
+  // text) is pre-formatted server-side by dashboard.py's
+  // build_price_warning() — this function does no arithmetic and no string
+  // formatting, only DOM construction. Every node is built with
+  // createElement + textContent, never innerHTML / insertAdjacentHTML /
+  // outerHTML / document.write, so a hostile model name can never be
+  // interpreted as markup (esc() is not needed here for that reason). The
+  // empty path only hides the box/groups and clears each list's OWN rows via
+  // textContent="" — it never removes #price-warn-msg or either group's
+  // heading/list element, so the banner renders correctly no matter how many
+  // times empty and non-empty responses alternate. (A prior bug called
+  // box.innerHTML="" on the empty path, which deleted those shipped children
+  // outright and made every later non-empty render throw.)
+  function renderPriceWarning(pw){
+    function buildRow(it){
+      const li=document.createElement("li");
+      const name=document.createElement("span");
+      name.className="price-warn-model";
+      name.textContent=it.modelName;
+      const id=document.createElement("span");
+      id.className="price-warn-id";
+      id.textContent=it.model;
+      const ev=document.createElement("span");
+      ev.textContent=it.eventsText;
+      const dt=document.createElement("span");
+      dt.textContent=it.dateRangeText;
+      const cost=document.createElement("span");
+      cost.textContent=it.costText;
+      li.append(name,id,ev,dt,cost);
+      return li;
+    }
+    function renderGroup(groupId,listId,headId,heading,items){
+      const group=$(groupId), list=$(listId), head=$(headId);
+      list.textContent="";
+      if(!items || !items.length){ group.hidden=true; head.textContent=""; return; }
+      head.textContent=heading;
+      items.forEach(it=> list.appendChild(buildRow(it)));
+      group.hidden=false;
+    }
     const box=$("price-warn");
-    if(!items || !items.length){ box.hidden=true; box.innerHTML=""; return; }
-    $("price-warn-msg").innerHTML =
-      `${items.length} model${items.length===1?"":"s"} logged with no price of its own`
-      + ` &mdash; the cost below is priced at a family-default or predecessor rate`
-      + ` and is an estimate. Run <code>/token-telemetry:pricing-update</code> to refresh.`;
-    $("price-warn-list").innerHTML = items.map(it=>{
-      const seen = it.firstSeen===it.lastSeen ? fmtDate(it.firstSeen)
-                 : `${fmtDate(it.firstSeen)} – ${fmtDate(it.lastSeen)}`;
-      return `<li><span class="price-warn-model">${esc(it.modelName)}</span>`
-           + `<span>${fmtInt(it.events)} event${it.events===1?"":"s"}</span>`
-           + `<span>${seen}</span>`
-           + `<span>${fmtUSD(it.cost)} at an estimated rate</span></li>`;
-    }).join("");
+    const est=(pw && pw.estimated) || [];
+    const unp=(pw && pw.unpriced) || [];
+    renderGroup("price-warn-estimated","price-warn-estimated-list","price-warn-estimated-head", pw&&pw.estimatedHeading, est);
+    renderGroup("price-warn-unpriced","price-warn-unpriced-list","price-warn-unpriced-head", pw&&pw.unpricedHeading, unp);
+    if(!est.length && !unp.length){
+      box.hidden=true;
+      $("price-warn-msg").textContent="";
+      return;
+    }
+    $("price-warn-msg").textContent = `${pw.heading} ${pw.note}`;
     box.hidden=false;
   }
 
   // ---- render everything from the last response ----
   function renderAll(){
     buildChips("model"); buildChips("agent");
-    renderPriceWarning(D.modelsWithoutOwnPriceDetail);
+    renderPriceWarning(D.priceWarning);
     renderKPIs(D.kpis);
     renderBars("bars-model",D.byModel,"model");
     renderBars("bars-agent",D.byAgent,"agent");

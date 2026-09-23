@@ -262,9 +262,12 @@ class TestDashboardData(unittest.TestCase):
     def test_price_warning_detail_carries_a_hostile_model_name_raw(self):
         # The model name is untrusted transcript data. The server must not try
         # to sanitize or escape it — JSON-encoding it here is safe by
-        # construction; HTML-escaping it is the RENDERER's job (dashboard.html
-        # esc(), exercised by the dashboard's own browser smoke test). This
-        # only guards against the server mangling or double-escaping it.
+        # construction. HTML-escaping is no longer any layer's job for this
+        # banner: the renderer (dashboard.html's renderPriceWarning, AOS-135
+        # S3) builds every node with createElement/textContent, which escapes
+        # structurally — there is no esc() call to remember or forget. This
+        # test only guards against the SERVER mangling or double-escaping the
+        # name; TestPriceWarningRenderStructure below pins the renderer side.
         hostile = "<img src=x onerror=alert(1)>\"'\n"
         self._insert("/proj", "s1", model=hostile, inp=100, out=50, cr=0,
                      cw=0, cw1h=0, mid="m9", ts=iso(int(time.time())))
@@ -277,6 +280,110 @@ class TestDashboardData(unittest.TestCase):
         # round-trips unmodified through JSON, exactly like every other field
         encoded = json.loads(json.dumps(d["modelsWithoutOwnPriceDetail"]))
         self.assertIn(hostile, {row["model"] for row in encoded})
+        # a hostile name never matches any seeded pricing prefix -> unpriced
+        pw_names = {row["model"] for row in d["priceWarning"]["unpriced"]}
+        self.assertIn(hostile, pw_names)
+        self.assertEqual(
+            [row["model"] for row in d["priceWarning"]["unpriced"]
+             if row["model"] == hostile][0], hostile)
+
+    # ---- own-price warning BANNER content (AOS-135 S3) -------------------
+    # dashboard.py's build_price_warning() is the only place that formats
+    # this banner's strings; the client (dashboard.html's renderPriceWarning)
+    # does no arithmetic/formatting of its own (TestPriceWarningRenderStructure
+    # below pins that). These tests pin the server's output exactly.
+
+    def test_price_warning_banner_prices_the_1h_fallback_and_pins_cost(self):
+        # F4: an ANCESTOR row (claude-sonnet-5-1 is an unlisted point release
+        # of claude-sonnet-5, R='-1') whose cache_w_1h_usd is NULL — predating
+        # the 1h/5m split — must still price the event's 1h cache-write
+        # tokens at that row's 5m rate via COALESCE(cache_w_1h_usd,
+        # cache_w_usd), reproducing the pre-split estimate. The model still
+        # has no own row, so it lands in the "estimated" group with this
+        # exact cost text.
+        now = int(time.time())
+        self._insert("/proj", "s1", model="claude-sonnet-5-1", inp=1000000,
+                     out=200000, cr=0, cw=100000, cw1h=40000, mid="m1",
+                     ts=iso(now))
+        rw = capture.connect(self.db)
+        with rw:
+            rw.execute(
+                "INSERT INTO pricing(provider, model_prefix, in_usd, out_usd,"
+                " cache_r_usd, cache_w_usd, cache_w_1h_usd, effective_from,"
+                " source) VALUES ('anthropic', 'claude-sonnet-5', 3.0, 15.0,"
+                " 0.3, 3.75, NULL, 1, 'test-no-1h-rate')")
+        rw.close()
+        conn = self._ro()
+        d = dashboard.build_data(conn, {"period": ["year"]})
+        conn.close()
+        # in 1,000,000*3 + out 200,000*15 + cache_w 100,000 all @ 3.75
+        # (60,000 @ 3.75 explicitly + 40,000 @ the 5m-rate fallback) = 6.375
+        expected_cost = 6.375
+        detail = {r["model"]: r for r in d["modelsWithoutOwnPriceDetail"]}
+        self.assertAlmostEqual(detail["claude-sonnet-5-1"]["cost"], expected_cost, places=6)
+        pw = d["priceWarning"]
+        self.assertEqual(pw["unpriced"], [])
+        self.assertEqual(len(pw["estimated"]), 1)
+        row = pw["estimated"][0]
+        self.assertEqual(row["model"], "claude-sonnet-5-1")
+        self.assertEqual(row["modelName"], "Sonnet 5.1")
+        self.assertEqual(row["eventsText"], "1 event")
+        self.assertEqual(row["dateRangeText"], dashboard._warn_date(now))
+        self.assertEqual(row["costText"], "$6.38")
+        self.assertEqual(row["costText"], dashboard._warn_usd(expected_cost))
+        self.assertEqual(pw["heading"],
+                          "1 model logged with no price of their own (all time)")
+        self.assertEqual(pw["estimatedHeading"], "Priced at an estimated rate")
+
+    def test_price_warning_banner_splits_estimated_and_unpriced_groups(self):
+        # F3: a model priced at a family-default/ancestor rate is "estimated"
+        # (with its cost); a model matching NO pricing row at all (a
+        # non-Claude name) is "unpriced" — its cost text is "not counted",
+        # never a misleading "$0.00 estimated". F6: exact model id ships
+        # alongside the pretty name; heading states "(all time)" and uses
+        # "their own", not "its own".
+        now = int(time.time())
+        self.seed_one(ts=now)   # claude-sonnet-5 -> family default -> estimated
+        self._insert("/proj", "s2", model="gpt-4o", inp=100, out=50, cr=0,
+                     cw=0, cw1h=0, mid="m2", ts=iso(now))   # -> unpriced
+        conn = self._ro()
+        d = dashboard.build_data(conn, {"period": ["year"]})
+        conn.close()
+        pw = d["priceWarning"]
+        self.assertEqual(len(pw["estimated"]), 1)
+        self.assertEqual(len(pw["unpriced"]), 1)
+        est = pw["estimated"][0]
+        self.assertEqual(est["model"], "claude-sonnet-5")
+        self.assertEqual(est["modelName"], "Sonnet 5")
+        detail = {r["model"]: r for r in d["modelsWithoutOwnPriceDetail"]}
+        self.assertEqual(est["costText"], dashboard._warn_usd(detail["claude-sonnet-5"]["cost"]))
+        self.assertNotEqual(est["costText"], "not counted")
+        unp = pw["unpriced"][0]
+        self.assertEqual(unp["model"], "gpt-4o")
+        self.assertEqual(unp["modelName"], "gpt-4o")
+        self.assertEqual(unp["eventsText"], "1 event")
+        self.assertEqual(unp["costText"], "not counted")
+        self.assertEqual(pw["heading"],
+                          "2 models logged with no price of their own (all time)")
+        self.assertEqual(pw["estimatedHeading"], "Priced at an estimated rate")
+        self.assertEqual(pw["unpricedHeading"], "No price at all")
+
+    def test_price_warning_banner_empty_when_every_model_has_own_price(self):
+        self.seed_one()
+        rw = capture.connect(self.db)
+        with rw:
+            rw.execute(
+                "INSERT INTO pricing(provider, model_prefix, in_usd, out_usd,"
+                " cache_r_usd, cache_w_usd, cache_w_1h_usd, effective_from,"
+                " source) SELECT provider, 'claude-sonnet-5', in_usd, out_usd,"
+                " cache_r_usd, cache_w_usd, cache_w_1h_usd, 1, 'test'"
+                " FROM pricing WHERE model_prefix = 'claude-sonnet-'")
+        rw.close()
+        conn = self._ro()
+        d = dashboard.build_data(conn, {"period": ["week"]})
+        conn.close()
+        self.assertEqual(d["priceWarning"]["estimated"], [])
+        self.assertEqual(d["priceWarning"]["unpriced"], [])
 
 
 # --- timeline bucketing (v0.11.0: per-bucket columns, not a running total) ---
@@ -482,6 +589,82 @@ class TestBackendBanner(unittest.TestCase):
         settings.write_settings({"active_backend": "carrier-pigeon"})
         page = dashboard.dashboard_page()
         self.assertEqual(page, self.original_html)
+
+
+# --- own-price warning renderer structure (AOS-135 S3, F2b) ---------------
+#
+# dashboard.html's renderPriceWarning() must build every node with
+# createElement/textContent and never touch innerHTML/insertAdjacentHTML/
+# outerHTML/document.write, so a hostile model name can never be interpreted
+# as markup — and must never remove #price-warn's own shipped structural
+# children (the F1 bug: box.innerHTML="" on the empty path deleted
+# #price-warn-msg and the row list themselves, so the next non-empty render
+# threw inside load()'s try and tripped the "Connection lost" dialog
+# permanently). These tests parse the actual shipped dashboard.html and
+# isolate the renderPriceWarning function body (brace-balanced from its
+# `function renderPriceWarning(` header) so a regression anywhere in that
+# function — including in a locally-nested helper — is caught.
+
+_DASHBOARD_HTML = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "dashboard.html"
+
+
+def _extract_js_function(source, name):
+    """The brace-balanced body of `function <name>(...){...}` in `source`,
+    starting at the `function` keyword. Raises AssertionError if the
+    function is missing or its braces never balance (e.g. it was deleted or
+    mangled) so a broken extraction fails loudly instead of silently passing
+    an empty/partial string through the checks below."""
+    marker = f"function {name}("
+    start = source.index(marker)
+    i = source.index("{", start)
+    depth = 0
+    while i < len(source):
+        if source[i] == "{":
+            depth += 1
+        elif source[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:i + 1]
+        i += 1
+    raise AssertionError(f"unbalanced braces extracting function {name}")
+
+
+class TestPriceWarningRenderStructure(unittest.TestCase):
+    def setUp(self):
+        self.source = _DASHBOARD_HTML.read_text()
+        self.fn = _extract_js_function(self.source, "renderPriceWarning")
+
+    def test_render_function_is_found_and_nontrivial(self):
+        # Sanity: the extraction itself must have found real content, or
+        # every other assertion in this class would pass vacuously.
+        self.assertIn("price-warn", self.fn)
+        self.assertGreater(len(self.fn), 200)
+
+    def test_no_innerHTML_family_api_is_used(self):
+        for banned in ("innerHTML", "insertAdjacentHTML", "outerHTML",
+                       "document.write"):
+            self.assertNotIn(banned, self.fn,
+                f"renderPriceWarning must not use {banned} (F1/F2)")
+
+    def test_structural_children_are_never_removed_or_replaced(self):
+        # Only a row <li> may ever be created/appended/discarded; the box,
+        # the two group <div>s, their <h4> headings and the message <span>
+        # are shipped once in dashboard.html and must never be torn down.
+        for banned in ("removeChild", ".remove(", "replaceWith", "replaceChild"):
+            self.assertNotIn(banned, self.fn,
+                f"renderPriceWarning must not use {banned} on structural nodes")
+
+    def test_uses_textContent(self):
+        self.assertIn("textContent", self.fn)
+
+    def test_calls_createElement_to_build_rows(self):
+        self.assertIn("createElement", self.fn)
+
+    def test_the_call_site_passes_the_new_priceWarning_field(self):
+        # renderAll() must feed the server-formatted object, not the old
+        # (now removed) raw detail array.
+        self.assertIn("renderPriceWarning(D.priceWarning)", self.source)
+        self.assertNotIn("renderPriceWarning(D.modelsWithoutOwnPriceDetail)", self.source)
 
 
 if __name__ == "__main__":

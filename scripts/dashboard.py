@@ -200,24 +200,33 @@ def fetch_price_warning(conn, models=None):
     For every model :func:`report.fetch_models_without_own_price` flags (at
     least one event, no pricing row of its own at any ``effective_from`` —
     see docs/TELEMETRY-CONTRACT.md's Pricing table), returns its event count,
-    first/last-seen epoch seconds and the cost currently carried at the
-    resolved rate. Uses the same per-event pricing resolution (:func:`_rate`
-    / :func:`_resolved`) and cost arithmetic as :func:`fetch_rows` — no new
+    first/last-seen epoch seconds, the cost currently carried at the resolved
+    rate, and whether any of its events actually resolved to a pricing row at
+    all. Uses the same per-event pricing resolution (:func:`_rate` /
+    :func:`_resolved`) and cost arithmetic as :func:`fetch_rows` — no new
     pricing rule — summed with ``COALESCE(rate, 0)`` so an unpriced event (no
     row resolves at all) contributes zero instead of erroring; by
     construction every event of these models is estimated or unpriced, never
     own-priced. Not windowed by period and not filtered by the
     backlog-capture note, matching the all-time scope of the model list
     itself (a model must stay listed even if its only events are outside the
-    current window or are backlog roll-ups).
+    current window or are backlog roll-ups). Cache-write cost prices the
+    1-hour portion at ``COALESCE(pr.cache_w_1h_usd, pr.cache_w_usd)`` so a
+    resolved row that predates the 1h/5m split (``cache_w_1h_usd`` NULL)
+    still reproduces the pre-split 5m-rate estimate for that portion (see
+    docs/TELEMETRY-CONTRACT.md's Pricing table, v3->v4).
 
     :param conn: read-only sqlite3 connection.
     :param models: precomputed result of
         :func:`report.fetch_models_without_own_price`, to avoid re-running it
         when the caller already has it; computed here when omitted.
-    :returns: list of ``{model, modelName, events, firstSeen, lastSeen,
-        cost}`` dicts, ordered by model name; empty when every logged model
-        has its own price.
+    :returns: list of ``{model, modelName, events, firstSeen, lastSeen, cost,
+        unpriced}`` dicts, ordered by model name; empty when every logged
+        model has its own price. ``unpriced`` is ``True`` only when NONE of
+        the model's events ever resolved to a pricing row (its cost is then
+        always 0.0, never an estimate); ``False`` means at least one event
+        resolved (family default or ancestor row) and ``cost`` is that
+        estimate.
     """
     if models is None:
         models = report.fetch_models_without_own_price(conn)
@@ -225,9 +234,11 @@ def fetch_price_warning(conn, models=None):
         return []
     placeholders = ",".join("?" * len(models))
     cw1h_rate = _resolved("COALESCE(pr.cache_w_1h_usd, pr.cache_w_usd)")
+    resolved_exists = _resolved("1")
     sql = f"""
       SELECT m.name AS model, COUNT(*) AS n,
              MIN(e.ts) AS first_ts, MAX(e.ts) AS last_ts,
+             SUM(CASE WHEN {resolved_exists} IS NOT NULL THEN 1 ELSE 0 END) AS priced_n,
              SUM(e.in_tok * COALESCE({_rate('in_usd')}, 0)
                  + e.out_tok * COALESCE({_rate('out_usd')}, 0)
                  + e.cache_r * COALESCE({_rate('cache_r_usd')}, 0)
@@ -240,8 +251,97 @@ def fetch_price_warning(conn, models=None):
     """
     return [{"model": r["model"], "modelName": _pretty_model(r["model"]),
              "events": r["n"], "firstSeen": r["first_ts"], "lastSeen": r["last_ts"],
-             "cost": r["cost"] or 0.0}
+             "cost": r["cost"] or 0.0, "unpriced": (r["priced_n"] or 0) == 0}
             for r in conn.execute(sql, models)]
+
+
+_WARN_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _warn_date(ts):
+    """``Mon D, YYYY`` for an epoch-seconds timestamp, in the server's local
+    timezone — matching dashboard.html's own (now-retired) client-side
+    ``fmtDate``. The dashboard is localhost-only (see the timeline bucketing
+    comment above ``_bucket_start``), so the server's clock is the reader's
+    clock; there is no cross-timezone reader to mislead."""
+    d = datetime.datetime.fromtimestamp(ts)
+    return f"{_WARN_MONTHS[d.month - 1]} {d.day}, {d.year}"
+
+
+def _warn_date_range(first_ts, last_ts):
+    if first_ts == last_ts:
+        return _warn_date(first_ts)
+    return f"{_warn_date(first_ts)} – {_warn_date(last_ts)}"
+
+
+def _warn_usd(v):
+    """Cost text for the warning banner, matching dashboard.html's general
+    ``fmtUSD`` (thousands-grouped 2dp at/above $1, 3dp at/above 1 cent, else
+    4dp, ``$0.00`` for a falsy/zero value) so a model's cost here reads
+    identically to the same number anywhere else on the page."""
+    v = v or 0.0
+    if not v:
+        return "$0.00"
+    if v >= 1:
+        return f"${v:,.2f}"
+    if v >= 0.01:
+        return f"${v:.3f}"
+    return f"${v:.4f}"
+
+
+def _warn_events(n):
+    return f"{n} event" if n == 1 else f"{n} events"
+
+
+def build_price_warning(detail):
+    """Server-formatted content for the dashboard's own-price warning banner
+    (AOS-135 S3). Takes :func:`fetch_price_warning`'s per-model rows and
+    returns only ready-to-show strings, plus the two-group split the banner
+    renders — the client (``renderPriceWarning`` in dashboard.html) does no
+    arithmetic and no string formatting for this banner, only DOM
+    construction via ``createElement``/``textContent``, so a hostile model
+    name can never be interpreted as markup.
+
+    Splits models per docs/TELEMETRY-CONTRACT.md's own-price-vs-estimate
+    distinction: a model with at least one event that resolved to a pricing
+    row (``unpriced`` False — family default or ancestor rate) is listed
+    under "priced at an estimated rate" with its accrued cost; a model with
+    NO event that ever resolved to any pricing row (``unpriced`` True — a
+    non-Claude name, or a name matching no seeded family/ancestor prefix at
+    all) is listed under "no price at all" with its cost stated as not
+    counted — never rendered as a misleading "$0.00 estimated".
+
+    :param detail: :func:`fetch_price_warning`'s return value.
+    :returns: ``{heading, note, estimatedHeading, unpricedHeading, estimated,
+        unpriced}`` — ``estimated``/``unpriced`` are lists of ``{model,
+        modelName, eventsText, dateRangeText, costText}``; both empty when
+        ``detail`` is empty (the banner then stays hidden).
+    """
+    estimated, unpriced = [], []
+    for it in detail:
+        row = {
+            "model": it["model"],
+            "modelName": it["modelName"],
+            "eventsText": _warn_events(it["events"]),
+            "dateRangeText": _warn_date_range(it["firstSeen"], it["lastSeen"]),
+        }
+        if it["unpriced"]:
+            row["costText"] = "not counted"
+            unpriced.append(row)
+        else:
+            row["costText"] = _warn_usd(it["cost"])
+            estimated.append(row)
+    total = len(estimated) + len(unpriced)
+    return {
+        "heading": (f"{total} model{'' if total == 1 else 's'} logged with no "
+                    "price of their own (all time)"),
+        "note": "Run /token-telemetry:pricing-update to refresh.",
+        "estimatedHeading": "Priced at an estimated rate",
+        "unpricedHeading": "No price at all",
+        "estimated": estimated,
+        "unpriced": unpriced,
+    }
 
 
 def fetch_rows(conn, since, models, agents):
@@ -453,6 +553,7 @@ def build_data(conn, q):
 
     domains = fetch_domains(conn, since)
     models_without_own_price = report.fetch_models_without_own_price(conn)
+    price_warning_detail = fetch_price_warning(conn, models_without_own_price)
     base_rows = fetch_rows(conn, since, models, agents)   # window + model/agent
     backlog_excluded = conn.execute(
         "SELECT COUNT(*) FROM events WHERE ts >= ?"
@@ -494,10 +595,13 @@ def build_data(conn, q):
         },
         "backlogExcluded": backlog_excluded,
         # models without an own pricing row (every event estimated/unpriced);
-        # modelsWithoutOwnPriceDetail (AOS-135) is what the own-price warning
-        # banner renders from — count/first/last/cost per model, all-time.
+        # modelsWithoutOwnPriceDetail is the raw per-model data (AOS-135 S1).
+        # priceWarning (AOS-135 S3) is the pre-formatted, two-group content
+        # the own-price warning banner actually renders — see
+        # build_price_warning().
         "modelsWithoutOwnPrice": models_without_own_price,
-        "modelsWithoutOwnPriceDetail": fetch_price_warning(conn, models_without_own_price),
+        "modelsWithoutOwnPriceDetail": price_warning_detail,
+        "priceWarning": build_price_warning(price_warning_detail),
         "generatedAt": now,
     }
 
