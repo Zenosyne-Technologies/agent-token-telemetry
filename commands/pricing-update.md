@@ -79,8 +79,9 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-plan
   end. The bare `--backfill-plan` form stays safe to pre-approve even though
   it now writes the plan-summary sidecar: it takes no arguments, so it can
   only ever write that one fixed path (`backfill-plan.json` next to the DB
-  the dashboard reads), and it does so with mode 0600, atomically, and never
-  through a symlink. Any such variant (including `--backfill-apply` in any form) always
+  the dashboard reads, via a short-lived temp file beside it that is renamed
+  into place), with mode 0600 and never through a symlink. Any variant with
+  extra flags or paths (including `--backfill-apply` in any form) always
   raises Claude Code's own permission prompt, which the user must approve in
   THIS session before anything runs — a second, harness-enforced gate on top
   of the question above, independent of this file's text. An unattended or
