@@ -1,5 +1,7 @@
 import datetime
+import json
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -7,7 +9,9 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 import capture
 import pricing_update
-import report
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import pricing_golden
 
 FIXTURE = (pathlib.Path(__file__).resolve().parent
            / "fixtures" / "pricing-page.html")
@@ -15,6 +19,12 @@ FIXTURE = (pathlib.Path(__file__).resolve().parent
 # 0.025x cache-read tier, Sonnet 5 unconditional, no `starting`/`through` rows.
 CURRENT_FIXTURE = (pathlib.Path(__file__).resolve().parent
                    / "fixtures" / "pricing-page-current.html")
+# The validator's repro page: Sonnet 5 unconditional AND `starting` Sep 1.
+INCREASE_FIXTURE = (pathlib.Path(__file__).resolve().parent
+                    / "fixtures" / "pricing-page-increase.html")
+# An expired `through` intro footnote next to the post-intro rate.
+EXPIRED_FIXTURE = (pathlib.Path(__file__).resolve().parent
+                   / "fixtures" / "pricing-page-expired-intro.html")
 TODAY = datetime.date(2026, 8, 6)
 TODAY_CUR = datetime.date(2026, 9, 21)
 
@@ -149,28 +159,137 @@ class TestCandidates(unittest.TestCase):
                     self.assertEqual(by[(p, _epoch(today))]["rates"],
                                      fam_row["rates"])
 
-    def test_in_force_conditional_wins_a_same_day_collision(self):
-        # A page listing the same version both unconditionally and with a
-        # `through` intro rate: the intro rate is what is charged now, and it
-        # must win the (prefix, effective_from) dedup regardless of row order.
+    def test_in_force_through_wins_regardless_of_row_order(self):
+        # F4: a page listing the same version both unconditionally and with an
+        # in-force `through` intro rate: the intro rate is what is charged now,
+        # and it wins in EITHER page order (the unconditional rate is not
+        # minted at all while the version has an in-force conditional).
         rates_a = {"in_usd": 2.0, "out_usd": 10.0, "cache_r_usd": 0.2,
                    "cache_w_usd": 2.5, "cache_w_1h_usd": 4.0}
         rates_b = dict(rates_a, in_usd=3.0)
+        uncond = {"family": "sonnet", "version": "5", "rates": rates_b,
+                  "condition": None}
+        intro = {"family": "sonnet", "version": "5", "rates": rates_a,
+                 "condition": ("through", TODAY + datetime.timedelta(days=9))}
+        for entries in ([uncond, intro], [intro, uncond]):
+            cands = pricing_update.build_candidates(entries, TODAY)
+            s5 = [c for c in cands if c["prefix"] == "claude-sonnet-5"]
+            self.assertEqual(len(s5), 1)
+            self.assertEqual(s5[0]["rates"], rates_a)
+            self.assertEqual(s5[0]["effective_from"], _epoch(TODAY))
+            fam = next(c for c in cands if c["prefix"] == "claude-sonnet-")
+            self.assertEqual(fam["rates"], rates_a)
+
+    def test_first_unconditional_row_for_a_version_wins(self):
+        # F4: two unconditional rows for one version (e.g. a long-context row
+        # listed after the standard one) -> the FIRST listed row is the
+        # version's own rate; the later one is dropped by the dedup.
+        std = {"in_usd": 3.0, "out_usd": 15.0, "cache_r_usd": 0.3,
+               "cache_w_usd": 3.75, "cache_w_1h_usd": 6.0}
+        long_ctx = dict(std, in_usd=6.0, out_usd=22.5)
         entries = [
-            {"family": "sonnet", "version": "5", "rates": rates_b,
+            {"family": "sonnet", "version": "4.5", "rates": std,
              "condition": None},
-            {"family": "sonnet", "version": "5", "rates": rates_a,
-             "condition": ("through", TODAY + datetime.timedelta(days=9))},
+            {"family": "sonnet", "version": "4.5", "rates": long_ctx,
+             "condition": None},
         ]
         cands = pricing_update.build_candidates(entries, TODAY)
-        s5 = [c for c in cands if c["prefix"] == "claude-sonnet-5"]
-        self.assertEqual(len(s5), 1)
-        self.assertEqual(s5[0]["rates"], rates_a)
+        s45 = [c for c in cands if c["prefix"] == "claude-sonnet-4-5"]
+        self.assertEqual([c["rates"] for c in s45], [std])
+        entries.reverse()
+        cands = pricing_update.build_candidates(entries, TODAY)
+        s45 = [c for c in cands if c["prefix"] == "claude-sonnet-4-5"]
+        self.assertEqual([c["rates"] for c in s45], [long_ctx])
 
     def test_family_alias_prefixes_never_collide(self):
         _, cands = fixture_candidates()
         keys = [(c["prefix"], c["effective_from"]) for c in cands]
         self.assertEqual(len(keys), len(set(keys)))
+
+    def test_in_force_predicate(self):
+        d = datetime.date(2026, 9, 1)
+        f = pricing_update.in_force
+        self.assertTrue(f(("through", d), d))              # last intro day
+        self.assertFalse(f(("through", d), d + datetime.timedelta(days=1)))
+        self.assertTrue(f(("starting", d), d))             # first new day
+        self.assertFalse(f(("starting", d), d - datetime.timedelta(days=1)))
+        self.assertFalse(f(None, d))
+
+
+class TestInForceMinting(unittest.TestCase):
+    """F1 + AOS-140: only the rate in force today is minted, per version."""
+
+    def test_arrived_increase_governs_over_the_unconditional_rate(self):
+        # Validator repro (pricing-page-increase.html): Sonnet 5 listed
+        # unconditionally at $3 AND `starting September 1, 2026` at $4. Run
+        # after Sep 1 -> the $4 increase governs; the $3 pre-increase rate is
+        # NOT minted dated today (it would override the increase).
+        today = datetime.date(2026, 9, 15)
+        entries = pricing_update.parse_models(INCREASE_FIXTURE.read_text())
+        cands = pricing_update.build_candidates(entries, today)
+        s5 = [c for c in cands if c["prefix"] == "claude-sonnet-5"]
+        self.assertEqual([(c["rates"]["in_usd"], c["effective_from"])
+                          for c in s5],
+                         [(4.0, _epoch(datetime.date(2026, 9, 1)))])
+        fam = next(c for c in cands if c["prefix"] == "claude-sonnet-")
+        self.assertEqual(fam["rates"]["in_usd"], 4.0)
+        conn = _db_with(cands)
+        try:
+            for ts in (_epoch(datetime.date(2026, 9, 2)),
+                       _epoch(today) + 3600, _epoch(today) + 30 * 86400):
+                r = price_lookup(conn, "claude-sonnet-5", ts)
+                self.assertEqual((r["in_usd"], r["out_usd"]), (4.0, 20.0))
+            r = price_lookup(conn, "claude-sonnet-4-5", _epoch(today) + 3600)
+            self.assertEqual(r["in_usd"], 3.0)   # other versions untouched
+        finally:
+            conn.close()
+
+    def test_before_the_increase_the_unconditional_rate_is_minted(self):
+        entries = pricing_update.parse_models(INCREASE_FIXTURE.read_text())
+        cands = pricing_update.build_candidates(entries,
+                                                datetime.date(2026, 8, 15))
+        s5 = [c for c in cands if c["prefix"] == "claude-sonnet-5"]
+        self.assertEqual([c["rates"]["in_usd"] for c in s5], [3.0])
+
+    def test_expired_intro_is_never_minted_post_intro_rate_governs(self):
+        # AOS-140 (pricing-page-expired-intro.html): the page still carries
+        # "through August 31, 2026" next to the unconditional post-intro rate.
+        # Run after the date -> no $2 row anywhere, the $3 rate governs.
+        today = datetime.date(2026, 9, 15)
+        entries = pricing_update.parse_models(EXPIRED_FIXTURE.read_text())
+        cands = pricing_update.build_candidates(entries, today)
+        self.assertFalse(any(c["rates"]["in_usd"] == 2.0 for c in cands))
+        s5 = [c for c in cands if c["prefix"] == "claude-sonnet-5"]
+        self.assertEqual([(c["rates"]["in_usd"], c["effective_from"])
+                          for c in s5], [(3.0, _epoch(today))])
+        # ...while the intro is still in force, the intro rate is minted and
+        # the post-intro unconditional rate is not.
+        cands = pricing_update.build_candidates(
+            entries, datetime.date(2026, 8, 31))
+        s5 = [c for c in cands if c["prefix"] == "claude-sonnet-5"]
+        self.assertEqual([c["rates"]["in_usd"] for c in s5], [2.0])
+
+    def test_rerun_after_intro_expiry_stops_the_intro_rate(self):
+        # Same DB, two runs of the original page: on 2026-08-06 the intro rate
+        # is minted; on 2026-09-15 the stale "through August 31" footnote must
+        # not re-assert it — the Sep-1 increase prices events from then on.
+        entries = pricing_update.parse_models(FIXTURE.read_text())
+        conn = _db_with(pricing_update.build_candidates(entries, TODAY))
+        try:
+            later = datetime.date(2026, 9, 15)
+            cands = pricing_update.build_candidates(entries, later)
+            self.assertFalse(any(
+                c["prefix"] == "claude-sonnet-5" and c["rates"]["in_usd"] == 2.0
+                for c in cands))
+            pricing_update.apply(conn, pricing_update.plan(conn, cands), "t")
+            self.assertEqual(price_lookup(
+                conn, "claude-sonnet-5", _epoch(TODAY) + 3600)["in_usd"], 2.0)
+            for ts in (_epoch(datetime.date(2026, 9, 1)) + 1,
+                       _epoch(later) + 3600):
+                self.assertEqual(price_lookup(
+                    conn, "claude-sonnet-5", ts)["in_usd"], 3.0)
+        finally:
+            conn.close()
 
 
 class TestPlanAndApply(unittest.TestCase):
@@ -342,119 +461,159 @@ class TestCurrentPage(unittest.TestCase):
             conn.close()
 
 
-# Model names spanning every family: listed versions, dated snapshots, legacy
-# aliases, versions the page does not list, and an unpriced non-Claude model.
-COST_NAMES = [
-    "claude-fable-5", "claude-fable-5-20260601", "claude-fable-5-1-20260901",
-    "claude-fable-6", "claude-mythos-5-1-x", "claude-opus-5", "claude-opus-5-5",
-    "claude-opus-4-8", "claude-opus-4-5-20251101", "claude-opus-4-1-20250805",
-    "claude-opus-4-20250514", "claude-opus-4-9", "claude-sonnet-5",
-    "claude-sonnet-5-1", "claude-sonnet-4-6", "claude-sonnet-4-20250514",
-    "claude-sonnet-4-7", "claude-haiku-4-5-20251001", "claude-haiku-5",
-    "claude-3-5-haiku-20241022", "gpt-4o"]
+# --------------------------------------------------------------------------
+# Golden cost test against the PRE-AOS-133 rules (tests/pricing_golden.py).
+# Every (scenario, model, timestamp) must resolve to exactly the rates the
+# pre-change code produced, except the reviewed differences below. A
+# prefix-only change at identical rates is accepted ONLY when the old row was
+# a family default and the new row is the model's OWN row (not estimated) —
+# the AOS-133 intent (every listed version gets its own row), no cost change.
+# --------------------------------------------------------------------------
+ALLOWED_REASONS = {
+    "a": "unlisted successor now prices at its nearest listed ancestor's own"
+         " row, flagged estimated (F2; forward-only: minted rows are dated"
+         " today, so past events keep their rate)",
+    "b": "an in-force `through` intro rate wins regardless of page row order"
+         " (F4; the pre-change code let an earlier unconditional row win)",
+    "c": "the FIRST unconditional row for a version wins over a later"
+         " same-version row such as a long-context row (F4; the pre-change"
+         " code minted only rows differing from the family rate, so the later"
+         " row won)",
+    "d": "F1/AOS-140: only the rate in force today is minted — an expired"
+         " `through` intro rate is never re-asserted, an arrived `starting`"
+         " increase is not overridden by the pre-increase rate, and the family"
+         " default takes the newest version's in-force rate",
+    "e": "a listed legacy-alias version (Haiku 3.5 as its family's newest) was"
+         " unpriced because its alias prefix was never minted; AOS-133 mints"
+         " every listed version's own row",
+}
+_INC, _EXP, _PG = ("increase@2026-09-15 after starting",
+                   "expired-intro@2026-09-15 intro expired",
+                   "page@2026-09-15 intro expired, increase arrived")
+_EXP8 = "expired-intro@2026-08-15 intro in force"
+_P806, _P831 = ("page@2026-08-06 intro in force, increase future",
+                "page@2026-08-31 intro last day")
+# (scenario, model) -> (reason, new model_prefix, new in_usd, new out_usd)
+ALLOWED_DIFFS = {
+    ("D uncond (other rate) before in-force through", "claude-opus-4-1"):
+        ("b", "claude-opus-4-1", 10.0, 50.0),
+    ("E two uncond rows for one version", "claude-sonnet-4-5"):
+        ("c", "claude-sonnet-4-5", 3.0, 15.0),
+    ("K Haiku 3.5 legacy alias newest", "claude-3-5-haiku-20241022"):
+        ("e", "claude-3-5-haiku", 0.8, 4.0),
+    # F1: the arrived $4 increase governs the family default too
+    (_INC, "claude-sonnet-4-20250514"): ("d", "claude-sonnet-", 4.0, 20.0),
+    (_INC, "claude-sonnet-4-6"): ("d", "claude-sonnet-", 4.0, 20.0),
+    (_INC, "claude-sonnet-4-7"): ("d", "claude-sonnet-", 4.0, 20.0),
+    # AOS-140: the expired $2 intro is not re-asserted; post-intro $3 governs
+    (_EXP, "claude-sonnet-5"): ("d", "claude-sonnet-5", 3.0, 15.0),
+    (_EXP, "claude-sonnet-5-1"): ("d", "claude-sonnet-5", 3.0, 15.0),
+    (_EXP, "claude-sonnet-5-20260101"): ("d", "claude-sonnet-5", 3.0, 15.0),
+    (_PG, "claude-sonnet-5"): ("d", "claude-sonnet-5", 3.0, 15.0),
+    (_PG, "claude-sonnet-5-1"): ("d", "claude-sonnet-5", 3.0, 15.0),
+    (_PG, "claude-sonnet-5-20260101"): ("d", "claude-sonnet-5", 3.0, 15.0),
+    # F1: while the intro is in force, the newest version's in-force rate is
+    # the family default
+    (_EXP8, "claude-sonnet-4-20250514"): ("d", "claude-sonnet-", 2.0, 10.0),
+    (_EXP8, "claude-sonnet-4-6"): ("d", "claude-sonnet-", 2.0, 10.0),
+    (_EXP8, "claude-sonnet-4-7"): ("d", "claude-sonnet-", 2.0, 10.0),
+}
+# F2 (a): unlisted successors -> nearest listed ancestor, identical rates here
+for _sc, _model, _prefix, _in, _out in [
+        (sc, m, p, i, o)
+        for sc in (_P806, _P831, _PG)
+        for m, p, i, o in (
+            ("claude-fable-5-1-20260901", "claude-fable-5", 10.0, 50.0),
+            ("claude-fable-5-1-x", "claude-fable-5", 10.0, 50.0),
+            ("claude-mythos-5-1-x", "claude-mythos-5", 10.0, 50.0),
+            ("claude-opus-5-5", "claude-opus-5", 5.0, 25.0),
+            ("claude-opus-5-5-20261001", "claude-opus-5", 5.0, 25.0),
+            ("claude-sonnet-4-7", "claude-sonnet-4", 3.0, 15.0))] + [
+        (sc, m, "claude-opus-5", 5.0, 25.0)
+        for sc in ("current@2026-09-21", _EXP8, _EXP)
+        for m in ("claude-opus-5-5", "claude-opus-5-5-20261001")] + [
+        ("current@2026-09-21", "claude-sonnet-5-1", "claude-sonnet-5",
+         2.0, 10.0),
+        ("increase@2026-08-15 before starting", "claude-sonnet-5-1",
+         "claude-sonnet-5", 3.0, 15.0)]:
+    ALLOWED_DIFFS[(_sc, _model)] = ("a", _prefix, _in, _out)
 
 
-def pre_aos133_candidates(entries, cands):
-    """The candidate set the pre-AOS-133 rules produced from the same page:
-    every candidate EXCEPT a specific row that merely repeats its family row's
-    rates — the family's newest version kept only when a surviving (differently
-    priced) sibling's specific prefix would otherwise shadow it (the old
-    anti-shadowing rule). Cross-checked against the pre-AOS-133 code on both
-    fixtures when this test was written."""
-    fam_rates = {c["prefix"]: c["rates"] for c in cands
-                 if capture.is_family_default(c["prefix"])}
+class TestGoldenPreAos133(unittest.TestCase):
+    """Per-event resolved rates of the current build_candidates vs the golden
+    recorded from the pre-AOS-133 code (tests/pricing_golden.py). Fails on any
+    cost difference outside the reviewed allow-list above, on an allow-listed
+    event resolving to anything but its expected row, and on a stale
+    allow-list entry."""
 
-    conditional = {p for e in entries if e["condition"] is not None
-                   for p in pricing_update.specific_prefixes(e["family"],
-                                                             e["version"])}
+    maxDiff = None   # print every differing event on failure
 
-    def redundant(c):
-        p = c["prefix"]
-        fam = next((f for f in fam_rates if p.startswith(f)), None)
-        return (not capture.is_family_default(p) and p not in conditional
-                and fam is not None and c["rates"] == fam_rates[fam])
+    @classmethod
+    def setUpClass(cls):
+        cls.golden = json.loads(pricing_golden.GOLDEN.read_text())
+        cls.current = pricing_golden.run_scenarios(
+            pricing_update.build_candidates, pricing_update.parse_models)
 
-    kept_specific = {c["prefix"] for c in cands
-                     if not capture.is_family_default(c["prefix"])
-                     and not redundant(c)}
-    newest = set()
-    for e in entries:
-        if e["condition"] is None and not any(
-                p.startswith(f"claude-{e['family']}-") for p in newest):
-            newest.update(pricing_update.specific_prefixes(e["family"],
-                                                           e["version"]))
-    out = []
-    for c in cands:
-        p = c["prefix"]
-        if redundant(c) and not (p in newest and any(
-                o != p and p.startswith(o) for o in kept_specific)):
-            continue
-        out.append(c)
-    return out
+    def test_every_scenario_is_in_the_golden(self):
+        self.assertEqual(set(self.golden["scenarios"]),
+                         {s[0] for s in pricing_golden.SCENARIOS})
+        for name, _src, _today, names in pricing_golden.SCENARIOS:
+            self.assertEqual(set(self.golden["scenarios"][name]), set(names))
+
+    def test_costs_match_the_pre_aos133_golden(self):
+        unexpected, wrong, used = [], [], set()
+        for sc, by_model in sorted(self.golden["scenarios"].items()):
+            for model, by_ts in sorted(by_model.items()):
+                for label, old in sorted(by_ts.items()):
+                    new = self.current[sc][model][label]
+                    if new == old:
+                        continue
+                    if (old is not None and new is not None
+                            and old[1:] == new[1:]
+                            and capture.is_family_default(old[0])
+                            and not capture.is_estimated(model, new[0])):
+                        continue  # own row minted at the same rate
+                    line = f"{sc} | {model} | ts {label}: {old} -> {new}"
+                    allowed = ALLOWED_DIFFS.get((sc, model))
+                    if allowed is None:
+                        unexpected.append(line)
+                        continue
+                    used.add((sc, model))
+                    code, prefix, in_usd, out_usd = allowed
+                    if (new is None or new[:3] != [prefix, in_usd, out_usd]
+                            or (code == "a"
+                                and not capture.is_estimated(model, new[0]))):
+                        wrong.append(f"[{code}] {line}")
+        self.assertEqual(unexpected, [],
+                         "cost differs from the pre-AOS-133 golden")
+        self.assertEqual(wrong, [],
+                         "allow-listed event resolved to an unexpected row")
+        self.assertEqual(set(ALLOWED_DIFFS) - used, set(),
+                         "stale allow-list entries (no longer differ)")
+
+    def test_every_allowed_diff_names_a_reason(self):
+        for key, (code, *_rest) in ALLOWED_DIFFS.items():
+            self.assertIn(code, ALLOWED_REASONS, key)
+
+    def test_golden_reproduces_from_the_baseline_commit(self):
+        # Provenance: the committed golden equals a fresh run of the
+        # pre-change build_candidates loaded from git. Skips where the
+        # baseline commit is not in the local history (a shallow clone).
+        try:
+            old = pricing_golden.load_baseline_module()
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            self.skipTest(f"baseline commit unavailable: {exc}")
+        self.assertEqual(
+            pricing_golden.run_scenarios(old.build_candidates,
+                                         old.parse_models),
+            self.golden["scenarios"])
 
 
-class TestNoCostChange(unittest.TestCase):
-    """Minting a row for every listed version (AOS-133) must not change any
-    computed cost: the new rows carry exactly the rate the events already
-    resolved to. Only the estimated-event count may drop."""
-
-    def build(self, cands, today):
-        conn = capture.connect(pathlib.Path(tempfile.mkdtemp()) / "u.db")
-        pricing_update.apply(conn, pricing_update.plan(conn, cands), "test")
-        pid = conn.execute(
-            "INSERT INTO projects(path, name) VALUES ('/p', 'P')").lastrowid
-        sid = conn.execute("INSERT INTO sessions(uuid, project_id)"
-                           " VALUES ('s', ?)", (pid,)).lastrowid
-        t0 = _epoch(today)
-        now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-        for i, name in enumerate(COST_NAMES):
-            mid = conn.execute("INSERT INTO models(name) VALUES (?)",
-                               (name,)).lastrowid
-            for ts in (t0 - 30 * 86400, t0 - 1, t0, t0 + 3600, now - 60):
-                conn.execute(
-                    "INSERT INTO events(ts, session_id, kind, model_id, in_tok,"
-                    " out_tok, cache_r, cache_w, cache_w_1h)"
-                    " VALUES (?,?,?,?,?,?,?,?,?)",
-                    (ts, sid, i % 2, mid, 1000 + i, 2000 + i, 3000 + i,
-                     4000 + i, 500 + i))
-        conn.commit()
-        return conn
-
-    def test_reports_cost_identically_before_and_after_per_version_rows(self):
-        for fixture, today in ((FIXTURE, TODAY),
-                               (FIXTURE, datetime.date(2026, 9, 15)),
-                               (CURRENT_FIXTURE, TODAY_CUR)):
-            entries = pricing_update.parse_models(fixture.read_text())
-            after = pricing_update.build_candidates(entries, today)
-            before = pre_aos133_candidates(entries, after)
-            self.assertLess(len(before), len(after))  # rows were added
-            a, b = self.build(before, today), self.build(after, today)
-            try:
-                ps_a = report.fetch_project_stats(a)
-                ps_b = report.fetch_project_stats(b)
-                strip = [k for k in report.STATS_KEYS
-                         if k != "estimated_events"]
-                self.assertEqual([[r[k] for k in strip] for r in ps_a],
-                                 [[r[k] for k in strip] for r in ps_b])
-                self.assertLess(ps_b[0]["estimated_events"],
-                                ps_a[0]["estimated_events"])
-                ts_a = report.fetch_token_stats(a)
-                ts_b = report.fetch_token_stats(b)
-                for k in ts_a:
-                    if k not in ("estimated_by_model",
-                                 "models_without_own_price"):
-                        self.assertEqual(ts_a[k], ts_b[k], k)
-                # per-event resolved rates, not just the sums
-                q = ("SELECT m.name, e.ts, "
-                     + ", ".join(report.rate_subquery(c)
-                                 for c in pricing_update.RATE_KEYS)
-                     + " FROM events e JOIN models m ON m.id = e.model_id"
-                       " ORDER BY m.name, e.ts")
-                self.assertEqual(a.execute(q).fetchall(),
-                                 b.execute(q).fetchall())
-            finally:
-                a.close()
-                b.close()
+def _db_with(cands):
+    """A fresh DB (seed rows kept) with `cands` planned and applied."""
+    conn = capture.connect(pathlib.Path(tempfile.mkdtemp()) / "u.db")
+    pricing_update.apply(conn, pricing_update.plan(conn, cands), "test")
+    return conn
 
 
 def _epoch(d):

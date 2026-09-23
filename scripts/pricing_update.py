@@ -135,66 +135,111 @@ def specific_prefixes(family, version):
                                 [f"claude-{family}-{version.replace('.', '-')}"])
 
 
+def _epoch(d):
+    """UTC midnight of date ``d`` as a unix timestamp."""
+    return int(datetime.datetime.combine(
+        d, datetime.time(), tzinfo=datetime.timezone.utc).timestamp())
+
+
+def in_force(condition, today):
+    """Whether a page row's condition makes its rate the one charged ``today``.
+
+    ``through <d>`` (an introductory rate) is in force while ``d >= today`` and
+    EXPIRED once ``d < today``; ``starting <d>`` (a scheduled increase) is in
+    force once ``d <= today``. An unconditional row (``None``) is never an
+    in-force *conditional* — see :func:`build_candidates` for when its rate is
+    minted.
+
+    :param condition: ``None`` or ``('through'|'starting', datetime.date)``.
+    :param today: the run date (UTC).
+    :returns: ``True`` for an in-force conditional, else ``False``.
+    """
+    if condition is None:
+        return False
+    kind, date = condition
+    return date >= today if kind == "through" else date <= today
+
+
 def build_candidates(entries, today):
-    """Deterministic prefix plan:
-    - `claude-<family>-` from each family's first (newest) unconditional row —
-      the FAMILY DEFAULT row: the fallback rate for any model of that family
-      the page does not list (docs/TELEMETRY-CONTRACT.md §Pricing table);
-    - a `through <d>` conditional gets its specific prefix dated today (the
-      intro rate is in force right now); a `starting <d>` conditional is a
-      scheduled future increase and is recorded ONLY once its date has arrived
-      (a run on/after `<d>`), never minted in advance — a forecast is not a
-      recorded charge (docs/TELEMETRY-CONTRACT.md);
-    - EVERY unconditional row gets its own specific prefix(es) at its own
-      rates, dated today — including each family's newest version, whose rates
-      equal the family row's (so no computed cost changes) but whose events now
-      resolve to a row of their own instead of the family default (an
-      estimate). This subsumes the old special cases: retired models on old
-      pricing, and anti-shadowing (`claude-fable-5` is a string-prefix of
-      `claude-fable-5-1`, so a Fable-5.1 model needs its own longer row or it
-      would pick up Fable-5's rate).
-    Conditional rows are listed before unconditional specific rows so that, on
-    a (prefix, effective_from) collision, the in-force conditional rate wins
-    the first-occurrence dedup (as it did when same-rate versions minted no
-    row of their own)."""
-    today_epoch = int(datetime.datetime.combine(
-        today, datetime.time(), tzinfo=datetime.timezone.utc).timestamp())
-    family_seen, candidates = set(), []
+    """Deterministic prefix plan — mint only the rate IN FORCE today, per
+    listed version (docs/TELEMETRY-CONTRACT.md §Pricing table):
 
-    def epoch(d):
-        return int(datetime.datetime.combine(
-            d, datetime.time(), tzinfo=datetime.timezone.utc).timestamp())
+    - an in-force ``through <d>`` intro rate (``d >= today``) gets the
+      version's specific prefix(es) dated today; an EXPIRED one (``d < today``)
+      mints nothing — a stale page footnote never re-asserts an intro rate;
+    - an in-force ``starting <d>`` increase (``d <= today``) is dated ``d``; a
+      future one mints nothing (a forecast is not a recorded charge);
+    - an UNCONDITIONAL row's rate is minted, dated today, ONLY IF its version
+      has no in-force conditional — otherwise a pre-increase or post-intro
+      rate dated today would override the rate actually charged. Every listed
+      version therefore gets its own specific prefix(es) (``claude-<family>-
+      <version>`` or the legacy aliases), the family's newest one included;
+    - ``claude-<family>-`` — the FAMILY DEFAULT row, the fallback for models
+      of that family the page does not list — dated today at the in-force
+      rate of the family's newest unconditionally-listed version (the rate its
+      own specific prefix resolves to from today on).
 
+    Ordering: on a ``(prefix, effective_from)`` collision the first candidate
+    wins. In-force conditionals are listed before unconditional rows (and an
+    in-force conditional suppresses the version's unconditional rate anyway),
+    so the in-force rate wins regardless of page order; among several
+    unconditional rows for one version (e.g. a long-context row) the FIRST
+    listed wins.
+
+    :param entries: :func:`parse_models` output, in page order.
+    :param today: the run date (UTC).
+    :returns: candidate dicts ``{prefix, rates, effective_from}``, family
+        rows first.
+    """
+    today_epoch = _epoch(today)
+
+    def version(e):
+        return (e["family"], e["version"])
+
+    conditioned = {version(e) for e in entries
+                   if in_force(e["condition"], today)}
+    specific = []
     for e in entries:
-        fam, rates = e["family"], e["rates"]
-        if e["condition"] is None and fam not in family_seen:
-            family_seen.add(fam)
-            candidates.append({"prefix": f"claude-{fam}-", "rates": rates,
-                               "effective_from": today_epoch})
-    for e in entries:
-        if e["condition"] is None:
+        if not in_force(e["condition"], today):
             continue
         kind, date = e["condition"]
-        if kind == "starting" and date > today:
-            continue  # scheduled increase not yet in effect — do not mint
-        eff = today_epoch if kind == "through" else epoch(date)
+        eff = today_epoch if kind == "through" else _epoch(date)
         for p in specific_prefixes(e["family"], e["version"]):
-            candidates.append({"prefix": p, "rates": e["rates"],
-                               "effective_from": eff})
+            specific.append({"prefix": p, "rates": e["rates"],
+                             "effective_from": eff})
     for e in entries:
-        if e["condition"] is not None:
+        if e["condition"] is not None or version(e) in conditioned:
             continue
         for p in specific_prefixes(e["family"], e["version"]):
-            candidates.append({"prefix": p, "rates": e["rates"],
-                               "effective_from": today_epoch})
+            specific.append({"prefix": p, "rates": e["rates"],
+                             "effective_from": today_epoch})
     # keep first occurrence per (prefix, effective_from)
-    seen, out = set(), []
-    for c in candidates:
+    seen, deduped = set(), []
+    for c in specific:
         key = (c["prefix"], c["effective_from"])
         if key not in seen:
             seen.add(key)
-            out.append(c)
-    return out
+            deduped.append(c)
+    # family default rows: the newest unconditional version's in-force rate —
+    # the row its own first prefix resolves to from today on (greatest
+    # effective_from, first on a tie).
+    family_rows, done = [], set()
+    for e in entries:
+        fam = e["family"]
+        if e["condition"] is not None or fam in done:
+            continue
+        done.add(fam)
+        own = specific_prefixes(fam, e["version"])[0]
+        best = None
+        for c in deduped:
+            if c["prefix"] == own and (
+                    best is None
+                    or c["effective_from"] > best["effective_from"]):
+                best = c
+        family_rows.append({"prefix": f"claude-{fam}-",
+                            "rates": best["rates"],
+                            "effective_from": today_epoch})
+    return family_rows + deduped
 
 
 def plan(conn, candidates):

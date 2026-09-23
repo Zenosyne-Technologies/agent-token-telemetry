@@ -34,10 +34,15 @@ changed or the fetch failed; its stderr says which). Then do it manually:
    never took effect (same contract §). `INSERT OR IGNORE` (unique key
    `provider, model_prefix, model_version, effective_from`) makes same-day
    reruns a no-op. Apply this per family (`claude-<family>-`, at the newest
-   version's rates) **and per listed version** (`claude-<family>-<version>`
-   with dots as dashes, e.g. `claude-opus-4-8`, at that version's rates) — every
-   version on the page gets its own row; the family prefix is only the fallback
-   for unlisted models (contract § "Own price vs family default").
+   version's in-force rate) **and per listed version** (`claude-<family>-<version>`
+   with dots as dashes, e.g. `claude-opus-4-8`) — every version on the page gets
+   its own row at the rate **in force today**: an expired `through <date>` intro
+   rate (date already past) is never recorded, and a version's unconditional
+   rate is skipped while an in-force `through`/`starting` rate exists for it. An
+   unlisted point release (e.g. `claude-opus-5-5`) then prices at its nearest
+   listed ancestor's row (`claude-opus-5`) from that row's date on, else the
+   family default, and counts as estimated either way (contract § "Own price
+   vs estimate").
 4. A `models`-table name matching no prefix is **unpriced** — report it, do
    not fabricate a rate.
 5. Report the same table the script prints: prefix, rates, effective date,

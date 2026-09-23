@@ -262,40 +262,68 @@ dated row supersedes them. Any consumer that renders an estimate's rate date **m
 special-case `effective_from = 0` as "seed rates (undated)" — never format it as an
 epoch date (1970-01-01).
 
-**Own price vs family default.** Three defined terms, each implemented once per
-dialect (Python `capture.is_family_default`, SQLite `capture.family_default_sql`,
-Postgres `model_prefix ~ '^claude-[a-z]+-$'` in `supabase/reports.sql`):
+**Own price vs estimate.** Four defined terms, each implemented once per dialect
+(Python `capture.is_family_default` / `capture.is_ancestor_row` /
+`capture.is_estimated`, SQLite `capture.family_default_sql` /
+`capture.ancestor_row_sql` / `capture.estimated_sql`, Postgres the `estimated`
+column of `report_priced_events` in `supabase/reports.sql`):
 
 - **Family default row** — a pricing row whose `model_prefix` matches
   `^claude-[a-z]+-$`: a bare family prefix such as `claude-opus-` or `claude-fable-`,
   including the `effective_from = 0` seed rows. It is the family's fallback rate for
-  any model of that family without a row of its own. `claude-opus-5-5`,
-  `claude-opus-4-2025`, `claude-3-5-haiku` and `claude-sonnet-4` are **not** family
-  default rows (they are a model's own row).
+  any model of that family without a closer row. `claude-opus-5-5`,
+  `claude-opus-4-2025`, `claude-opus-4-`, `claude-3-5-haiku` and `claude-sonnet-4`
+  are **not** family default rows.
+- **Ancestor row** — for a given model, a row that matches it only because the model
+  is an unlisted point release of the row's version. Let R be the model name with the
+  row's `model_prefix` removed from its start; the row is an ancestor row when R
+  matches `^-[0-9]{1,2}(-|$)` (a point-release segment): `claude-opus-5` for
+  `claude-opus-5-5` (R = `-5`). A date snapshot is **not** an ancestor:
+  `claude-haiku-4-5` for `claude-haiku-4-5-20251001` (R = `-20251001`) and
+  `claude-opus-4-2025` for `claude-opus-4-20250514` (R = `0514`) are the model's own
+  rows.
 - **Estimated event** — an event whose resolved pricing row (the resolution above,
-  unchanged) is a family default row. Its cost is an estimate at the family rate, not
-  necessarily that model's published price. An unpriced event (no row resolves) is
-  neither estimated nor own-priced.
+  unchanged) is a family default row **or** an ancestor row for its model. Its cost is
+  an estimate, not necessarily that model's published price. An unpriced event (no row
+  resolves) is neither estimated nor own-priced.
 - **Model without own price** — a model name with at least one event for which **no**
-  non-family-default pricing row's prefix is a prefix of the name, at any
-  `effective_from`. Every event of such a model is estimated or unpriced (a model with
-  no matching row at all, e.g. a non-Claude model, is therefore included). A model
-  that has an own row is not one, even if some of its older events predate that row
-  and still resolve to the family default.
+  pricing row whose prefix is a prefix of the name is its own row (neither a family
+  default row nor an ancestor row for that name), at any `effective_from`. Every event
+  of such a model is estimated or unpriced (a model with no matching row at all, e.g.
+  a non-Claude model, is therefore included). A model that has an own row is not one,
+  even if some of its older events predate that row and are still estimated.
 
-The report data carries these flags (`report_priced_events.family_default`, per-row
+The report data carries these flags (`report_priced_events.estimated`, per-row
 estimated-event counts, the list of models without own price); they do not change
 any computed cost.
 
-**`pricing-update` mints a row for every listed version.** Each model version read off
-the published page gets its own specific prefix(es) (`claude-<family>-<version>`, or
-the legacy alias prefixes such as `claude-3-5-haiku` / `claude-opus-4-0`) at that
-version's rates — including each family's newest version, whose rates equal the
-`claude-<family>-` row written in the same run, so no computed cost changes. The bare
-family prefix remains the fallback for models the page does not list (a new point
-release before the next refresh): their events price at the family default and are
-estimated until a refresh lands their own row. A new row takes effect from its
-`effective_from` onward only; events before it keep the rate they already had.
+**`pricing-update` mints only the rate in force today, per listed version.** Each
+model version read off the published page gets its own specific prefix(es)
+(`claude-<family>-<version>`, or the legacy alias prefixes such as `claude-3-5-haiku`
+/ `claude-opus-4-0`) — including each family's newest version — at the rate in force
+on the run date:
+
+- a `through <d>` intro rate is in force while `d >= today` and is minted dated
+  today; once `d < today` it is **expired** and mints nothing — a stale page footnote
+  never re-asserts an intro rate;
+- a `starting <d>` increase is minted dated `d` once `d <= today`, never before;
+- a version's unconditional rate is minted dated today **only if** that version has
+  no in-force conditional, so a pre-increase or post-intro rate never overrides the
+  rate actually charged;
+- an in-force `through` wins regardless of where it sits relative to the version's
+  unconditional row on the page;
+- when the page lists several unconditional rows for one version (e.g. a long-context
+  row), the **first** one listed is the version's rate;
+- the `claude-<family>-` family default row, dated today, carries the in-force rate of
+  the family's newest unconditionally-listed version.
+
+A model the page does not list is priced by the longest matching prefix, unchanged:
+an unlisted point release of a listed version (e.g. `claude-opus-5-5` while the page
+lists Opus 5) prices at its nearest listed ancestor's own row (`claude-opus-5`) for
+events on or after that row's `effective_from`, and before it at whatever row resolved
+before — typically the family default. Either way its events are **estimated** until a
+refresh lands its own row. This is forward-only: minted rows are dated today (or at an
+arrived `starting` date), so events before them keep the rate they already had.
 
 ## Context sidecar (kit → telemetry)
 
