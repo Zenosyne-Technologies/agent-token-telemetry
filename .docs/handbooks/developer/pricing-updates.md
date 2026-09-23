@@ -416,8 +416,9 @@ after `--backfill-apply` that is not a well-formed pricing prefix
 (`is_pricing_prefix()`) — including another flag such as `--db=other.db` —
 so a malformed or option-looking argument is refused with exit 2 before any
 DB is opened. Because `--backfill-apply` uses `nargs="+"` and consumes every
-remaining raw argument as a candidate prefix, `--db`/`--html` MUST be given
-BEFORE `--backfill-apply` on the command line; anything after it is checked
+remaining raw argument as a candidate prefix, `--db` MUST be given BEFORE
+`--backfill-apply` on the command line (`--html` is refresh-only and is
+rejected with either backfill flag); anything after it is checked
 only as a prefix, never as another flag. Argparse's own
 `add_mutually_exclusive_group()` enforces the same
 `--backfill-plan`/`--backfill-apply` exclusivity a second, independent way —
