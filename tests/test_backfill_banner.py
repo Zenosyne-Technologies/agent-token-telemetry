@@ -15,6 +15,7 @@ import pathlib
 import stat
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -339,6 +340,27 @@ class TestBannerLine(Base):
         self.cache.mkdir()
         self.assertIsNone(self.line())
         self.payload()   # never raises
+
+    def test_fifo_at_cache_path_is_no_line_and_does_not_hang(self):
+        # A FIFO with no writer would block a plain O_RDONLY open() (and a
+        # blocking read()) forever; the reader must never get that far —
+        # opening non-blocking and checking fstat before any read is what
+        # keeps this bounded. Run off-thread with a hard timeout so a
+        # regression hangs this test, not the whole suite: the thread is a
+        # daemon, so it cannot block process/suite exit even if it never
+        # returns.
+        os.mkfifo(self.cache)
+        result = {}
+
+        def run():
+            result["line"] = self.line()
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(timeout=2)
+        self.assertFalse(t.is_alive(), "reading a FIFO sidecar hung past 2s")
+        self.assertIsNone(result.get("line"))
+        self.assertIsNone(self.payload()["priceWarning"]["backfill"])
 
     def test_symlink_to_valid_summary_is_not_followed(self):
         real = pathlib.Path(self.f.tmp.name) / "elsewhere.json"

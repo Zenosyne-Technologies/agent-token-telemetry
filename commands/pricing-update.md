@@ -17,7 +17,9 @@ Then run the backfill step below (after the fallback too, once the table is
 refreshed).
 
 **Backfill — consent-gated** (contract: `docs/TELEMETRY-CONTRACT.md` §Pricing
-table, "Third narrow case"). Run the read-only plan:
+table, "Third narrow case"). Run the plan — it reads the DB read-only (writes
+no DB row) and caches a plan summary in `backfill-plan.json` next to the DB
+for the dashboard:
 
 ```
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-plan
@@ -74,7 +76,11 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-plan
   the exact, bare `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py"
   --backfill-plan` — neither pattern accepts a prefix match, so neither one
   pre-approves `--db`, `--html`, or any other flag or path tacked onto the
-  end; any such variant (including `--backfill-apply` in any form) always
+  end. The bare `--backfill-plan` form stays safe to pre-approve even though
+  it now writes the plan-summary sidecar: it takes no arguments, so it can
+  only ever write that one fixed path (`backfill-plan.json` next to the DB
+  the dashboard reads), and it does so with mode 0600, atomically, and never
+  through a symlink. Any such variant (including `--backfill-apply` in any form) always
   raises Claude Code's own permission prompt, which the user must approve in
   THIS session before anything runs — a second, harness-enforced gate on top
   of the question above, independent of this file's text. An unattended or

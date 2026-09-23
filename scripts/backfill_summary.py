@@ -216,13 +216,22 @@ def read(path=None, now=None):
     path = Path(path or cache_path())
     now = time.time() if now is None else now
     try:
-        fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | _NOFOLLOW)
     except OSError:
         return None
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            # A FIFO, device, socket, etc. — closed unopened-for-reading, so
+            # a FIFO with no writer (which would otherwise block open() or a
+            # blocking read()) never has a byte read from it; treated the
+            # same as a missing file.
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        return None
+    try:
         with os.fdopen(fd, "rb") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                return None
             raw = f.read(MAX_CACHE_BYTES + 1)
     except OSError:
         return None

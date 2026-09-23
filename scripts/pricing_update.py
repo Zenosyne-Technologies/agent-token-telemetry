@@ -24,9 +24,11 @@ page/file that reads but does not parse or bound-check as expected is
 exactly the kind of anomaly the fallback's manual read must not be trusted
 with either.
 
-`--backfill-plan [--json]` prints the read-only consent-gated backfill plan
-(estimated events that a copy of their model's own, later-minted rate would
-re-price) and `--backfill-apply PREFIX...` applies the user-confirmed prefixes
+`--backfill-plan [--json]` prints the consent-gated backfill plan (estimated
+events that a copy of their model's own, later-minted rate would re-price);
+it reads the DB read-only (writes no DB row) and caches a plan summary in
+`backfill-plan.json` next to the DB for the dashboard (see below).
+`--backfill-apply PREFIX...` applies the user-confirmed prefixes
 — contract §Pricing table, "Third narrow case" (consent-gated backfill). Neither
 fetches the page. `--backfill-apply` exits 2, touching nothing, when any
 argument is not a well-formed pricing prefix (:func:`is_pricing_prefix`), and 1
@@ -2069,7 +2071,9 @@ def main(argv=None):
                             " (tests); mutually exclusive with"
                             " --backfill-plan/--backfill-apply")
     group.add_argument("--backfill-plan", action="store_true",
-                       help="print the read-only backfill plan and exit")
+                       help="print the backfill plan and exit (DB read-only;"
+                            " caches a plan-summary sidecar for the"
+                            " dashboard)")
     ap.add_argument("--json", action="store_true",
                     help="with --backfill-plan: machine-readable JSON")
     group.add_argument("--backfill-apply", nargs="+", metavar="PREFIX",

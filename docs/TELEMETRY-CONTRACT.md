@@ -289,9 +289,11 @@ model's events were priced at an **estimate** (their resolved row was a family d
 or ancestor row — "Own price vs estimate" below) before that model's own row was first
 minted, `pricing_update.py --backfill-plan` offers, per such prefix P, one extra row: a
 copy of P's earliest own row R0, dated the UTC start of the day of the earliest
-estimated event P is the own row for. The plan is read-only; it lists every event whose
-resolved row would change (other models sharing the prefix included, under their own
-names), the window and its span, and cost now → after. `--backfill-apply <prefix>...`
+estimated event P is the own row for. The plan reads the DB read-only (writes no DB row)
+and caches a plan summary in `backfill-plan.json` next to the DB for the dashboard (see
+"Dashboard plan summary" below); it lists every event whose resolved row would change
+(other models sharing the prefix included, under their own names), the window and its
+span, and cost now → after. `--backfill-apply <prefix>...`
 re-plans, writes all named rows in one transaction or none, and verifies that exactly
 the planned events changed, rolling back otherwise; it accepts only arguments of the
 strict prefix shape the parser mints (`claude-<family>-<version>` or a legacy alias),

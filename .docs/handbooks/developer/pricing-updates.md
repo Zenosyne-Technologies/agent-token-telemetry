@@ -367,7 +367,10 @@ A refresh is forward-only, so a model whose events were priced at an estimate
 (a family default or ancestor row) before its own row was first minted keeps
 that estimate forever — e.g. `claude-opus-5-5` events priced at the
 `claude-opus-` default the day before its own, cheaper row landed.
-`--backfill-plan` (read-only; `--json` for machines) finds each non-family
+`--backfill-plan` (reads the DB read-only, writes no DB row, and caches a
+plan summary in `backfill-plan.json` next to the DB for the dashboard — see
+"Dashboard 'backfill available' line" below; `--json` for machines) finds
+each non-family
 prefix P whose earliest own row R0 was preceded by estimated events of models
 P is the own row for, and offers one INSERT: R0's rates dated the UTC start of
 the earliest such event's day. `backfill_plan()` never assumes the impact set:
