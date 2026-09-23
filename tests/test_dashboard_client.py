@@ -19,6 +19,7 @@ import html.parser
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -367,6 +368,50 @@ class TestBannerCostMatchesPageFormatter(_NodeTestCase):
                       for v, js in zip(values, out["fmt"])
                       if js != dashboard._warn_usd(v)]
         self.assertEqual(mismatches, [])
+
+
+class TestPriceWarnStaticMarkupAndCSS(unittest.TestCase):
+    """Static checks over the shipped page source — no ``node`` needed. The
+    fake DOM in dashboard_dom_harness.js cannot evaluate CSS, so the
+    ``display`` guard has to be asserted as text against the stylesheet; and
+    the initial ``hidden`` state has to be asserted on the markup the server
+    actually ships, before any client-side render runs."""
+
+    CSS_CLASSES = ("price-warn", "price-warn-group")
+
+    def test_banner_and_group_display_only_set_under_not_hidden(self):
+        # C1/C2: an unconditional `display` rule for .price-warn or
+        # .price-warn-group would override the `hidden` attribute's UA
+        # default, and the banner (or a group within it) could never truly
+        # hide — see dashboard.html's "PRICE WARNING" comment block.
+        source = DASHBOARD_HTML.read_text()
+        m = re.search(r"<style>(.*?)</style>", source, re.S)
+        self.assertIsNotNone(m, "no <style> block in dashboard.html")
+        style = m.group(1)
+        rules = re.findall(r"([^{}]+)\{([^{}]*)\}", style)
+        for cls in self.CSS_CLASSES:
+            bare = re.compile(r"\." + re.escape(cls) + r"(?![\w-])")
+            guarded = re.compile(r"\." + re.escape(cls) + r"(?![\w-]):not\(\[hidden\]\)")
+            display_selectors = [
+                sel.strip()
+                for sel_group, body in rules if "display" in body
+                for sel in sel_group.split(",")
+                if bare.search(sel.strip())
+            ]
+            self.assertTrue(display_selectors,
+                             f".{cls}: no CSS rule sets `display` for it at all")
+            for sel in display_selectors:
+                self.assertRegex(
+                    sel, guarded,
+                    f".{cls}: display rule {sel!r} is not guarded by :not([hidden])")
+
+    def test_banner_ships_hidden_before_any_render(self):
+        # C3: the server-rendered markup must carry `hidden` on #price-warn
+        # itself, so the banner starts hidden before the first client-side
+        # render (or if the first fetch fails and no render ever runs).
+        banner, _, _ = parse_page(DASHBOARD_HTML.read_text())
+        self.assertIn("hidden", banner["attrs"],
+                       "#price-warn must ship with the `hidden` attribute")
 
 
 if __name__ == "__main__":

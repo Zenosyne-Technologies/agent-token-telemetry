@@ -1,3 +1,4 @@
+import calendar
 import json
 import os
 import pathlib
@@ -17,6 +18,34 @@ from tests.test_capture import entry
 
 def iso(ts):
     return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(ts))
+
+
+def utc_epoch(y, m, d, hh=12, mm=0, ss=0):
+    """A known epoch-seconds timestamp for the given UTC calendar date, for
+    tests that pin a LITERAL expected ``dashboard._warn_date``/
+    ``_warn_date_range`` string (see ``pin_utc``) — an independent oracle,
+    not a round-trip through the function under test."""
+    return calendar.timegm((y, m, d, hh, mm, ss, 0, 0, 0))
+
+
+def pin_utc(testcase):
+    """Pin TZ=UTC for one test, restoring it on cleanup. ``_warn_date``
+    renders in the server's local timezone (its own docstring says so), so a
+    test asserting a literal expected date string needs a fixed zone to be
+    deterministic across runners — mirrors the TZ pin in
+    tests/test_report_parity.py's ``TestPostgresEquivalence``."""
+    prev = os.environ.get("TZ")
+    os.environ["TZ"] = "UTC"
+    time.tzset()
+
+    def _restore():
+        if prev is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = prev
+        time.tzset()
+
+    testcase.addCleanup(_restore)
 
 
 class TestDashboardData(unittest.TestCase):
@@ -301,7 +330,8 @@ class TestDashboardData(unittest.TestCase):
         # cache_w_usd), reproducing the pre-split estimate. The model still
         # has no own row, so it lands in the "estimated" group with this
         # exact cost text.
-        now = int(time.time())
+        pin_utc(self)
+        now = utc_epoch(2025, 6, 18)   # single-day range: a literal oracle
         self._insert("/proj", "s1", model="claude-sonnet-5-1", inp=1000000,
                      out=200000, cr=0, cw=100000, cw1h=40000, mid="m1",
                      ts=iso(now))
@@ -328,7 +358,7 @@ class TestDashboardData(unittest.TestCase):
         self.assertEqual(row["model"], "claude-sonnet-5-1")
         self.assertEqual(row["modelName"], "Sonnet 5.1")
         self.assertEqual(row["eventsText"], "1 event")
-        self.assertEqual(row["dateRangeText"], dashboard._warn_date(now))
+        self.assertEqual(row["dateRangeText"], "Jun 18, 2025")
         self.assertEqual(row["costText"], "$6.38")
         self.assertEqual(row["costText"], dashboard._warn_usd(expected_cost))
         self.assertEqual(pw["heading"],
@@ -432,6 +462,20 @@ class TestDashboardData(unittest.TestCase):
                          "$0.500 for 2 priced events; 3 unpriced, not counted")
         self.assertEqual(pw["estimated"][0]["eventsText"], "5 events")
 
+    def test_price_warning_date_text_catches_month_index_off_by_one(self):
+        # C10: dashboard._warn_date indexes _WARN_MONTHS with `d.month - 1`.
+        # An off-by-one substitution (e.g. `d.month % 12`) still returns a
+        # name from the tuple for every month, so it passes silently unless
+        # pinned against a literal string. December is the sharpest case:
+        # `12 % 12 == 0` wraps all the way around to "Jan", printed with the
+        # UNCHANGED year — "Jan 15, 2025" instead of "Dec 15, 2025".
+        pin_utc(self)
+        ts = utc_epoch(2025, 12, 15)
+        pw = dashboard.build_price_warning([{
+            "model": "m", "modelName": "m", "events": 1, "pricedEvents": 1,
+            "firstSeen": ts, "lastSeen": ts, "cost": 1.0, "unpriced": False}])
+        self.assertEqual(pw["estimated"][0]["dateRangeText"], "Dec 15, 2025")
+
     def test_price_warning_events_text_counts_plural_exactly(self):
         # M2b: pin n > 1, not just "1 event".
         now = int(time.time())
@@ -453,7 +497,8 @@ class TestDashboardData(unittest.TestCase):
         # every dashboard window itself excludes. A model whose only events
         # are backlog roll-ups from long ago must still be listed, counted
         # and priced.
-        now = int(time.time())
+        pin_utc(self)
+        now = utc_epoch(2026, 1, 5)   # multi-month range crossing a year boundary
         old = now - 400 * 86400
         conn = capture.connect(self.db)
         with conn:
@@ -476,8 +521,7 @@ class TestDashboardData(unittest.TestCase):
         est = d["priceWarning"]["estimated"][0]
         self.assertEqual(est["eventsText"], "2 events")
         self.assertEqual(est["costText"], "$10.00")
-        self.assertEqual(est["dateRangeText"],
-                         f"{dashboard._warn_date(old)} – {dashboard._warn_date(now)}")
+        self.assertEqual(est["dateRangeText"], "Dec 1, 2024 – Jan 5, 2026")
 
     def test_price_warning_cost_equals_the_pages_by_model_cost(self):
         # The banner's SQL cost must be the same arithmetic the rest of the
