@@ -2,12 +2,12 @@
 doc: Pricing Updates
 type: handbook
 status: active
-summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, minting only the rate in force today per listed version (with a stale-price warning for an expired intro with nothing else listed), the own-price-vs-estimate definitions, and the two narrow exceptions to the pricing table's immutability contract.
-keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning]
+summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, minting only the rate in force today per listed version (with a stale-price warning for an expired intro with nothing else listed), the own-price-vs-estimate definitions, and the dashboard's own-price warning banner (AOS-135) that now surfaces them, with its node-gated client tests.
+keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning, dashboard, price-warning-banner, node-gated-tests, require-node]
 level: project
 audience: developer
 module: pricing-update
-sources: [scripts/pricing_update.py, commands/pricing-update.md, docs/TELEMETRY-CONTRACT.md, tests/pricing_golden.py]
+sources: [scripts/pricing_update.py, commands/pricing-update.md, docs/TELEMETRY-CONTRACT.md, tests/pricing_golden.py, scripts/dashboard.py, scripts/dashboard.html, tests/test_dashboard_client.py, tests/dashboard_dom_harness.js]
 related: ["[[capture-pipeline]]", "[[remote-read-parity]]"]
 created: 2026-09-22
 updated: 2026-09-23
@@ -113,9 +113,91 @@ The flag is exposed today by `report.py` (`fetch_project_stats`'s
 `estimated_events`, `fetch_token_stats`'s `estimated_by_model` and
 `models_without_own_price`), `dashboard.py` (`/api/data`: each event's and
 group's `estimated`, `kpis.estimatedEvents`, `modelsWithoutOwnPrice`), and
-`report_priced_events.estimated` on the remote (see [[remote-read-parity]]) —
-but nothing renders it in a report or the dashboard UI yet; that is later
-work, not landed here.
+`report_priced_events.estimated` on the remote (see [[remote-read-parity]]).
+The dashboard's own-price warning banner (AOS-135 S3, below) is what finally
+renders it to a user; report-level rendering is still later work.
+
+## Own-price warning banner (dashboard, AOS-135 S3)
+
+`dashboard.py`'s `fetch_price_warning()` takes `report.fetch_models_without_own_price()`'s
+list and, per model, sums its all-time event count, first/last-seen
+timestamps, and the cost its events resolve to under the same per-event
+pricing resolution `fetch_rows()` uses (`_rate`/`_resolved`). `pricedEvents`
+counts only the events that actually resolved to a pricing row (family
+default or ancestor rate); the rest contribute `0` to the sum instead of
+erroring, since by construction every event of these models is estimated or
+unpriced, never own-priced.
+
+`build_price_warning()` turns that per-model detail into the two-group
+content the banner renders — the client does no arithmetic:
+
+- **"Priced at an estimated rate"** — at least one event resolved to a
+  pricing row. Shows the accrued cost. A *mixed* model (some events resolved,
+  some didn't, because a resolving row landed after its earliest events)
+  states both counts instead of silently summing the unpriced ones as `$0`,
+  e.g. `"$2.70 for 1 priced event; 2 unpriced, not counted"`.
+- **"No price at all"** — no event ever resolved to any pricing row (a
+  non-Claude name, or a name matching no seeded family/ancestor prefix).
+  Cost text reads `"not counted"`, never a misleading `"$0.00 estimated"`.
+
+Both groups point at `/token-telemetry:pricing-update`. The banner is scoped
+all-time, not the period filter (a model must stay listed even if its only
+events fall outside the current window), and it hides entirely when every
+logged model already has its own price — `build_price_warning()` returns
+empty `estimated`/`unpriced` lists and the client never shows the box.
+
+Two new `/api/data` keys carry this: `modelsWithoutOwnPriceDetail` is
+`fetch_price_warning()`'s raw per-model rows; `priceWarning` is
+`build_price_warning()`'s ready-to-render output. The older
+`modelsWithoutOwnPrice` list (bare model names) is unchanged.
+
+**Every string is formatted server-side.** Headings, event counts (`"1
+event"` / `"N events"`), date ranges (`Mon D, YYYY`, or a `Mon D, YYYY – Mon
+D, YYYY` range; `_warn_date()` renders `"unknown date"` instead of raising
+when a timestamp can't convert to a local calendar date, so one bad event
+timestamp can't fail the whole `/api/data` response), and cost text
+(`_warn_usd()`, built to match `dashboard.html`'s own `fmtUSD` character for
+character) are all resolved in `dashboard.py`. `renderPriceWarning()` in
+`dashboard.html` does no arithmetic or string formatting — only
+`createElement`/`textContent` DOM construction, the same defense the rest of
+the page's tables use, applied here because a model name is
+attacker-controlled: nothing this banner writes ever goes through
+`innerHTML`, so a hostile model name can never be interpreted as markup.
+
+**Hidden by default, defensively.** `#price-warn` ships `hidden` and empty;
+`renderPriceWarning()` only ever toggles `hidden` and clears/rebuilds each
+group's list, never removing the shipped nodes, so it stays correct across
+any number of empty/non-empty refreshes. Because the page already styles
+some elements by id (and an inline `style="display:…"` would otherwise beat
+the CSS `:not([hidden])` display rule), `dashboard.html` adds a
+belt-and-suspenders guard: `#price-warn[hidden], #price-warn
+[hidden]{display:none !important}`. `!important` here beats any later id
+selector and any non-important inline style, so the banner and its groups
+stay genuinely hidden whenever `hidden` is set, no matter what else on the
+page targets them.
+
+## Testing: node-gated dashboard client behavior
+
+`tests/test_dashboard_client.py` runs `dashboard.html`'s real inline
+`<script>` under the system `node` binary, inside Node's `vm` module,
+against a fake DOM built in `tests/dashboard_dom_harness.js` from the page's
+own shipped `#price-warn` markup — so renaming a structural id breaks the
+test instead of passing it vacuously. The fake DOM is deliberately hostile to
+this banner's known defect shapes: it throws on any
+`innerHTML`/`outerHTML`/`insertAdjacentHTML` write to the banner subtree or
+to a `createElement`-made node, on removal of any shipped banner node, and
+on a raw hostile model name (script/svg/`onerror` payloads) reaching any
+`innerHTML` sink anywhere on the page. It also runs the page's real `fmtUSD`
+against `dashboard.py`'s `_warn_usd()` to hold the server-formatted cost
+strings character-for-character identical to what the page's own KPI/table
+formatter renders for the same number.
+
+Skipped, with a stated reason, when `node` isn't on `PATH` — the same
+gated-test pattern as the Postgres-gated tests in [[remote-read-parity]]. Set
+`TOKEN_TELEMETRY_REQUIRE_NODE=1` to turn a missing `node` into a hard
+failure instead of a skip; `.github/workflows/checks.yml` sets it and
+asserts `node --version` on the runner first, so this gate can never
+silently skip in CI.
 
 ## Testing: the golden no-cost-change test
 

@@ -2,15 +2,15 @@
 doc: Enabling Remote Telemetry
 type: handbook
 status: active
-summary: How to turn on the shared remote (Supabase) storage backend with `/token-telemetry:enable-remote` — choosing local vs remote, setting the project URL and the publishable-key env-var NAME (the key value is never entered in chat), applying the schema and running the RLS live-verification, logging in, ensuring your remote identity, then migrating your existing data or starting fresh, and how to switch back.
-keywords: [enable, remote, supabase, backend, publishable-key, env-var, login, rls, migrate, start-fresh, reversible, telemetry]
+summary: How to turn on the shared remote (Supabase) storage backend with `/token-telemetry:enable-remote` — choosing local vs remote, setting the project URL and the publishable-key env-var NAME (the key value is never entered in chat), applying the schema and running the RLS live-verification, logging in, ensuring your remote identity, then migrating your existing data or starting fresh, how to switch back, and the dashboard's own-price warning banner.
+keywords: [enable, remote, supabase, backend, publishable-key, env-var, login, rls, migrate, start-fresh, reversible, telemetry, dashboard, price-warning-banner, estimated-rate]
 level: project
 audience: user
 module: storage
-sources: [commands/enable-remote.md, commands/enable.md, scripts/remote_migrate.py, scripts/settings.py, scripts/supabase_backend.py, scripts/dashboard.py]
+sources: [commands/enable-remote.md, commands/enable.md, scripts/remote_migrate.py, scripts/settings.py, scripts/supabase_backend.py, scripts/dashboard.py, scripts/dashboard.html]
 related: ["[[operating-remote-telemetry]]", "[[migrating-to-remote]]", "[[migrating-local-logs-to-central]]", "[[reading-token-stats]]"]
 created: 2026-09-22
-updated: 2026-09-22
+updated: 2026-09-23
 ---
 
 # Enabling Remote Telemetry
@@ -130,6 +130,27 @@ it reads the local `usage.db` the same way whichever backend is active. Once
 you switch to remote, the dashboard's header adds a small note saying so and
 pointing you at `/token-telemetry:token-stats` for the central (all-machines)
 view. A full remote dashboard view is planned but not built yet.
+
+## When a logged model has no price of its own
+
+Whether you're local or remote, the dashboard shows a banner near the top of
+the page whenever it has logged usage (at any time, not just the period
+you're currently viewing) for a model that has no published price of its
+own. It splits what it finds into two groups:
+
+- **Priced at an estimated rate** — Anthropic hasn't published a rate for
+  this exact model, so a related rate is used instead (its version family's
+  default rate, or the nearest earlier model's rate). Each entry shows how
+  many times you used it, the date range, and the estimated cost. If some of
+  that model's usage happened before a rate could be found at all, the cost
+  says so — e.g. "$2.70 for 1 priced event; 2 unpriced, not counted" — rather
+  than quietly leaving those events out of the total.
+- **No price at all** — no rate could be found for this model at all; its
+  cost is not counted anywhere.
+
+Either way, the banner points you at `/token-telemetry:pricing-update` to
+refresh the pricing table. It disappears once every model you've logged has
+its own price.
 
 ## Going back to local
 
