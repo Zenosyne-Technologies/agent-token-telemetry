@@ -276,8 +276,12 @@ billed, so deleting it corrects the table rather than rewriting history. Every o
 row — one whose `effective_from <= now` and whose rate was, at some point, the rate
 actually charged — is immutable and is never `UPDATE`d or `DELETE`d. `pricing-update`
 itself never mints a future-dated row: a scheduled increase is recorded only on the
-first run on or after its effective date (so case (2) cannot arise from the script and
-is only reachable by a manual fallback that recorded a forecast by hand).
+first run on or after its effective date, so case (2) cannot arise from the script's
+own normal run. It is not reachable through the command's fallback either (AOS-143
+correction, round 2, F1b): that fallback no longer parses or inserts a row by hand —
+it re-fetches the page and re-runs this same script — so case (2) currently has no
+documented path at all; it is recorded here only because nothing but a manual write
+could ever have produced it.
 
 **Third narrow case — a consent-gated backfill may date an INSERT in the past.** Not a
 `DELETE` and not an `UPDATE`: the two cases above stay the only deletions. When a
@@ -415,6 +419,23 @@ own unbounded manual read would run for exactly the pages these bounds exist to
 refuse. A structural parse failure gets its own code too, and also never falls back:
 a page that fetched fine but did not parse as expected cannot be told apart from one
 altered in transit, so it is never handed to the fallback either.
+
+**Round 2 (F1b): the fallback itself closed, and only on an interactive run.** A
+security re-validation found that even with the three codes above separated, a
+hostile server could force `EXIT_FETCH_FAILED` on demand (a 403 to the script's
+fixed User-Agent, a 500, a redirect loop, a truncated body), then serve the agent's
+own differently-identified fetch a different page — and the command's prose fallback
+applied looser bounds than the script's (a per-row skip instead of refusing the whole
+page; no family/prefix-shape check; no cap on an unattended run). The fallback no
+longer parses or inserts anything itself: it re-fetches the page and re-runs
+`pricing_update.py --html <file>`, so every bound above applies through the one
+implementation, and it never runs on an unattended or scheduled run at all — on
+`EXIT_FETCH_FAILED` those report and stop, same as the other two codes (see
+`commands/schedule-pricing.md`). A related finding in the same pass (hang/DoS): the
+fetch itself now enforces one wall-clock deadline across connect + the full read
+(`FETCH_TIMEOUT_S`) and a body-size cap (`FETCH_MAX_BYTES`), since `urlopen`'s own
+`timeout=` only bounds each individual socket operation and a server that trickles
+data could otherwise avoid it indefinitely.
 
 - **Backdated `starting`.** An in-force `starting <d>` row is normally minted dated `d`
   however far back — `starting January 1, 1970` would mint `effective_from = 0`,

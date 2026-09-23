@@ -2,8 +2,8 @@
 doc: Pricing Updates
 type: handbook
 status: active
-summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, minting only the rate in force today per listed version (with warnings for an expired intro or a future-only-newest version), the own-price-vs-estimate definitions, the dashboard's own-price warning banner (AOS-135) that now surfaces them with its node-gated client tests, the consent-gated backfill of estimated events, the narrow exceptions to the pricing table's immutability contract, and the AOS-143 parser bounds (backdated-starting refusal, malformed-token rejection, rate-magnitude/floor and row-count caps, capped per-row warnings, three distinct exit codes so the command's manual fallback can never bypass a bound, sanitized error and fetch-failure text) that keep a hostile or broken page from minting permanent bad rows.
-keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning, future-rate-warning, backdated-starting-warning, parser-bounds, max-rate-usd, min-inout-rate-usd, max-candidates, warning-cap, exit-bounds-refused, exit-fetch-failed, exit-other-error, dashboard, price-warning-banner, node-gated-tests, require-node, backfill, backfill-plan, backfill-apply]
+summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, minting only the rate in force today per listed version (with warnings for an expired intro or a future-only-newest version), the own-price-vs-estimate definitions, the dashboard's own-price warning banner (AOS-135) that now surfaces them with its node-gated client tests, the consent-gated backfill of estimated events, the narrow exceptions to the pricing table's immutability contract, and the AOS-143 parser bounds (backdated-starting refusal, malformed-token rejection extended in round 2 to separator/suffix/notation characters, rate-magnitude/floor and row-count caps, capped per-row warnings, three distinct exit codes so the command's fallback can never bypass a bound, a wall-clock fetch deadline and body-size cap closing a hang/DoS gap, an unopenable-DB error mapped to its documented exit code, sanitized error and fetch-failure text, and round 2's F1b fix that closed the fallback itself — it now only ever re-fetches the page and re-runs this same script, never on an unattended/scheduled run) that keep a hostile or broken page from minting permanent bad rows.
+keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning, future-rate-warning, backdated-starting-warning, parser-bounds, max-rate-usd, min-inout-rate-usd, max-candidates, warning-cap, exit-bounds-refused, exit-fetch-failed, exit-other-error, dashboard, price-warning-banner, node-gated-tests, require-node, backfill, backfill-plan, backfill-apply, f1b, fetch-timeout-s, fetch-max-bytes, strict-number-token]
 level: project
 audience: developer
 module: pricing-update
@@ -155,28 +155,61 @@ increase itself recorded that later row.
 **Three distinct exit codes (AOS-143, corrected, F1).** A plain refresh run
 ends in `EXIT_BOUNDS_REFUSED` (1, the page violated a bound below — never
 falls back), `EXIT_FETCH_FAILED` (2, the page/file could not be read at
-all — the ONLY code `commands/pricing-update.md`'s manual fallback runs
-for), or `EXIT_OTHER_ERROR` (3, the page read fine but did not structurally
-parse, or another unexpected error — also never falls back). The first
-AOS-143 fix shipped let a bound refusal share `EXIT_FETCH_FAILED`'s
+all, including the fetch bounds below — the ONLY code
+`commands/pricing-update.md`'s fallback runs for, and only on an interactive
+run), or `EXIT_OTHER_ERROR` (3, the page read fine but did not structurally
+parse, another unexpected error, or a DB error — also never falls back). The
+first AOS-143 fix shipped let a bound refusal share `EXIT_FETCH_FAILED`'s
 predecessor code with a genuine fetch/layout failure, so the command's own
-fallback text — which has none of these bounds — would run for exactly the
+fallback text — which had none of these bounds — would run for exactly the
 pages the bounds exist to refuse; `main()` now catches `PricingRefused`
 around `parse_models()` itself (not just around `run_update()`'s row-count
 check) so every bound refusal, wherever it is raised, gets the same
 non-falling-back code.
 
+**Round 2 (F1b) closed the fallback itself.** Even with the codes above
+separated, a hostile server could still force `EXIT_FETCH_FAILED` on demand
+and get served, through the agent's own differently-identified fetch, a page
+whose bounds the command's PROSE fallback applied more loosely than the
+script (a per-row skip instead of refusing the whole page; no family/prefix
+check; no cap on an unattended run). The fallback no longer parses or inserts
+anything by hand at all: it re-fetches the page, writes it to a file, and
+re-runs `pricing_update.py --html <file>`, so every bound in this document
+applies through the one implementation; it also never runs on an unattended
+or scheduled run — those report and stop on `EXIT_FETCH_FAILED` too. A
+related round-2 fix bounds the fetch itself: `_fetch_page()` enforces one
+wall-clock deadline across connect + the full read (`FETCH_TIMEOUT_S`, 30s)
+in a joined daemon thread — `urlopen`'s own `timeout=` only bounds each
+individual socket operation, which a server that trickles data through can
+avoid indefinitely — plus a body-size cap (`FETCH_MAX_BYTES`, 5MB) enforced
+while reading in chunks, since `resp.read()` has no cap of its own.
+
 **Unbounded rate magnitude, and malformed numeric tokens (`MAX_RATE_USD`,
 `MIN_INOUT_RATE_USD`, in `parse_models()`; malformed-token rejection in
-`money()` itself, AOS-143 corrected).** `money()` matches the WHOLE
-contiguous `$`-prefixed numeric-ish run (digits, commas, dots, exponent
-markers, signs) and requires it to be a plain decimal number — ASCII digits
-with at most one `.` — raising `PricingRefused` otherwise: a thousands
+`money()` itself, AOS-143 corrected, extended round 2, F6).** `money()`
+matches the WHOLE contiguous `$`-prefixed numeric-ish run and requires it —
+trailing ASCII spaces trimmed — to be a plain decimal number — ASCII digits
+with at most one `.` — raising `PricingRefused` otherwise. Round 1's class
+(digits, commas, dots, exponent markers, signs) already refused a thousands
 separator (`$1,500`), more than one decimal point (`$4.00.00`), or any
 exponent marker, complete (`$1e309`) or dangling after a bare `.`
-(`$1.e3`), used to be silently truncated to its leading digits (minting
-`$1`) instead of refusing the malformed cell outright. A well-formed number
-that survives that check is still bounded in `parse_models()`: a rate cell
+(`$1.e3`), instead of silently truncating to the leading digits (minting
+`$1`). Round 2 found the class still let other separator/suffix/notation
+characters through uncaptured, each truncating the same way: an apostrophe
+or underscore thousands separator (`$1'500`, `$1_500`), a thousands-grouping
+space — ASCII or one of four Unicode variants, thin space U+2009, narrow
+no-break space U+202F, no-break space U+00A0, figure space U+2007 —
+(`$1 500`), a `k`/`M` magnitude suffix (`$1k`, `$1M`), a written-out exponent
+(`$1x10^6`), or a leading sign (`$-4`, `$+4`). Every one of those is now also
+a run character, so the WHOLE run is captured and fails the strict check
+instead of stopping short. `e`/`E`/`+`/`-` stay in the class from round 1 —
+removing them would stop capturing an exponent's tail and reopen the
+`$1e309` → `$1` truncation it fixed. A character the class does not
+recognize at all (e.g. a non-ASCII digit) still starts no run — `money()`
+returns `None`, `parse_models()` raises its pre-existing generic
+"unparseable rate cell" error (`EXIT_OTHER_ERROR`), and that is still safe
+(the run stops either way). A well-formed number that survives that check is
+still bounded in `parse_models()`: a rate cell
 with several hundred digits overflows Python's `float()` to `inf` with **no
 exception raised**; `parse_models()` rejects any rate that is non-finite,
 exceeds `MAX_RATE_USD` ($10,000/MTok), or — for `in_usd`/`out_usd` only,
@@ -431,7 +464,9 @@ above is an INSERT dated in the past that replaces an estimate — never a
 model's own published rate — for estimated events only.
 
 Because `build_candidates()` never mints a `starting` row ahead of its date
-(above), case (2) cannot arise from this script's own normal run — it is only
-reachable through the manual fallback that records a forecast by hand before
-this script would have. See `docs/TELEMETRY-CONTRACT.md` for the exact
-`effective_from`/`now` boundary and the `effective_from = 0` seed-row caveat.
+(above), case (2) cannot arise from this script's own normal run. It is not
+reachable through the command's fallback either (AOS-143 correction, round 2,
+F1b): the fallback no longer records anything by hand — it re-fetches the page
+and re-runs this same script — so case (2) currently has no documented path at
+all. See `docs/TELEMETRY-CONTRACT.md` for the exact `effective_from`/`now`
+boundary and the `effective_from = 0` seed-row caveat.
