@@ -13,12 +13,16 @@ F1): `EXIT_BOUNDS_REFUSED` (1) — the page was REFUSED by a parser bound (an
 out-of-bounds/malformed rate, or over `MAX_CANDIDATES` rows) — nothing is
 wrong with fetching or reading the page, the page itself is untrustworthy, so
 the LLM flow reports this and STOPS; `EXIT_FETCH_FAILED` (2) — the page (or
-`--html` file) could not be read at all (network down, HTTP error, timeout) —
-this is the ONLY exit code the manual fallback exists for; `EXIT_OTHER_ERROR`
-(3) — the page was read but its structure did not parse (layout changed,
-table/column not found) or an unexpected error occurred — also no fallback,
-since a page that reads but does not parse as expected is exactly the kind of
-anomaly the fallback's unbounded manual read must not be trusted with either.
+`--html` file) could not be read at all (network down, HTTP error, timeout,
+missing/unreadable `--html` path) — this is the ONLY exit code the manual
+fallback exists for; `EXIT_OTHER_ERROR` (3) — the page was read but its
+structure did not parse (layout changed, table/column not found), an
+unexpected error occurred, or the `--html` file existed but failed its
+pre-read bounds check (not a regular file, or over `FETCH_MAX_BYTES` —
+AOS-143 round 4, F2, :func:`_read_html_file`) — also no fallback, since a
+page/file that reads but does not parse or bound-check as expected is
+exactly the kind of anomaly the fallback's manual read must not be trusted
+with either.
 
 `--backfill-plan [--json]` prints the read-only consent-gated backfill plan
 (estimated events that a copy of their model's own, later-minted rate would
@@ -54,9 +58,12 @@ import datetime
 import decimal
 import json
 import math
+import os
 import re
+import stat
 import sys
 import threading
+import unicodedata
 import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
@@ -198,6 +205,48 @@ _MONEY_TOKEN_RE = re.compile(
 # silently keeping only the run's well-formed leading digits.
 _STRICT_NUMBER_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 
+# Characters that, found immediately after a money() token's matched run,
+# mean the run was TRUNCATED rather than complete (AOS-143 round 4, N1):
+# each is a digit-group or decimal separator lookalike that
+# :data:`_MONEY_TOKEN_RE`'s character class does not recognize, so the run
+# stops one character early and leaves only the leading digits looking
+# well-formed — e.g. `$1，500` (fullwidth comma) matches only `1`, which
+# passes :data:`_STRICT_NUMBER_RE` unless this lookahead also refuses it.
+_TRAILING_SEPARATOR_LOOKALIKES = frozenset("，٫٬'’_.")
+
+
+def _rate_token_truncated(text, pos):
+    """True if the character at ``text[pos]`` — immediately following a
+    :func:`money` token's matched run — shows the run was TRUNCATED rather
+    than complete (AOS-143 round 4, N1), instead of the cell genuinely
+    ending there (or continuing with unrelated text such as `` / MTok``):
+
+    - a Unicode digit the token's own character class does not recognize
+      (``ch.isdigit()`` or Unicode category ``Nd`` — covers Arabic-Indic,
+      fullwidth, and other non-ASCII digit scripts);
+    - a digit-group or decimal-separator lookalike
+      (:data:`_TRAILING_SEPARATOR_LOOKALIKES`);
+    - a dash (Unicode category ``Pd``, or the ASCII hyphen) immediately
+      followed by a digit — a written-out range such as ``$3–4``.
+
+    :param text: the original, untrimmed cell text.
+    :param pos: the index immediately after the matched run
+        (:meth:`re.Match.end`).
+    :returns: ``True`` when the character at ``pos`` indicates truncation.
+    """
+    if pos >= len(text):
+        return False
+    ch = text[pos]
+    if ch.isdigit() or unicodedata.category(ch) == "Nd":
+        return True
+    if ch in _TRAILING_SEPARATOR_LOOKALIKES:
+        return True
+    if ch == "-" or unicodedata.category(ch) == "Pd":
+        nxt = text[pos + 1] if pos + 1 < len(text) else ""
+        if nxt and (nxt.isdigit() or unicodedata.category(nxt) == "Nd"):
+            return True
+    return False
+
 
 def money(text):
     """Parse a ``$<amount> / MTok`` cell to a float, or ``None`` when the
@@ -227,17 +276,27 @@ def money(text):
     :func:`parse_models`'s job (:data:`MAX_RATE_USD`, :data:`MIN_INOUT_RATE_USD`),
     so every caller shares the one enforcement point for those; a malformed
     TOKEN, by contrast, is refused right here, since no caller should ever
-    see a guessed-at number."""
+    see a guessed-at number.
+
+    The run can still be truncated rather than malformed (AOS-143 round 4,
+    N1): a character right after the matched run that :data:`_MONEY_TOKEN_RE`'s
+    class does not recognize (e.g. a non-ASCII digit, a fullwidth or Arabic
+    separator, or an en/em dash immediately followed by a digit) simply ends
+    the run one character early, leaving only its well-formed leading digits
+    to pass :data:`_STRICT_NUMBER_RE` — silently minting a wrong number
+    (``$3٠٠`` -> ``3``, ``$3–4`` -> ``3``) instead of refusing the cell.
+    :func:`_rate_token_truncated` checks the character immediately following
+    the run for exactly this shape and raises here too."""
     m = _MONEY_TOKEN_RE.search(text)
     if not m:
         return None
     token = m.group(1).rstrip(" ")
-    if not _STRICT_NUMBER_RE.match(token):
+    if not _STRICT_NUMBER_RE.match(token) or _rate_token_truncated(text, m.end()):
         raise PricingRefused(
             "Pricing refresh REFUSED — nothing written: malformed rate cell"
             " (expected a plain decimal number such as $3 or $3.75 — not a"
             " thousands separator, a magnitude suffix, scientific/written-out"
-            " exponent notation, or a sign):"
+            " exponent notation, a sign, or a truncated/ambiguous run):"
             f" {_safe_error_text(text)}")
     return float(token)
 
@@ -1704,6 +1763,52 @@ def _fetch_page(url, timeout_s=FETCH_TIMEOUT_S, max_bytes=FETCH_MAX_BYTES):
     return outcome["html"]
 
 
+class _HtmlFileInvalid(Exception):
+    """Raised by :func:`_read_html_file` when the ``--html`` path fails the
+    pre-read bounds check — not a regular file, or larger than
+    :data:`FETCH_MAX_BYTES` (AOS-143 round 4, F2). Kept distinct from a
+    plain unreadable-path error (missing file, permission denied), which
+    :func:`main` still maps to :data:`EXIT_FETCH_FAILED` like any other
+    fetch failure: this exception instead maps to :data:`EXIT_OTHER_ERROR`,
+    since the file IS there but is not a trustworthy pricing-page source."""
+
+
+def _read_html_file(path, max_bytes=FETCH_MAX_BYTES):
+    """Read a local ``--html`` file under the same bound the network fetch
+    enforces (AOS-143 round 4, F2). This path is reached only through the
+    command's manual fallback, which is deliberately NOT pre-approved (a
+    Claude Code permission prompt gates it) — but once approved, a hostile
+    or mistaken path (a FIFO, a device node, a directory, an oversized file)
+    must not hang the process or exhaust memory the way an unbounded
+    ``read_text()`` could.
+
+    The file type is checked with :func:`os.stat` and :data:`stat.S_ISREG`
+    BEFORE the file is ever opened, so a FIFO blocks on neither the stat nor
+    a subsequent read attempt. At most ``max_bytes + 1`` bytes are then
+    read, which is enough to detect an over-cap file without buffering an
+    unbounded one.
+
+    :param path: the ``--html`` argument.
+    :param max_bytes: the same cap the network fetch enforces
+        (default :data:`FETCH_MAX_BYTES`).
+    :raises OSError: the path does not exist or cannot be stat'd — mapped by
+        :func:`main` to :data:`EXIT_FETCH_FAILED`, same as any other fetch
+        failure.
+    :raises _HtmlFileInvalid: the path is not a regular file, or its
+        content exceeds ``max_bytes``.
+    :returns: the file's decoded text.
+    """
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise _HtmlFileInvalid(
+            f"--html path is not a regular file: {_safe_error_text(path)}")
+    with open(path, "rb") as f:
+        data = f.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise _HtmlFileInvalid(f"--html file exceeded {max_bytes} bytes")
+    return data.decode("utf-8", errors="replace")
+
+
 class _ArgumentParser(argparse.ArgumentParser):
     """``argparse.ArgumentParser`` whose ``error()`` strips ASCII control
     characters (e.g. a raw ESC byte) out of argparse's own error message
@@ -1716,6 +1821,22 @@ class _ArgumentParser(argparse.ArgumentParser):
         self.print_usage(sys.stderr)
         clean = _CONTROL_CHAR_RE.sub("", message)
         self.exit(2, f"{self.prog}: error: {clean}\n")
+
+
+def _argv_has_flag(argv, flag):
+    """True when ``flag`` appears in ``argv`` either as its own token
+    (``--foo``) or as the ``--foo=value`` combined form (AOS-143 round 4,
+    N2) — the pre-argparse guards below used exact-token membership only,
+    so a token spelled ``--backfill-apply=X`` (valid argparse syntax, and
+    argparse itself accepts it — see ``_reject_option_shaped_backfill_apply``)
+    was invisible to them even though the equivalent space-separated form
+    was caught.
+
+    :param argv: the raw argument list, before ``argparse.parse_args``.
+    :param flag: the long-option spelling to look for, e.g. ``"--html"``.
+    :returns: ``True`` if ``flag`` or ``flag + "="...`` is present.
+    """
+    return any(tok == flag or tok.startswith(flag + "=") for tok in argv)
 
 
 def _reject_combined_backfill_flags(argv):
@@ -1735,10 +1856,12 @@ def _reject_combined_backfill_flags(argv):
     third, independent layer.
 
     :param argv: the raw argument list, before ``argparse.parse_args``.
-    :returns: ``True`` when both flags appear anywhere in ``argv``, else
-        ``False``.
+    :returns: ``True`` when both flags appear anywhere in ``argv`` (either
+        as their own token or as the ``--flag=value`` combined form — AOS-143
+        round 4, N2, :func:`_argv_has_flag`), else ``False``.
     """
-    return "--backfill-plan" in argv and "--backfill-apply" in argv
+    return (_argv_has_flag(argv, "--backfill-plan")
+            and _argv_has_flag(argv, "--backfill-apply"))
 
 
 def _reject_html_with_backfill(argv):
@@ -1760,11 +1883,13 @@ def _reject_html_with_backfill(argv):
 
     :param argv: the raw argument list, before ``argparse.parse_args``.
     :returns: ``True`` when ``--html``/``--html=...`` appears anywhere in
-        ``argv`` together with ``--backfill-plan`` or ``--backfill-apply``,
-        else ``False``.
+        ``argv`` together with ``--backfill-plan``/``--backfill-plan=...``
+        or ``--backfill-apply``/``--backfill-apply=...`` (AOS-143 round 4,
+        N2, :func:`_argv_has_flag`), else ``False``.
     """
-    has_html = any(tok == "--html" or tok.startswith("--html=") for tok in argv)
-    has_backfill = "--backfill-plan" in argv or "--backfill-apply" in argv
+    has_html = _argv_has_flag(argv, "--html")
+    has_backfill = (_argv_has_flag(argv, "--backfill-plan")
+                     or _argv_has_flag(argv, "--backfill-apply"))
     return has_html and has_backfill
 
 
@@ -1780,15 +1905,28 @@ def _reject_option_shaped_backfill_apply(argv):
     ``--backfill-apply``, ``--db``/``--html`` must be given BEFORE it on the
     command line.
 
+    The combined ``--backfill-apply=VALUE`` form (AOS-143 round 4, N2) is
+    also recognized: it is valid argparse syntax — argparse accepts exactly
+    one value that way — and this guard used to look only for the exact
+    token ``--backfill-apply``, so ``--backfill-apply=claude-opus-5-5
+    --db=other.db`` was invisible to it even though the equivalent
+    space-separated form (``--backfill-apply claude-opus-5-5 --db
+    other.db``) was already caught, since ``--db`` itself is not a
+    well-formed pricing prefix.
+
     :param argv: the raw argument list, before ``argparse.parse_args``.
     :returns: the 1-based positions (within the arguments following
         ``--backfill-apply``) of every offending token, or ``None`` when
         ``--backfill-apply`` is absent or every following token is a
         well-formed prefix.
     """
-    if "--backfill-apply" not in argv:
+    start = None
+    for i, tok in enumerate(argv):
+        if tok == "--backfill-apply" or tok.startswith("--backfill-apply="):
+            start = i + 1
+            break
+    if start is None:
         return None
-    start = argv.index("--backfill-apply") + 1
     bad = [i for i, tok in enumerate(argv[start:], 1)
            if not is_pricing_prefix(tok)]
     return bad or None
@@ -1918,9 +2056,17 @@ def main(argv=None):
     # page-derived error text before it ever reaches stderr.
     try:
         if args.html:
-            html = Path(args.html).read_text(errors="replace")
+            html = _read_html_file(args.html, FETCH_MAX_BYTES)
         else:
             html = _fetch_page(URL, FETCH_TIMEOUT_S, FETCH_MAX_BYTES)
+    except _HtmlFileInvalid as exc:
+        # Not a plain "could not be read" failure (that stays a fetch
+        # failure below) — the file IS there but fails the bounds check
+        # (AOS-143 round 4, F2), so nothing was read/written and this is
+        # never eligible for the command's fallback.
+        print(f"pricing page read failed: {_safe_error_text(exc)}",
+              file=sys.stderr)
+        return EXIT_OTHER_ERROR
     except Exception as exc:  # noqa: BLE001 - any fetch failure -> fallback
         print(f"pricing page fetch failed: {_safe_error_text(exc)}",
               file=sys.stderr)

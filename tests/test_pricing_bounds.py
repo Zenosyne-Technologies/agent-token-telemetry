@@ -15,7 +15,9 @@ import contextlib
 import datetime
 import hashlib
 import io
+import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import threading
@@ -965,6 +967,66 @@ class TestStrictNumberToken(Base):
                 self.assertTrue(entries)
 
 
+class TestTrailingTruncationLookalikes(Base):
+    """AOS-143 round 4, N1: the token class's captured run can still stop
+    ONE CHARACTER TOO EARLY when the very next character is a separator or
+    digit it does not recognize — e.g. a fullwidth comma (U+FF0C) or an
+    Arabic-Indic digit are outside :data:`pricing_update._MONEY_TOKEN_RE`'s
+    class entirely, so ``$1，500`` and ``$3٠٠`` each match only their leading
+    digit, which then passes :data:`pricing_update._STRICT_NUMBER_RE`
+    unmodified — silently minting `1` or `3` instead of refusing an
+    obviously-truncated cell. :func:`pricing_update._rate_token_truncated`
+    checks the character immediately after the matched run for exactly this
+    shape (a Unicode digit, a separator lookalike, or a dash directly
+    followed by a digit) and refuses the whole cell too."""
+
+    def _page(self, in_cell):
+        return _table_html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
+                            "$4 / MTok", "$0.20 / MTok", "$10 / MTok")])
+
+    def test_fullwidth_comma_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$1，500 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertIn("REFUSED", out)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_arabic_indic_digit_run_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$3٠٠ / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_en_dash_range_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$3–4 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_repeated_decimal_point_refuses_whole_run(self):
+        before = self.f.digest()
+        path = self.f.write_html(self._page("$3.5.1 / MTok"))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED)
+        self.assertEqual(self.f.digest(), before)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_money_unit_refusals_and_controls(self):
+        for bad in ("$1，500", "$3٠٠", "$3–4", "$3.5.1"):
+            with self.subTest(cell=bad):
+                with self.assertRaises(pricing_update.PricingRefused):
+                    pricing_update.money(bad + " / MTok")
+        for text, expect in (("$3 / MTok", 3.0), ("$3/MTok", 3.0)):
+            with self.subTest(cell=text):
+                self.assertEqual(pricing_update.money(text), expect)
+
+
 class TestFetchHangAndSizeBounds(Base):
     """AOS-143 correction, round 2 (hang/DoS fix): `urlopen(timeout=N)` only
     bounds each individual socket operation, not the fetch as a whole — a
@@ -1083,6 +1145,63 @@ class TestFetchHangAndSizeBounds(Base):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+class TestHtmlFileReadBounds(Base):
+    """AOS-143 round 4, F2: ``--html`` is reached only through the command's
+    fallback, which now requires an explicit Claude Code permission prompt
+    (round 4, F1) — but once approved, the file it reads used to be
+    unbounded: ``Path.read_text()`` had no size cap (unlike the network
+    fetch's :data:`pricing_update.FETCH_MAX_BYTES`) and could block forever
+    reading a FIFO. :func:`pricing_update._read_html_file` now applies the
+    same 5MB cap and refuses non-regular files (``os.stat`` +
+    ``stat.S_ISREG``) BEFORE ever opening them, so a FIFO cannot block the
+    process at all — mapped to :data:`pricing_update.EXIT_OTHER_ERROR`, not
+    the fallback-eligible :data:`pricing_update.EXIT_FETCH_FAILED`, since
+    the file IS there but is not a trustworthy source."""
+
+    SCRIPT = (pathlib.Path(__file__).resolve().parent.parent / "scripts"
+              / "pricing_update.py")
+
+    def test_oversized_html_file_is_refused_db_unchanged(self):
+        # Padded with an otherwise-valid table so the cap is what refuses
+        # this, not incidental garbage content: without the size check, this
+        # file would read, parse, and mint a real row (a weaker version of
+        # this test that used pure padding would still "pass" against a
+        # reverted fix, since an unbounded read_text() of non-HTML garbage
+        # also ends up EXIT_OTHER_ERROR via a parse failure).
+        before = (self.f.digest(), self.f.pricing_rows())
+        page = self._page("$2 / MTok")
+        pad_len = pricing_update.FETCH_MAX_BYTES + 1 - len(page)
+        padded = page + f"<!--{'x' * pad_len}-->"
+        self.assertGreater(len(padded), pricing_update.FETCH_MAX_BYTES)
+        big = pathlib.Path(self.f.tmp.name) / "big.html"
+        big.write_text(padded)
+        code, out, err = self.f.cli("--html", str(big))
+        self.assertEqual(code, pricing_update.EXIT_OTHER_ERROR, err)
+        self.assertIn("exceeded", err)
+        self.assertEqual((self.f.digest(), self.f.pricing_rows()), before)
+
+    def _page(self, in_cell):
+        return _table_html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
+                            "$4 / MTok", "$0.20 / MTok", "$10 / MTok")])
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "no FIFOs on this platform")
+    def test_fifo_html_path_is_refused_promptly_not_blocked(self):
+        fifo = pathlib.Path(self.f.tmp.name) / "page.fifo"
+        os.mkfifo(fifo)
+        env = dict(os.environ, TOKEN_TELEMETRY_DB=str(self.f.path))
+        before = self.f.digest()
+        try:
+            result = subprocess.run(
+                [sys.executable, str(self.SCRIPT), "--html", str(fifo)],
+                env=env, capture_output=True, text=True, timeout=5)
+        except subprocess.TimeoutExpired:
+            self.fail("--html on a FIFO blocked instead of being refused"
+                      " promptly as a non-regular file")
+        self.assertEqual(result.returncode, pricing_update.EXIT_OTHER_ERROR,
+                         result.stderr)
+        self.assertEqual(self.f.digest(), before)
 
 
 class TestDbErrorExitCode(Base):

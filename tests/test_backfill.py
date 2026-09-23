@@ -1129,6 +1129,66 @@ class TestHtmlRejectedWithBackfill(Base):
         self.assertEqual(code, 0, out)
 
 
+class TestBackfillApplyEqualsFormGuard(Base):
+    """AOS-143 round 4, N2: the pre-argparse guards used exact-token
+    membership only (``"--backfill-apply" in argv``), so the equally-valid
+    ``--backfill-apply=PREFIX`` combined form was invisible to them even
+    though the space-separated form was already caught (``--db`` itself
+    fails :func:`is_pricing_prefix`, so it was rejected as a "bad" token
+    following ``--backfill-apply``). Neither form is pre-approved — the
+    command prompt gates `--backfill-apply` behind Claude Code's own
+    permission prompt regardless — but the guard's own docstring claims
+    position-based protection that the ``=`` form silently bypassed, so a
+    ``--db``/``--db=`` given after an ``=``-form apply must be rejected the
+    same way the space-separated form already is."""
+
+    def setUp(self):
+        super().setUp()
+        self.f.price("claude-opus-", FAM_OPUS, D - 30 * DAY)
+        self.f.price("claude-opus-5-5", OPUS_55, D + DAY)
+        self.f.event("claude-opus-5-5", D + 60)
+        self.other_db = pathlib.Path(self.f.tmp.name) / "other.db"
+
+    def run_cli(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = pricing_update.main(list(args))
+        return code, out.getvalue()
+
+    def test_equals_form_apply_with_equals_form_db_is_rejected(self):
+        before = (self.f.digest(), self.f.pricing_rows())
+        code, out = self.run_cli(
+            "--backfill-apply=claude-opus-5-5", f"--db={self.other_db}")
+        self.assertEqual(code, 2, out)
+        self.assertIn("rejected --backfill-apply argument(s) #1", out)
+        self.assertFalse(self.other_db.exists())
+        self.assertEqual((self.f.digest(), self.f.pricing_rows()), before)
+
+    def test_abbreviated_apply_with_space_form_db_is_rejected(self):
+        # --backfill-a is blocked earlier still, by argparse's own
+        # allow_abbrev=False: an unrecognized-argument usage error, which
+        # argparse (and this module's _ArgumentParser.error()) reports by
+        # calling sys.exit(2) directly rather than returning — this pins
+        # that neither this nor a future refactor lets it through.
+        before = (self.f.digest(), self.f.pricing_rows())
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as cm:
+            pricing_update.main(
+                ["--backfill-a", "claude-opus-5-5", "--db", str(self.other_db)])
+        self.assertEqual(cm.exception.code, 2, err.getvalue())
+        self.assertFalse(self.other_db.exists())
+        self.assertEqual((self.f.digest(), self.f.pricing_rows()), before)
+
+    def test_control_equals_form_apply_alone_still_applies(self):
+        # Proves the guard rejects the --db redirection specifically, not
+        # every --backfill-apply=PREFIX invocation.
+        code, out = self.run_cli(
+            "--db", str(self.f.path), "--backfill-apply=claude-opus-5-5")
+        self.assertEqual(code, 0, out)
+
+
 class TestBundleClosure(Base):
     """F2/F3 pinned on the shared-prefix fixture: backfilling the
     predecessor alone would leave the successor's event on an ANCESTOR row

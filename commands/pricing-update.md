@@ -1,6 +1,6 @@
 ---
 description: Refresh the pricing table from Anthropic's currently published rates
-allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py"), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-plan:*), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --html:*), WebFetch, AskUserQuestion
+allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py"), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-plan), WebFetch, AskUserQuestion
 argument-hint: "[--unattended]"
 ---
 
@@ -69,18 +69,20 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-plan
   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-apply 'claude-opus-5' 'claude-opus-5-5'
   ```
 
-  `--backfill-apply` is deliberately **not** in this command's `allowed-tools`
-  — only the plain refresh and `--backfill-plan` are pre-approved. Running
-  this line always raises Claude Code's own permission prompt, which the
-  user must approve in THIS session before anything runs; that is a second,
-  harness-enforced gate on top of the question above, independent of this
-  file's text. An unattended or headless run never reaches it: it never
-  reaches this step at all (see "Unattended run" above), and even if it
-  somehow did, the prompt auto-denies with no one present to approve it.
-  `--html` is rejected with either backfill flag (script exit 2, nothing
-  read or written), so the pre-approved `--html:*` prefix can never reach
-  an apply by tacking `--backfill-apply` onto the end of an otherwise
-  pre-approved refresh command.
+  `--backfill-apply` is deliberately **not** in this command's `allowed-tools`.
+  The ONLY pre-approved commands are the bare refresh with no arguments and
+  the exact, bare `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py"
+  --backfill-plan` — neither pattern accepts a prefix match, so neither one
+  pre-approves `--db`, `--html`, or any other flag or path tacked onto the
+  end; any such variant (including `--backfill-apply` in any form) always
+  raises Claude Code's own permission prompt, which the user must approve in
+  THIS session before anything runs — a second, harness-enforced gate on top
+  of the question above, independent of this file's text. An unattended or
+  headless run never reaches it: it never reaches this step at all (see
+  "Unattended run" above), and even if it somehow did, the prompt auto-denies
+  with no one present to approve it. `--html` is also rejected with either
+  backfill flag by the script itself (exit 2, nothing read or written), as a
+  second, independent layer.
 
   Never pass a prefix that is not exactly `claude-<family>-<version>` (e.g.
   `claude-opus-5-5`) or a legacy alias the table itself shows — the script
@@ -125,7 +127,9 @@ rules:
 1. Fetch **https://platform.claude.com/docs/en/about-claude/pricing** yourself
    (WebFetch or equivalent) and write the raw HTML you received, unmodified,
    to a temporary file.
-2. Run the same script against that file:
+2. Run the same script against that file. This call is deliberately **not**
+   pre-approved: it reads a local file and writes the pricing table, so
+   Claude Code asks first — approve it in THIS session before it runs.
 
    ```
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --html <path to that file>
