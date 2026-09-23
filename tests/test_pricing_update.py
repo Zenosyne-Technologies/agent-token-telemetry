@@ -7,6 +7,7 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 import capture
 import pricing_update
+import report
 
 FIXTURE = (pathlib.Path(__file__).resolve().parent
            / "fixtures" / "pricing-page.html")
@@ -110,8 +111,61 @@ class TestCandidates(unittest.TestCase):
         self.assertLessEqual({"claude-opus-4-1", "claude-opus-4-0",
                               "claude-opus-4-2025", "claude-3-5-haiku"},
                              prefixes)
-        # same-rate versions (Opus 4.8 etc.) must NOT get redundant rows
-        self.assertNotIn("claude-opus-4-8", prefixes)
+        # Same-rate versions (Opus 4.8 etc.) now get their OWN row too (AOS-133:
+        # every listed version is minted), at exactly the family rate — so it
+        # changes no cost, only whether their events count as estimated.
+        opus_fam = next(c for c in cands if c["prefix"] == "claude-opus-")
+        o48 = next(c for c in cands if c["prefix"] == "claude-opus-4-8")
+        self.assertEqual(o48["rates"], opus_fam["rates"])
+        self.assertEqual(o48["effective_from"], opus_fam["effective_from"])
+
+    def test_every_listed_version_gets_its_own_row(self):
+        # Each version read off the page — the family's newest unconditional
+        # one included — mints its specific prefix(es) at its own rates, dated
+        # today like the family row. The bare family prefix stays the fallback
+        # for versions the page does not list.
+        for entries, cands, today in (
+                (*fixture_candidates(), TODAY),
+                (*current_candidates(), TODAY_CUR)):
+            by = {(c["prefix"], c["effective_from"]): c for c in cands}
+            for e in entries:
+                if e["condition"] is not None:
+                    continue
+                for p in pricing_update.specific_prefixes(e["family"],
+                                                          e["version"]):
+                    c = by.get((p, _epoch(today)))
+                    self.assertIsNotNone(c, p)
+                    self.assertEqual(c["rates"], e["rates"], p)
+                    self.assertFalse(capture.is_family_default(p), p)
+            # the newest unconditional version of each family carries the
+            # family row's exact rates
+            for fam in {e["family"] for e in entries}:
+                newest = next(e for e in entries
+                              if e["family"] == fam and e["condition"] is None)
+                fam_row = by[(f"claude-{fam}-", _epoch(today))]
+                self.assertEqual(fam_row["rates"], newest["rates"])
+                for p in pricing_update.specific_prefixes(fam,
+                                                          newest["version"]):
+                    self.assertEqual(by[(p, _epoch(today))]["rates"],
+                                     fam_row["rates"])
+
+    def test_in_force_conditional_wins_a_same_day_collision(self):
+        # A page listing the same version both unconditionally and with a
+        # `through` intro rate: the intro rate is what is charged now, and it
+        # must win the (prefix, effective_from) dedup regardless of row order.
+        rates_a = {"in_usd": 2.0, "out_usd": 10.0, "cache_r_usd": 0.2,
+                   "cache_w_usd": 2.5, "cache_w_1h_usd": 4.0}
+        rates_b = dict(rates_a, in_usd=3.0)
+        entries = [
+            {"family": "sonnet", "version": "5", "rates": rates_b,
+             "condition": None},
+            {"family": "sonnet", "version": "5", "rates": rates_a,
+             "condition": ("through", TODAY + datetime.timedelta(days=9))},
+        ]
+        cands = pricing_update.build_candidates(entries, TODAY)
+        s5 = [c for c in cands if c["prefix"] == "claude-sonnet-5"]
+        self.assertEqual(len(s5), 1)
+        self.assertEqual(s5[0]["rates"], rates_a)
 
     def test_family_alias_prefixes_never_collide(self):
         _, cands = fixture_candidates()
@@ -286,6 +340,121 @@ class TestCurrentPage(unittest.TestCase):
                  "cache_w_usd": 2.5, "cache_w_1h_usd": 4.0})
         finally:
             conn.close()
+
+
+# Model names spanning every family: listed versions, dated snapshots, legacy
+# aliases, versions the page does not list, and an unpriced non-Claude model.
+COST_NAMES = [
+    "claude-fable-5", "claude-fable-5-20260601", "claude-fable-5-1-20260901",
+    "claude-fable-6", "claude-mythos-5-1-x", "claude-opus-5", "claude-opus-5-5",
+    "claude-opus-4-8", "claude-opus-4-5-20251101", "claude-opus-4-1-20250805",
+    "claude-opus-4-20250514", "claude-opus-4-9", "claude-sonnet-5",
+    "claude-sonnet-5-1", "claude-sonnet-4-6", "claude-sonnet-4-20250514",
+    "claude-sonnet-4-7", "claude-haiku-4-5-20251001", "claude-haiku-5",
+    "claude-3-5-haiku-20241022", "gpt-4o"]
+
+
+def pre_aos133_candidates(entries, cands):
+    """The candidate set the pre-AOS-133 rules produced from the same page:
+    every candidate EXCEPT a specific row that merely repeats its family row's
+    rates — the family's newest version kept only when a surviving (differently
+    priced) sibling's specific prefix would otherwise shadow it (the old
+    anti-shadowing rule). Cross-checked against the pre-AOS-133 code on both
+    fixtures when this test was written."""
+    fam_rates = {c["prefix"]: c["rates"] for c in cands
+                 if capture.is_family_default(c["prefix"])}
+
+    conditional = {p for e in entries if e["condition"] is not None
+                   for p in pricing_update.specific_prefixes(e["family"],
+                                                             e["version"])}
+
+    def redundant(c):
+        p = c["prefix"]
+        fam = next((f for f in fam_rates if p.startswith(f)), None)
+        return (not capture.is_family_default(p) and p not in conditional
+                and fam is not None and c["rates"] == fam_rates[fam])
+
+    kept_specific = {c["prefix"] for c in cands
+                     if not capture.is_family_default(c["prefix"])
+                     and not redundant(c)}
+    newest = set()
+    for e in entries:
+        if e["condition"] is None and not any(
+                p.startswith(f"claude-{e['family']}-") for p in newest):
+            newest.update(pricing_update.specific_prefixes(e["family"],
+                                                           e["version"]))
+    out = []
+    for c in cands:
+        p = c["prefix"]
+        if redundant(c) and not (p in newest and any(
+                o != p and p.startswith(o) for o in kept_specific)):
+            continue
+        out.append(c)
+    return out
+
+
+class TestNoCostChange(unittest.TestCase):
+    """Minting a row for every listed version (AOS-133) must not change any
+    computed cost: the new rows carry exactly the rate the events already
+    resolved to. Only the estimated-event count may drop."""
+
+    def build(self, cands, today):
+        conn = capture.connect(pathlib.Path(tempfile.mkdtemp()) / "u.db")
+        pricing_update.apply(conn, pricing_update.plan(conn, cands), "test")
+        pid = conn.execute(
+            "INSERT INTO projects(path, name) VALUES ('/p', 'P')").lastrowid
+        sid = conn.execute("INSERT INTO sessions(uuid, project_id)"
+                           " VALUES ('s', ?)", (pid,)).lastrowid
+        t0 = _epoch(today)
+        now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+        for i, name in enumerate(COST_NAMES):
+            mid = conn.execute("INSERT INTO models(name) VALUES (?)",
+                               (name,)).lastrowid
+            for ts in (t0 - 30 * 86400, t0 - 1, t0, t0 + 3600, now - 60):
+                conn.execute(
+                    "INSERT INTO events(ts, session_id, kind, model_id, in_tok,"
+                    " out_tok, cache_r, cache_w, cache_w_1h)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (ts, sid, i % 2, mid, 1000 + i, 2000 + i, 3000 + i,
+                     4000 + i, 500 + i))
+        conn.commit()
+        return conn
+
+    def test_reports_cost_identically_before_and_after_per_version_rows(self):
+        for fixture, today in ((FIXTURE, TODAY),
+                               (FIXTURE, datetime.date(2026, 9, 15)),
+                               (CURRENT_FIXTURE, TODAY_CUR)):
+            entries = pricing_update.parse_models(fixture.read_text())
+            after = pricing_update.build_candidates(entries, today)
+            before = pre_aos133_candidates(entries, after)
+            self.assertLess(len(before), len(after))  # rows were added
+            a, b = self.build(before, today), self.build(after, today)
+            try:
+                ps_a = report.fetch_project_stats(a)
+                ps_b = report.fetch_project_stats(b)
+                strip = [k for k in report.STATS_KEYS
+                         if k != "estimated_events"]
+                self.assertEqual([[r[k] for k in strip] for r in ps_a],
+                                 [[r[k] for k in strip] for r in ps_b])
+                self.assertLess(ps_b[0]["estimated_events"],
+                                ps_a[0]["estimated_events"])
+                ts_a = report.fetch_token_stats(a)
+                ts_b = report.fetch_token_stats(b)
+                for k in ts_a:
+                    if k not in ("estimated_by_model",
+                                 "models_without_own_price"):
+                        self.assertEqual(ts_a[k], ts_b[k], k)
+                # per-event resolved rates, not just the sums
+                q = ("SELECT m.name, e.ts, "
+                     + ", ".join(report.rate_subquery(c)
+                                 for c in pricing_update.RATE_KEYS)
+                     + " FROM events e JOIN models m ON m.id = e.model_id"
+                       " ORDER BY m.name, e.ts")
+                self.assertEqual(a.execute(q).fetchall(),
+                                 b.execute(q).fetchall())
+            finally:
+                a.close()
+                b.close()
 
 
 def _epoch(d):

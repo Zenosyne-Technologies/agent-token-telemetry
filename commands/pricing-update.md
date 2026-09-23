@@ -33,7 +33,11 @@ changed or the fetch failed; its stderr says which). Then do it manually:
    forever; the only deletable row is a withdrawn future-dated forecast that
    never took effect (same contract §). `INSERT OR IGNORE` (unique key
    `provider, model_prefix, model_version, effective_from`) makes same-day
-   reruns a no-op.
+   reruns a no-op. Apply this per family (`claude-<family>-`, at the newest
+   version's rates) **and per listed version** (`claude-<family>-<version>`
+   with dots as dashes, e.g. `claude-opus-4-8`, at that version's rates) — every
+   version on the page gets its own row; the family prefix is only the fallback
+   for unlisted models (contract § "Own price vs family default").
 4. A `models`-table name matching no prefix is **unpriced** — report it, do
    not fabricate a rate.
 5. Report the same table the script prints: prefix, rates, effective date,

@@ -262,6 +262,41 @@ dated row supersedes them. Any consumer that renders an estimate's rate date **m
 special-case `effective_from = 0` as "seed rates (undated)" — never format it as an
 epoch date (1970-01-01).
 
+**Own price vs family default.** Three defined terms, each implemented once per
+dialect (Python `capture.is_family_default`, SQLite `capture.family_default_sql`,
+Postgres `model_prefix ~ '^claude-[a-z]+-$'` in `supabase/reports.sql`):
+
+- **Family default row** — a pricing row whose `model_prefix` matches
+  `^claude-[a-z]+-$`: a bare family prefix such as `claude-opus-` or `claude-fable-`,
+  including the `effective_from = 0` seed rows. It is the family's fallback rate for
+  any model of that family without a row of its own. `claude-opus-5-5`,
+  `claude-opus-4-2025`, `claude-3-5-haiku` and `claude-sonnet-4` are **not** family
+  default rows (they are a model's own row).
+- **Estimated event** — an event whose resolved pricing row (the resolution above,
+  unchanged) is a family default row. Its cost is an estimate at the family rate, not
+  necessarily that model's published price. An unpriced event (no row resolves) is
+  neither estimated nor own-priced.
+- **Model without own price** — a model name with at least one event for which **no**
+  non-family-default pricing row's prefix is a prefix of the name, at any
+  `effective_from`. Every event of such a model is estimated or unpriced (a model with
+  no matching row at all, e.g. a non-Claude model, is therefore included). A model
+  that has an own row is not one, even if some of its older events predate that row
+  and still resolve to the family default.
+
+The report data carries these flags (`report_priced_events.family_default`, per-row
+estimated-event counts, the list of models without own price); they do not change
+any computed cost.
+
+**`pricing-update` mints a row for every listed version.** Each model version read off
+the published page gets its own specific prefix(es) (`claude-<family>-<version>`, or
+the legacy alias prefixes such as `claude-3-5-haiku` / `claude-opus-4-0`) at that
+version's rates — including each family's newest version, whose rates equal the
+`claude-<family>-` row written in the same run, so no computed cost changes. The bare
+family prefix remains the fallback for models the page does not list (a new point
+release before the next refresh): their events price at the family default and are
+estimated until a refresh lands their own row. A new row takes effect from its
+`effective_from` onward only; events before it keep the rate they already had.
+
 ## Context sidecar (kit → telemetry)
 
 `capture.py` reads `.claude/telemetry-context.json` from the **project root only**

@@ -26,7 +26,6 @@ import capture
 
 URL = "https://platform.claude.com/docs/en/about-claude/pricing"
 PROVIDER = "anthropic"
-FAMILIES = ("fable", "mythos", "opus", "sonnet", "haiku")
 # Model families whose API ids do not follow the claude-<family>-<version>
 # scheme, or that need extra alias prefixes to match real model names.
 SPECIAL_PREFIXES = {
@@ -138,20 +137,29 @@ def specific_prefixes(family, version):
 
 def build_candidates(entries, today):
     """Deterministic prefix plan:
-    - `claude-<family>-` from each family's first (newest) unconditional row;
+    - `claude-<family>-` from each family's first (newest) unconditional row —
+      the FAMILY DEFAULT row: the fallback rate for any model of that family
+      the page does not list (docs/TELEMETRY-CONTRACT.md §Pricing table);
     - a `through <d>` conditional gets its specific prefix dated today (the
       intro rate is in force right now); a `starting <d>` conditional is a
       scheduled future increase and is recorded ONLY once its date has arrived
       (a run on/after `<d>`), never minted in advance — a forecast is not a
       recorded charge (docs/TELEMETRY-CONTRACT.md);
-    - unconditional rows get a specific prefix when their rates differ from the
-      family rate (retired models on old pricing), OR when the family's newest
-      version would be shadowed by an older sibling's longer specific prefix
-      (e.g. `claude-fable-5` is a string-prefix of `claude-fable-5-1`, so a
-      Fable-5.1 model would otherwise pick up Fable-5's rate)."""
+    - EVERY unconditional row gets its own specific prefix(es) at its own
+      rates, dated today — including each family's newest version, whose rates
+      equal the family row's (so no computed cost changes) but whose events now
+      resolve to a row of their own instead of the family default (an
+      estimate). This subsumes the old special cases: retired models on old
+      pricing, and anti-shadowing (`claude-fable-5` is a string-prefix of
+      `claude-fable-5-1`, so a Fable-5.1 model needs its own longer row or it
+      would pick up Fable-5's rate).
+    Conditional rows are listed before unconditional specific rows so that, on
+    a (prefix, effective_from) collision, the in-force conditional rate wins
+    the first-occurrence dedup (as it did when same-rate versions minted no
+    row of their own)."""
     today_epoch = int(datetime.datetime.combine(
         today, datetime.time(), tzinfo=datetime.timezone.utc).timestamp())
-    family_rates, family_newest, candidates = {}, {}, []
+    family_seen, candidates = set(), []
 
     def epoch(d):
         return int(datetime.datetime.combine(
@@ -159,43 +167,26 @@ def build_candidates(entries, today):
 
     for e in entries:
         fam, rates = e["family"], e["rates"]
-        if e["condition"] is None and fam not in family_rates:
-            family_rates[fam] = rates
-            family_newest[fam] = e
+        if e["condition"] is None and fam not in family_seen:
+            family_seen.add(fam)
             candidates.append({"prefix": f"claude-{fam}-", "rates": rates,
                                "effective_from": today_epoch})
     for e in entries:
-        fam, rates = e["family"], e["rates"]
+        if e["condition"] is None:
+            continue
+        kind, date = e["condition"]
+        if kind == "starting" and date > today:
+            continue  # scheduled increase not yet in effect — do not mint
+        eff = today_epoch if kind == "through" else epoch(date)
+        for p in specific_prefixes(e["family"], e["version"]):
+            candidates.append({"prefix": p, "rates": e["rates"],
+                               "effective_from": eff})
+    for e in entries:
         if e["condition"] is not None:
-            kind, date = e["condition"]
-            if kind == "starting" and date > today:
-                continue  # scheduled increase not yet in effect — do not mint
-            eff = today_epoch if kind == "through" else epoch(date)
-            for p in specific_prefixes(fam, e["version"]):
-                candidates.append({"prefix": p, "rates": rates,
-                                   "effective_from": eff})
-        elif rates != family_rates.get(fam):
-            for p in specific_prefixes(fam, e["version"]):
-                candidates.append({"prefix": p, "rates": rates,
-                                   "effective_from": today_epoch})
-    # Anti-shadowing: a family's newest version needs its OWN specific prefix
-    # whenever an older sibling's specific prefix (emitted above) is a proper
-    # string-prefix of it — otherwise longest-prefix matching would hand the
-    # newest models the older sibling's rate.
-    specific_by_family = {}
-    for c in candidates:
-        for fam in FAMILIES:
-            family_prefix = f"claude-{fam}-"
-            if c["prefix"].startswith(family_prefix) \
-                    and c["prefix"] != family_prefix:
-                specific_by_family.setdefault(fam, set()).add(c["prefix"])
-                break
-    for fam, e in family_newest.items():
-        others = specific_by_family.get(fam, set())
-        for np in specific_prefixes(fam, e["version"]):
-            if any(sp != np and np.startswith(sp) for sp in others):
-                candidates.append({"prefix": np, "rates": family_rates[fam],
-                                   "effective_from": today_epoch})
+            continue
+        for p in specific_prefixes(e["family"], e["version"]):
+            candidates.append({"prefix": p, "rates": e["rates"],
+                               "effective_from": today_epoch})
     # keep first occurrence per (prefix, effective_from)
     seen, out = set(), []
     for c in candidates:
