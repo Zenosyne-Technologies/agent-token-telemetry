@@ -51,15 +51,47 @@ def _entry(family, version, condition=None, rates=None):
             "rates": dict(rates or RATES), "condition": condition}
 
 
-def _table_html(rows):
-    """A minimal valid pricing table: the real header the page ships, plus
-    one ``<td>`` row per ``(name, in, w5, w1h, cr, out)`` tuple in ``rows``."""
-    header = ("<tr><th>Model</th><th>Base input tokens</th>"
-              "<th>5m cache writes</th><th>1h cache writes</th>"
-              "<th>Cache hits and refreshes</th><th>Output tokens</th></tr>")
-    body = "".join(
-        "<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
-    return f"<html><body><table>{header}{body}</table></body></html>"
+# Row tuples passed to _table_html are always in this SEMANTIC order,
+# whatever the layout; each layout then emits the cells in its own column
+# order, so a two-row page genuinely exercises the column mapping.
+ROW_KEYS = ("name", "in", "w5", "w1h", "cr", "out")
+# The two rate-table layouts pricing_update recognizes (AOS-151): the older
+# single-row header, and the live page's two-row header (a column-group row
+# above the per-column row, verbatim cell texts from the 2026-09-23 capture).
+LAYOUTS = ("single-row", "two-row")
+_LAYOUT_ORDER = {"single-row": ("name", "in", "w5", "w1h", "cr", "out"),
+                 "two-row": ("name", "in", "out", "w5", "w1h", "cr")}
+_LAYOUT_HEADER = {
+    "single-row": {"name": "Model", "in": "Base input tokens",
+                   "w5": "5m cache writes", "w1h": "1h cache writes",
+                   "cr": "Cache hits and refreshes", "out": "Output tokens"},
+    "two-row": {"name": "Name", "in": "Input", "out": "Output",
+                "w5": "5m writes", "w1h": "1h writes",
+                "cr": "Hits and refreshes"},
+}
+_TWO_ROW_GROUP = ('<tr><th scope="colgroup">Model</th>'
+                  '<th scope="colgroup" colSpan="2">Base tokens</th>'
+                  '<th scope="colgroup" colSpan="3">Prompt caching</th></tr>')
+
+
+def _table_html(rows, layout="single-row", header=None):
+    """A minimal valid pricing table in ``layout`` (one of :data:`LAYOUTS`):
+    the header the page ships in that layout, plus one ``<td>`` row per
+    ``(name, in, w5, w1h, cr, out)`` tuple in ``rows`` (a shorter tuple
+    omits its trailing cells). ``header`` overrides per-column header texts
+    by key; a ``None`` value drops that column from the header and every
+    row."""
+    head = dict(_LAYOUT_HEADER[layout], **(header or {}))
+    order = [k for k in _LAYOUT_ORDER[layout] if head[k] is not None]
+    head_html = "<tr>" + "".join(f"<th>{head[k]}</th>" for k in order) + "</tr>"
+    if layout == "two-row":
+        head_html = _TWO_ROW_GROUP + head_html
+    body = ""
+    for r in rows:
+        cells = dict(zip(ROW_KEYS, r))
+        body += ("<tr>" + "".join(f"<td>{cells[k]}</td>"
+                                  for k in order if k in cells) + "</tr>")
+    return f"<html><body><table>{head_html}{body}</table></body></html>"
 
 
 class Fixture:
@@ -116,11 +148,19 @@ class Fixture:
 
 
 class Base(unittest.TestCase):
+    # The page layout every self._html() call renders. Each HTML-parsing
+    # class runs once per layout: this base value, plus a generated
+    # `<Class>TwoRowLayout` twin at the bottom of the module (AOS-151).
+    LAYOUT = "single-row"
+
     def setUp(self):
         self.f = Fixture()
 
     def tearDown(self):
         self.f.close()
+
+    def _html(self, rows, header=None):
+        return _table_html(rows, self.LAYOUT, header)
 
 
 class TestBackdatedStarting(Base):
@@ -435,7 +475,7 @@ class TestValueBounds(Base):
     no lower bound)."""
 
     def _page(self, in_cell, out_cell="$10 / MTok"):
-        return _table_html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
+        return self._html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
                             "$4 / MTok", "$0.20 / MTok", out_cell)])
 
     def test_400_digit_rate_refuses_whole_run(self):
@@ -568,7 +608,7 @@ class TestValueBounds(Base):
     def test_zero_cache_rate_is_unaffected(self):
         # Cache rates keep no lower bound: a legitimate $0 cache-read/write
         # rate is accepted, unlike in_usd/out_usd.
-        path = self.f.write_html(_table_html([
+        path = self.f.write_html(self._html([
             ("Claude Sonnet 5", "$2 / MTok", "$0 / MTok", "$0 / MTok",
              "$0 / MTok", "$10 / MTok")]))
         code, out, err = self.f.cli("--html", str(path))
@@ -686,18 +726,16 @@ class TestErrorSanitization(Base):
         self.assertIn("C", clean)
 
     def test_header_error_message_has_no_raw_control_or_bidi_chars(self):
-        header = ("<tr><th>Model</th>"
-                  "<th>Base input tokens\x1b[31m</th>"
-                  "<th>5m cache writes</th><th>1h cache writes</th>"
-                  "<th>Cache hits and refreshes</th>"
-                  "<th>Weird‮Column</th></tr>")  # no "output" column
-        html = (f"<html><body><table>{header}"
-               "<tr><td>Claude Sonnet 5</td><td>$2 / MTok</td>"
-               "<td>$2.50 / MTok</td><td>$4 / MTok</td><td>$0.20 / MTok</td>"
-               "</tr></table></body></html>")
+        # The "output" column is renamed away, so the header guard raises;
+        # the message must carry the escape/bidi characters stripped.
+        in_text = _LAYOUT_HEADER[self.LAYOUT]["in"] + "\x1b[31m"
+        html = self._html([("Claude Sonnet 5", "$2 / MTok", "$2.50 / MTok",
+                            "$4 / MTok", "$0.20 / MTok")],
+                          header={"in": in_text, "out": "Weird‮Column"})
         with self.assertRaises(ValueError) as ctx:
             pricing_update.parse_models(html)
         msg = str(ctx.exception)
+        self.assertIn("unexpected pricing table header", msg)
         self.assertNotIn("\x1b", msg)
         self.assertNotIn("‮", msg)
 
@@ -705,21 +743,18 @@ class TestErrorSanitization(Base):
         # str(<list of cell strings>) has no length limit on its own — a
         # header row padded with one very long cell must still print a
         # short, bounded message.
-        header = ("<tr><th>Model</th>"
-                  f"<th>Base input tokens{'z' * 5000}</th>"
-                  "<th>5m cache writes</th><th>1h cache writes</th>"
-                  "<th>Cache hits and refreshes</th></tr>")  # no "output"
-        html = (f"<html><body><table>{header}"
-               "<tr><td>Claude Sonnet 5</td><td>$2 / MTok</td>"
-               "<td>$2.50 / MTok</td><td>$4 / MTok</td><td>$0.20 / MTok</td>"
-               "</tr></table></body></html>")
+        in_text = _LAYOUT_HEADER[self.LAYOUT]["in"] + "z" * 5000
+        html = self._html([("Claude Sonnet 5", "$2 / MTok", "$2.50 / MTok",
+                            "$4 / MTok", "$0.20 / MTok")],
+                          header={"in": in_text, "out": None})  # no output
         with self.assertRaises(ValueError) as ctx:
             pricing_update.parse_models(html)
+        self.assertIn("unexpected pricing table header", str(ctx.exception))
         self.assertLess(len(str(ctx.exception)), 300)
 
     def test_rate_cell_error_message_has_no_raw_control_or_bidi_chars(self):
         name_cell = "Claude Sonnet 5\x1b[31mevil‮reordered"
-        html = _table_html([(name_cell, "not a dollar amount",
+        html = self._html([(name_cell, "not a dollar amount",
                             "$2.50 / MTok", "$4 / MTok", "$0.20 / MTok",
                             "$10 / MTok")])
         with self.assertRaises(ValueError) as ctx:
@@ -731,7 +766,7 @@ class TestErrorSanitization(Base):
         self.assertIn("reordered", msg)
 
     def test_cli_stderr_carries_no_raw_control_chars_on_parse_failure(self):
-        html = _table_html([("Claude Sonnet 5\x1b[31m", "nope",
+        html = self._html([("Claude Sonnet 5\x1b[31m", "nope",
                             "$2.50 / MTok", "$4 / MTok", "$0.20 / MTok",
                             "$10 / MTok")])
         path = self.f.write_html(html)
@@ -791,10 +826,10 @@ class TestFetchVsParseVsBoundsExitCodes(Base):
         self.assertIn("Oops", err.getvalue())
 
     def test_bounds_refusal_and_other_error_never_use_the_fetch_code(self):
-        bounds_path = self.f.write_html(_table_html([
+        bounds_path = self.f.write_html(self._html([
             ("Claude Sonnet 5", "$0 / MTok", "$2.50 / MTok", "$4 / MTok",
              "$0.20 / MTok", "$10 / MTok")]), name="bounds.html")
-        other_path = self.f.write_html(_table_html([
+        other_path = self.f.write_html(self._html([
             ("Claude Sonnet 5", "nope", "$2.50 / MTok", "$4 / MTok",
              "$0.20 / MTok", "$10 / MTok")]), name="other.html")
         bounds_code, _, _ = self.f.cli("--html", str(bounds_path))
@@ -849,7 +884,7 @@ class TestStrictNumberToken(Base):
     truncation-to-`$1` bug round 1 fixed."""
 
     def _page(self, in_cell):
-        return _table_html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
+        return self._html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
                             "$4 / MTok", "$0.20 / MTok", "$10 / MTok")])
 
     def test_thousands_grouping_space_variants_refuse_whole_run(self):
@@ -959,8 +994,9 @@ class TestStrictNumberToken(Base):
         # published rate cell — every committed fixture page still parses
         # end to end.
         fixtures_dir = pathlib.Path(__file__).resolve().parent / "fixtures"
-        for name in ("pricing-page-current.html", "pricing-page-increase.html",
-                    "pricing-page-expired-intro.html", "pricing-page.html"):
+        for name in ("pricing-page-two-row-header-2026-09-23.html",
+                     "pricing-page-current.html", "pricing-page-increase.html",
+                     "pricing-page-expired-intro.html", "pricing-page.html"):
             with self.subTest(fixture=name):
                 html = (fixtures_dir / name).read_text()
                 entries = pricing_update.parse_models(html)
@@ -981,7 +1017,7 @@ class TestTrailingTruncationLookalikes(Base):
     followed by a digit) and refuses the whole cell too."""
 
     def _page(self, in_cell):
-        return _table_html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
+        return self._html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
                             "$4 / MTok", "$0.20 / MTok", "$10 / MTok")])
 
     def test_fullwidth_comma_refuses_whole_run(self):
@@ -1120,7 +1156,7 @@ class TestFetchHangAndSizeBounds(Base):
     def test_normal_sized_fast_response_is_unaffected(self):
         import http.server
 
-        page = _table_html([("Claude Sonnet 5", "$2 / MTok", "$2.50 / MTok",
+        page = self._html([("Claude Sonnet 5", "$2 / MTok", "$2.50 / MTok",
                             "$4 / MTok", "$0.20 / MTok", "$10 / MTok")])
         body = page.encode()
 
@@ -1183,7 +1219,7 @@ class TestHtmlFileReadBounds(Base):
         self.assertEqual((self.f.digest(), self.f.pricing_rows()), before)
 
     def _page(self, in_cell):
-        return _table_html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
+        return self._html([("Claude Sonnet 5", in_cell, "$2.50 / MTok",
                             "$4 / MTok", "$0.20 / MTok", "$10 / MTok")])
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "no FIFOs on this platform")
@@ -1218,7 +1254,7 @@ class TestDbErrorExitCode(Base):
             db_dir = pathlib.Path(tmp.name) / "not-a-file.db"
             db_dir.mkdir()
             html_path = pathlib.Path(tmp.name) / "page.html"
-            html_path.write_text(_table_html([
+            html_path.write_text(self._html([
                 ("Claude Sonnet 5", "$2 / MTok", "$2.50 / MTok",
                  "$4 / MTok", "$0.20 / MTok", "$10 / MTok")]))
             out, err = io.StringIO(), io.StringIO()
@@ -1230,6 +1266,189 @@ class TestDbErrorExitCode(Base):
             self.assertIn("pricing DB error", err.getvalue())
         finally:
             tmp.cleanup()
+
+
+def _page_date(d):
+    """``d`` the way the page writes a condition date (``August 1, 2026``)."""
+    return f"{d:%B} {d.day}, {d.year}"
+
+
+class TestPageDrivenRunBounds(Base):
+    """AOS-151: the row cap, the 365-day `starting` rule and the warning cap
+    are enforced in :func:`pricing_update.run_update`, after parsing — these
+    drive them from a real ``--html`` page through ``main()`` instead of
+    hand-built entries, so they run once per page layout (see the generated
+    ``TwoRowLayout`` twin) and no layout's parse path can bypass them."""
+
+    SONNET = ("$2 / MTok", "$2.50 / MTok", "$4 / MTok", "$0.20 / MTok",
+              "$10 / MTok")
+
+    @staticmethod
+    def _today():
+        return datetime.datetime.now(tz=datetime.timezone.utc).date()
+
+    def test_501_candidate_rows_from_a_page_refuse_the_whole_run(self):
+        # 500 unconditional versions -> 500 specific + 1 family row = 501.
+        rows = [(f"Claude Sonnet {1000 + i}", *self.SONNET)
+                for i in range(500)]
+        before = self.f.digest()
+        path = self.f.write_html(self._html(rows))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED, out + err)
+        self.assertIn("500", out)
+        self.assertEqual(self.f.digest(), before)
+
+    def test_500_candidate_rows_from_a_page_are_not_refused(self):
+        rows = [(f"Claude Sonnet {1000 + i}", *self.SONNET)
+                for i in range(499)]
+        path = self.f.write_html(self._html(rows))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(len(self.f.pricing_rows("claude-sonnet-1000")), 1)
+
+    def test_starting_row_over_365_days_back_is_refused_and_warned(self):
+        old = self._today() - datetime.timedelta(days=400)
+        rows = [(f"Claude Sonnet 5 (starting {_page_date(old)})",
+                 "$4 / MTok", "$5 / MTok", "$8 / MTok", "$0.40 / MTok",
+                 "$20 / MTok")]
+        path = self.f.write_html(self._html(rows))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("BACKDATED-STARTING WARNING", out)
+        self.assertEqual(self.f.pricing_rows("claude-sonnet-5"), [])
+
+    def test_starting_row_within_365_days_mints_dated_its_start(self):
+        recent = self._today() - datetime.timedelta(days=30)
+        rows = [(f"Claude Sonnet 5 (starting {_page_date(recent)})",
+                 "$4 / MTok", "$5 / MTok", "$8 / MTok", "$0.40 / MTok",
+                 "$20 / MTok")]
+        path = self.f.write_html(self._html(rows))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, 0, out + err)
+        got = self.f.pricing_rows("claude-sonnet-5")
+        self.assertEqual([(r[1], r[6]) for r in got], [(4.0, _epoch(recent))])
+
+    def test_backdated_warnings_from_a_page_are_capped(self):
+        old = self._today() - datetime.timedelta(days=400)
+        n = pricing_update.WARNING_CAP + 4
+        rows = [(f"Claude Sonnet {1000 + i} (starting {_page_date(old)})",
+                 *self.SONNET) for i in range(n)]
+        path = self.f.write_html(self._html(rows))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, 0, out + err)
+        lines = [ln for ln in out.splitlines()
+                 if ln.startswith("BACKDATED-STARTING WARNING")]
+        self.assertEqual(len(lines), pricing_update.WARNING_CAP)
+        self.assertIn(f"… and {n - pricing_update.WARNING_CAP} more"
+                      " BACKDATED-STARTING warning(s)", out)
+
+
+class TestLayoutHelper(unittest.TestCase):
+    """Guards on the parametrization itself: each layout the helper renders
+    must reach the parser through THAT layout's header path (a two-row page
+    silently parsed as single-row would make the twin classes prove
+    nothing), and map every rate to the right column."""
+
+    DISTINCT = ("Claude Sonnet 5", "$1.10 / MTok", "$2.20 / MTok",
+                "$3.30 / MTok", "$0.40 / MTok", "$5.50 / MTok")
+
+    def test_each_layout_maps_every_rate_to_its_own_column(self):
+        for layout in LAYOUTS:
+            with self.subTest(layout=layout):
+                entries = pricing_update.parse_models(
+                    _table_html([self.DISTINCT], layout))
+                self.assertEqual(entries[0]["rates"], {
+                    "in_usd": 1.1, "cache_w_usd": 2.2,
+                    "cache_w_1h_usd": 3.3, "cache_r_usd": 0.4,
+                    "out_usd": 5.5})
+
+    def test_two_row_page_is_located_by_the_two_row_path(self):
+        html = _table_html([self.DISTINCT], "two-row")
+        self.assertNotIn(pricing_update._SINGLE_ROW_MARKER, html.lower())
+        tc = pricing_update.TableCollector()
+        tc.feed(html)
+        header, body, needles = pricing_update._locate_rate_table(tc.tables)
+        self.assertIs(needles, pricing_update._TWO_ROW_NEEDLES)
+        self.assertEqual(header[0], "Name")
+        self.assertEqual(len(body), 1)
+
+    def test_two_row_group_row_without_prompt_caching_is_not_the_table(self):
+        # The batch table has a group row too ("Model | Batch tokens") —
+        # only the group row carrying BOTH markers is the rate table.
+        html = _table_html([self.DISTINCT], "two-row").replace(
+            "Prompt caching", "Batch")
+        with self.assertRaises(ValueError) as ctx:
+            pricing_update.parse_models(html)
+        self.assertIn("not found", str(ctx.exception))
+
+    def test_ambiguous_two_row_header_is_refused(self):
+        # Two cells matching one needle must refuse, never pick either.
+        html = _table_html([self.DISTINCT], "two-row",
+                           header={"cr": "Input hits"})
+        with self.assertRaises(ValueError):
+            pricing_update.parse_models(html)
+
+    def test_every_html_building_class_has_a_two_row_twin(self):
+        import inspect
+        missing = [cls.__name__ for cls in Base.__subclasses__()
+                   if "self._html(" in inspect.getsource(cls)
+                   and cls.LAYOUT == "single-row"
+                   and f"{cls.__name__}TwoRowLayout" not in globals()]
+        self.assertEqual(missing, [])
+
+
+class TestTwoRowLiveFixture(Base):
+    """AOS-151: the committed capture of the live page (2026-09-23), parsed
+    and applied end to end through ``--html`` on a fresh DB."""
+
+    FIXTURE = (pathlib.Path(__file__).resolve().parent / "fixtures"
+               / "pricing-page-two-row-header-2026-09-23.html")
+
+    def test_bare_refresh_of_the_live_capture_records_every_listed_model(self):
+        code, out, err = self.f.cli("--html", str(self.FIXTURE))
+        self.assertEqual(code, 0, out + err)
+        expect = {
+            "claude-fable-5-1": (10.0, 50.0, 0.25, 12.5, 20.0),
+            "claude-opus-5-5": (4.0, 20.0, 0.2, 5.0, 8.0),
+            "claude-sonnet-5": (2.0, 10.0, 0.2, 2.5, 4.0),
+            "claude-haiku-4-5": (1.0, 5.0, 0.1, 1.25, 2.0),
+            "claude-mythos-5-1": (10.0, 50.0, 0.25, 12.5, 20.0),
+            "claude-opus-4-1": (15.0, 75.0, 1.5, 18.75, 30.0),
+            "claude-3-5-haiku": (0.8, 4.0, 0.08, 1.0, 1.6),
+            # family defaults follow each family's first-listed (newest)
+            "claude-opus-": (4.0, 20.0, 0.2, 5.0, 8.0),
+            "claude-sonnet-": (2.0, 10.0, 0.2, 2.5, 4.0),
+        }
+        for prefix, rates in expect.items():
+            with self.subTest(prefix=prefix):
+                latest = self.f.pricing_rows(prefix)[-1]
+                self.assertEqual(tuple(latest[1:6]), rates)
+
+    def test_fast_mode_and_batch_tables_are_not_parsed_as_rates(self):
+        entries = pricing_update.parse_models(self.FIXTURE.read_text())
+        self.assertEqual(len(entries), 18)
+        opus55 = [e for e in entries
+                  if (e["family"], e["version"]) == ("opus", "5.5")]
+        # $8/$40 (fast mode) and $2/$10 (batch) must not appear.
+        self.assertEqual([e["rates"]["in_usd"] for e in opus55], [4.0])
+
+
+# Every class that renders a page through self._html() runs a second time
+# against the live page's two-row header (AOS-151), so no AOS-143 bound —
+# strict token, value bounds, sanitization, exit codes, fetch/file bounds,
+# row cap, 365-day rule, warning cap — can be skipped by that parse path.
+# TestLayoutHelper.test_every_html_building_class_has_a_two_row_twin fails
+# if a new such class is added without being listed here.
+for _cls in (TestValueBounds, TestErrorSanitization,
+             TestFetchVsParseVsBoundsExitCodes, TestStrictNumberToken,
+             TestTrailingTruncationLookalikes, TestFetchHangAndSizeBounds,
+             TestHtmlFileReadBounds, TestDbErrorExitCode,
+             TestPageDrivenRunBounds):
+    _twin = f"{_cls.__name__}TwoRowLayout"
+    globals()[_twin] = type(_twin, (_cls,), {
+        "LAYOUT": "two-row", "__module__": __name__,
+        "__doc__": f"{_cls.__name__}, against the two-row page header."})
+del _cls, _twin
 
 
 if __name__ == "__main__":

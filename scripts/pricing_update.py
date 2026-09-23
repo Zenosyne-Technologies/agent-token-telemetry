@@ -308,9 +308,96 @@ def money(text):
     return float(token)
 
 
+# The rate-table header layouts the parser recognizes. Only WHERE the header
+# sits and WHAT its cells say differ between them; the data rows below it go
+# through the one shared row loop in :func:`parse_models`, so every AOS-143
+# bound applies identically whichever layout matched. Header text is matched
+# case-insensitively: the page has shipped both title case ("Base Input
+# Tokens") and sentence case ("Base input tokens") for the same columns.
+#
+# Two-row layout (the live page since at least 2026-09-23): a column-group row
+# ("Model" | "Base tokens" colSpan=2 | "Prompt caching" colSpan=3) above the
+# per-column row ("Name" | "Input" | "Output" | "5m writes" | "1h writes" |
+# "Hits and refreshes"). The per-column row is the one aligned with the data
+# cells, so it is the header the columns are mapped from.
+_TWO_ROW_GROUP_MARKERS = ("base tokens", "prompt caching")
+_TWO_ROW_NEEDLES = (("in", "input"), ("out", "output"),
+                    ("w5", "5m writes"), ("w1h", "1h writes"),
+                    ("cr", "hits and refreshes"))
+# Single-row layout (the page before 2026-09): one header row, "Model" |
+# "Base input tokens" | "5m cache writes" | "1h cache writes" | "Cache hits
+# and refreshes" | "Output tokens". Still accepted so an `--html` save of the
+# older page (and the committed fixtures) keeps parsing.
+_SINGLE_ROW_MARKER = "base input tokens"
+_SINGLE_ROW_NEEDLES = (("in", "base input"), ("out", "output"),
+                       ("w5", "5m cache"), ("w1h", "1h cache"),
+                       ("cr", "cache hits"))
+
+
+def _locate_rate_table(tables):
+    """Find the model-pricing table and split it into header and data rows.
+
+    The first table, in page order, that matches either recognized layout
+    wins: the two-row layout (its first row carries both
+    :data:`_TWO_ROW_GROUP_MARKERS`; the header is its SECOND row) or the
+    single-row layout (a first-row cell contains :data:`_SINGLE_ROW_MARKER`).
+    Other tables on the page (batch, fast mode, tool-use token counts) carry
+    neither marker set and are ignored.
+
+    :param tables: :class:`TableCollector` ``tables`` (rows of cell texts).
+    :returns: ``(header_row, data_rows, needles)`` — the per-column header,
+        the rows below it, and the ``(key, needle)`` pairs to map it with.
+    :raises ValueError: when no table matches either layout (a structural
+        parse failure, :data:`EXIT_OTHER_ERROR`).
+    """
+    for t in tables:
+        if not t:
+            continue
+        first = [c.lower() for c in t[0]]
+        if len(t) >= 2 and all(any(m in c for c in first)
+                               for m in _TWO_ROW_GROUP_MARKERS):
+            return t[1], t[2:], _TWO_ROW_NEEDLES
+        if any(_SINGLE_ROW_MARKER in c for c in first):
+            return t[0], t[1:], _SINGLE_ROW_NEEDLES
+    raise ValueError("model pricing table not found on the page")
+
+
+def _map_rate_columns(header, needles):
+    """Map each rate key to its column index in ``header``.
+
+    Every needle must match EXACTLY ONE header cell (case-insensitive
+    substring), no two keys may share a column, and no rate may sit in
+    column 0 (the model-name column every row is identified by). Anything
+    else — a genuinely absent column, an ambiguous header, a shifted layout —
+    raises rather than mapping a wrong column to a rate.
+
+    :param header: the per-column header row (cell texts).
+    :param needles: ``(key, needle)`` pairs for the matched layout.
+    :returns: ``{"in"|"out"|"w5"|"w1h"|"cr": column index}``.
+    :raises ValueError: on any mapping failure, with the header text passed
+        through :func:`_safe_error_text`.
+    """
+    cells = [c.lower() for c in header]
+    col = {}
+    for key, needle in needles:
+        hits = [i for i, c in enumerate(cells) if needle in c]
+        if len(hits) == 1:
+            col[key] = hits[0]
+    if (len(col) != len(needles) or len(set(col.values())) != len(col)
+            or 0 in col.values()):
+        raise ValueError("unexpected pricing table header:"
+                         f" {_safe_error_text(header)}")
+    return col
+
+
 def parse_models(html):
     """The model-pricing table -> ordered entries:
     {family, version, rates, condition: None|('through'|'starting', date)}.
+
+    The table and its header are located by :func:`_locate_rate_table` (the
+    current two-row layout or the older single-row one) and mapped by
+    :func:`_map_rate_columns`; every data row, whichever layout matched,
+    then goes through the same token, bound and sanitization checks below.
 
     Raises :class:`ValueError` for a structural parse failure (table/column
     not found, a cell with no dollar amount at all, no model rows) — main()
@@ -323,33 +410,11 @@ def parse_models(html):
     fetch failure or a structural one."""
     tc = TableCollector()
     tc.feed(html)
-    # Header text is matched case-insensitively: the published page has shipped
-    # both title case ("Base Input Tokens") and sentence case ("Base input
-    # tokens") for the same columns, and a case-sensitive match silently failed
-    # to find the table (now EXIT_OTHER_ERROR) when the casing changed.
-    table = next((t for t in tc.tables
-                  if t and any("base input tokens" in c.lower()
-                               for c in t[0])), None)
-    if table is None:
-        raise ValueError("model pricing table not found on the page")
-    header = table[0]
-    col = {}
-    for i, cell in enumerate(header):
-        cell_l = cell.lower()
-        for key, needle in (("in", "base input"), ("w5", "5m cache"),
-                            ("w1h", "1h cache"), ("cr", "cache hits"),
-                            ("out", "output")):
-            if needle in cell_l:
-                col[key] = i
-    # The guard still fires on a genuinely-absent column: every needle must have
-    # matched some header cell, else an index is missing and we refuse rather
-    # than map a wrong column.
-    if set(col) != {"in", "w5", "w1h", "cr", "out"}:
-        raise ValueError("unexpected pricing table header:"
-                         f" {_safe_error_text(header)}")
+    header, body, needles = _locate_rate_table(tc.tables)
+    col = _map_rate_columns(header, needles)
 
     entries = []
-    for row in table[1:]:
+    for row in body:
         if len(row) <= max(col.values()):
             continue
         m = re.search(r"Claude\s+(" + "|".join(FAMILIES) + r")"
