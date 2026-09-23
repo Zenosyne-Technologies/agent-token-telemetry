@@ -231,13 +231,18 @@ GRANT EXECUTE ON FUNCTION public.report_project_stats() TO authenticated;
 -- marvin:escalation-* -> ladder; marvin:developer-small/marvin:documenter ->
 -- small; marvin:ponytail -> micro); any OTHER agent falls back to its model's
 -- claude-fable/opus/sonnet/haiku prefix (ladder/heavy/small/micro), 'unknown'
--- for no match. by_model now groups by (model, tier) — the SAME model can
--- legitimately land in more than one tier row (e.g. as the main session's
--- 'orchestrator' and as a marvin:developer subagent's 'heavy'). by_rung breaks
--- the 'ladder' rows of by_tier down by escalation rung (high/xhigh/max/
--- frontier), read only from the named marvin:escalation-<rung> persona; a
--- ladder row that reached that tier via the model-prefix fallback has no rung
--- and is left out of by_rung (it still counts in by_tier's ladder total).
+-- for no match. The role split is visible in by_tier (and by_rung), NOT in
+-- by_model: that stays ONE row per model, as before role tiering, but its
+-- tier column now lists every tier the model actually served that window,
+-- comma-joined in the kit's display order (orchestrator, heavy, ladder,
+-- small, micro, 'unknown' last) — e.g. a model used both as the main session
+-- and as a marvin:developer subagent reads 'orchestrator, heavy'. by_rung
+-- breaks the 'ladder' rows of by_tier down by escalation rung (high/xhigh/
+-- max/frontier), read only from the named marvin:escalation-<rung> persona; a
+-- ladder row with no such name (the model-prefix fallback, or an
+-- unrecognized marvin:escalation-* suffix) is grouped under v_rung_fallback
+-- ('no rung (fallback)') instead of dropped, so by_rung's rows always sum to
+-- by_tier's ladder total.
 -- Raw path+name are returned for by_project (basename stays client-side).
 -- The estimate figures (estimated_by_model, events_by_model, unpriced_by_model,
 -- models_without_own_price) mirror report.py's keys of the same names; they
@@ -256,6 +261,9 @@ DECLARE
   v_today bigint := extract(epoch FROM date_trunc('day', now()))::bigint;
   -- now - 7 days, in seconds (pure arithmetic == SQLite '-7 days').
   v_week  bigint := extract(epoch FROM now())::bigint - 7 * 86400;
+  -- by_rung's catch-all label for a ladder row with no named rung — mirrors
+  -- report.py's RUNG_FALLBACK_LABEL verbatim.
+  v_rung_fallback text := 'no rung (fallback)';
   result  jsonb;
 BEGIN
   SELECT jsonb_build_object(
@@ -301,41 +309,61 @@ BEGIN
         WHERE ts >= v_week AND coalesce(note, '') <> 'backlog-capture'
         GROUP BY 1
       ) q),
+    -- by_model is ONE row per model (F1): unlike by_tier, it stays
+    -- model-keyed, but a model that served more than one role-tier this
+    -- window lists them ALL, comma-joined in the kit's display order
+    -- (orchestrator, heavy, ladder, small, micro, unknown last) via the
+    -- INNER per-(model,tier) grouping's `string_agg(... ORDER BY tier_rank)`
+    -- — a documented Postgres aggregate-ORDER-BY extension. `tier_rank` is a
+    -- rank over the tier TEXT only (mirrors report.py's tier_rank_case), so
+    -- it cannot itself drift from a role-rule edit to the tier CASE below.
     'by_model', (
       SELECT coalesce(jsonb_agg(
-               jsonb_build_array(model_name, tier, i, o, cost, rate_from)
+               jsonb_build_array(model_name, tier_list, i, o, cost, rate_from)
                ORDER BY o DESC, model_name COLLATE pg_catalog."C"), '[]'::jsonb)
       FROM (
-        SELECT pe.model_name AS model_name,
-               CASE
-                 WHEN pe.kind = 0 AND pe.agent IS NULL THEN 'orchestrator'
-                 WHEN pe.agent IN ('marvin:developer', 'marvin:researcher')
-                      OR pe.agent LIKE 'marvin:validator-%' THEN 'heavy'
-                 WHEN pe.agent LIKE 'marvin:escalation-%' THEN 'ladder'
-                 WHEN pe.agent IN ('marvin:developer-small', 'marvin:documenter')
-                      THEN 'small'
-                 WHEN pe.agent = 'marvin:ponytail' THEN 'micro'
-                 WHEN pe.model_name LIKE 'claude-opus-%'   THEN 'heavy'
-                 WHEN pe.model_name LIKE 'claude-sonnet-%' THEN 'small'
-                 WHEN pe.model_name LIKE 'claude-haiku-%'  THEN 'micro'
-                 WHEN pe.model_name LIKE 'claude-fable-%'  THEN 'ladder'
-                 ELSE 'unknown' END AS tier,
-               sum(pe.in_tok) AS i, sum(pe.out_tok) AS o,
-               round((sum(
-                 pe.in_tok  * coalesce(pe.in_usd, 0)
-               + pe.out_tok * coalesce(pe.out_usd, 0)
-               + pe.cache_r * coalesce(pe.cache_r_usd, 0)
-               + (pe.cache_w - pe.cache_w_1h) * coalesce(pe.cache_w_usd, 0)
-               + pe.cache_w_1h
-                   * coalesce(pe.cache_w_1h_usd, pe.cache_w_usd, 0)
-               ) / 1000000.0)::numeric, 4) AS cost,
-               max(pe.rate_from) AS rate_from
-        FROM public.report_priced_events pe
-        WHERE pe.ts >= v_week AND coalesce(pe.note, '') <> 'backlog-capture'
-        -- grouping by the output alias `tier` (not repeating the CASE) is a
-        -- documented Postgres extension: GROUP BY may reference an output
-        -- column's name, same as ORDER BY.
-        GROUP BY pe.model_name, tier
+        SELECT model_name,
+               string_agg(tier, ', ' ORDER BY
+                 CASE tier
+                   WHEN 'orchestrator' THEN 0 WHEN 'heavy' THEN 1
+                   WHEN 'ladder' THEN 2 WHEN 'small' THEN 3
+                   WHEN 'micro' THEN 4 ELSE 5 END) AS tier_list,
+               sum(i) AS i, sum(o) AS o,
+               round(sum(cost)::numeric, 4) AS cost,
+               max(rate_from) AS rate_from
+        FROM (
+          SELECT pe.model_name AS model_name,
+                 CASE
+                   WHEN pe.kind = 0 AND pe.agent IS NULL THEN 'orchestrator'
+                   WHEN pe.agent IN ('marvin:developer', 'marvin:researcher')
+                        OR pe.agent LIKE 'marvin:validator-%' THEN 'heavy'
+                   WHEN pe.agent LIKE 'marvin:escalation-%' THEN 'ladder'
+                   WHEN pe.agent IN ('marvin:developer-small', 'marvin:documenter')
+                        THEN 'small'
+                   WHEN pe.agent = 'marvin:ponytail' THEN 'micro'
+                   WHEN pe.model_name LIKE 'claude-opus-%'   THEN 'heavy'
+                   WHEN pe.model_name LIKE 'claude-sonnet-%' THEN 'small'
+                   WHEN pe.model_name LIKE 'claude-haiku-%'  THEN 'micro'
+                   WHEN pe.model_name LIKE 'claude-fable-%'  THEN 'ladder'
+                   ELSE 'unknown' END AS tier,
+                 sum(pe.in_tok) AS i, sum(pe.out_tok) AS o,
+                 sum(
+                   pe.in_tok  * coalesce(pe.in_usd, 0)
+                 + pe.out_tok * coalesce(pe.out_usd, 0)
+                 + pe.cache_r * coalesce(pe.cache_r_usd, 0)
+                 + (pe.cache_w - pe.cache_w_1h) * coalesce(pe.cache_w_usd, 0)
+                 + pe.cache_w_1h
+                     * coalesce(pe.cache_w_1h_usd, pe.cache_w_usd, 0)
+                 ) / 1000000.0 AS cost,
+                 max(pe.rate_from) AS rate_from
+          FROM public.report_priced_events pe
+          WHERE pe.ts >= v_week AND coalesce(pe.note, '') <> 'backlog-capture'
+          -- grouping by the output alias `tier` (not repeating the CASE) is a
+          -- documented Postgres extension: GROUP BY may reference an output
+          -- column's name, same as ORDER BY.
+          GROUP BY pe.model_name, tier
+        ) per_model_tier
+        GROUP BY model_name
       ) q),
     'by_kind', (
       SELECT coalesce(jsonb_agg(
@@ -375,10 +403,12 @@ BEGIN
       ) q),
     -- Ladder rungs, broken out from the 'ladder' rows of by_tier above: high /
     -- xhigh / max / frontier, read only from the named marvin:escalation-*
-    -- persona (never inferred from model or effort). A ladder row that
-    -- reached that tier via the model-prefix fallback (no named escalation
-    -- persona) has NULL rung and is dropped by the `r.rung IS NOT NULL`
-    -- filter below — it still counts toward by_tier's ladder total.
+    -- persona (never inferred from model or effort). A ladder row with no
+    -- such name (the model-prefix fallback, or an unrecognized
+    -- marvin:escalation-* suffix) is COALESCEd into v_rung_fallback rather
+    -- than dropped, so by_rung's rows always sum to by_tier's ladder total —
+    -- mirrors report.py's RUNG_FALLBACK_LABEL verbatim (report_token_stats'
+    -- DECLARE block); it only appears when at least one such row exists.
     'by_rung', (
       SELECT coalesce(jsonb_agg(
                jsonb_build_array(rung, i, o, n)
@@ -388,12 +418,12 @@ BEGIN
                pg_catalog.count(*) AS n
         FROM (
           SELECT
-            CASE
+            coalesce(CASE
               WHEN pe.agent = 'marvin:escalation-high'     THEN 'high'
               WHEN pe.agent = 'marvin:escalation-xhigh'    THEN 'xhigh'
               WHEN pe.agent = 'marvin:escalation-max'      THEN 'max'
               WHEN pe.agent = 'marvin:escalation-frontier' THEN 'frontier'
-            END AS rung,
+            END, v_rung_fallback) AS rung,
             pe.in_tok AS in_tok, pe.out_tok AS out_tok
           FROM public.report_priced_events pe
           WHERE pe.ts >= v_week AND coalesce(pe.note, '') <> 'backlog-capture'
@@ -413,7 +443,6 @@ BEGIN
                 ELSE 'unknown' END
             ) = 'ladder'
         ) r
-        WHERE r.rung IS NOT NULL
         GROUP BY rung
       ) q),
     'by_issue', (

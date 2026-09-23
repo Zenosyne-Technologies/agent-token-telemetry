@@ -153,12 +153,13 @@ def tier_case(model="model_name", kind="kind", agent="agent"):
 def rung_case(agent="agent"):
     """Escalation rung for a ladder-tier event, read only from the exact
     ``marvin:escalation-<rung>`` persona name — never inferred from a model or
-    effort setting. NULL for a ladder row that reached that tier through the
-    model-prefix fallback (a ``claude-fable-*`` model under an agent that is
-    not a named escalation persona): there is no rung to report for it, so it
-    contributes to the tier total but is left out of the by-rung breakdown.
-    ``{agent}`` is the SQL expression for the agent column in the query this
-    is spliced into."""
+    effort setting. NULL for a ladder row with no such name: the model-prefix
+    fallback (a ``claude-fable-*`` model under an agent that is not a named
+    escalation persona), or an unrecognized ``marvin:escalation-*`` suffix.
+    The by-rung query (:func:`fetch_token_stats`) COALESCEs this NULL into
+    :data:`RUNG_FALLBACK_LABEL` so every ladder-tier row is represented and
+    the rung breakdown sums to the tier total. ``{agent}`` is the SQL
+    expression for the agent column in the query this is spliced into."""
     return (
         "CASE"
         f" WHEN {agent} = 'marvin:escalation-high' THEN 'high'"
@@ -167,6 +168,29 @@ def rung_case(agent="agent"):
         f" WHEN {agent} = 'marvin:escalation-frontier' THEN 'frontier'"
         " END"
     )
+
+
+# The by-rung label for a ladder-tier event with no named rung (see
+# rung_case). Mirrored verbatim in supabase/reports.sql's by_rung CASE.
+RUNG_FALLBACK_LABEL = "no rung (fallback)"
+
+# The kit's tier display order (docs/TELEMETRY-CONTRACT.md's "Tier mapping"),
+# used ONLY to order the comma-joined tier list a by_model row shows for a
+# model that served more than one tier (see fetch_token_stats). 'unknown' (a
+# model matching no known family) is not part of the kit's own order, so it
+# sorts last. Mirrored by the rank CASE in supabase/reports.sql's by_model
+# aggregation (there computed the same way, over the SAME tier text).
+TIER_DISPLAY_ORDER = ("orchestrator", "heavy", "ladder", "small", "micro")
+
+
+def tier_rank_case(tier="tier"):
+    """SQL CASE ranking a tier-text column ``{tier}`` 0..len-1 in
+    :data:`TIER_DISPLAY_ORDER`, len for anything else (``'unknown'``). Used
+    to ORDER the per-model tier list a by_model row shows, independently of
+    by_model's own output-desc row order."""
+    whens = " ".join(f"WHEN '{t}' THEN {i}"
+                     for i, t in enumerate(TIER_DISPLAY_ORDER))
+    return f"CASE {tier} {whens} ELSE {len(TIER_DISPLAY_ORDER)} END"
 
 
 def rate_subquery(column):
@@ -423,11 +447,19 @@ def fetch_token_stats(conn):
     :func:`fetch_models_without_own_price` (all-time), rendered as the
     :func:`own_price_footer`.
 
-    ``by_model`` and ``by_tier`` are ROLE-tiered (see :func:`tier_case`), not
-    model-tiered: a model can appear once per tier it was actually used at.
-    ``by_rung`` breaks the 'ladder' tier rows of ``by_tier`` down by
-    escalation rung (see :func:`rung_case`); a ladder row with no named rung
-    (the model-prefix fallback) counts in ``by_tier`` but not here."""
+    ``by_tier`` is ROLE-tiered (see :func:`tier_case`), not model-tiered. Role
+    splits are visible there (and in ``by_rung``), NOT in ``by_model``: that
+    stays ONE row per model, as on the model-tiered kit, but its tier column
+    now lists every tier the model actually served that window, comma-joined
+    in :data:`TIER_DISPLAY_ORDER` (e.g. a model used both as the main
+    session and as a ``marvin:developer`` subagent reads ``orchestrator,
+    heavy``) — its estimated/event/unpriced counts stay per-model exactly as
+    before role tiering. ``by_rung`` breaks the 'ladder' tier rows of
+    ``by_tier`` down by escalation rung (see :func:`rung_case`); a ladder row
+    with no named rung (the model-prefix fallback, or an unrecognized
+    ``marvin:escalation-*`` suffix) is grouped under
+    :data:`RUNG_FALLBACK_LABEL` instead of dropped, so ``by_rung``'s rows
+    always sum to ``by_tier``'s ladder total."""
     cw1h, cw1h_usd = priced_cte(conn)
     name = "p.name" if has_column(conn, "projects", "name") else "NULL"
 
@@ -474,36 +506,42 @@ WITH priced AS (
 ),
 tiered AS (
   SELECT *, {tier_case()} AS tier FROM priced
-)
-SELECT model_name, tier,
-       SUM(in_tok), SUM(out_tok),
-       ROUND(SUM(in_tok*COALESCE(in_usd,0) + out_tok*COALESCE(out_usd,0)
+),
+per_model_tier AS (
+  SELECT model_name, tier,
+         SUM(in_tok) AS i, SUM(out_tok) AS o,
+         SUM(in_tok*COALESCE(in_usd,0) + out_tok*COALESCE(out_usd,0)
              + cache_r*COALESCE(cache_r_usd,0)
              + (cache_w - cache_w_1h)*COALESCE(cache_w_usd,0)
              + cache_w_1h*COALESCE(cache_w_1h_usd, cache_w_usd, 0))
-             / 1000000.0, 4),
-       MAX(rate_from),
-       SUM(CASE WHEN estimated = 1 THEN 1 ELSE 0 END),
-       COUNT(*),
-       SUM(CASE WHEN rate_from IS NULL THEN 1 ELSE 0 END)
-FROM tiered GROUP BY model_name, tier
-ORDER BY SUM(out_tok) DESC, model_name;""").fetchall()
-    # by_model keeps its 6-tuple shape (the renderer and the remote mapper
-    # depend on it); grouping is now (model, tier) — a role-tiered model can
-    # legitimately appear once per tier it was actually used at (e.g. the
-    # same model as both the main session's 'orchestrator' and a
-    # 'marvin:developer' subagent's 'heavy'), so the estimated/event/unpriced
-    # counts below are summed ACROSS tiers back onto the model name — those
-    # three dicts stay model-only, exactly as before this change.
+             / 1000000.0 AS cost,
+         MAX(rate_from) AS rate_from,
+         SUM(CASE WHEN estimated = 1 THEN 1 ELSE 0 END) AS est_n,
+         COUNT(*) AS ev_n,
+         SUM(CASE WHEN rate_from IS NULL THEN 1 ELSE 0 END) AS unpriced_n
+  FROM tiered GROUP BY model_name, tier
+)
+SELECT p1.model_name,
+       (SELECT group_concat(t, ', ') FROM (
+          SELECT tier AS t FROM per_model_tier p2
+          WHERE p2.model_name = p1.model_name
+          ORDER BY """ + tier_rank_case("tier") + f"""
+        )),
+       SUM(p1.i), SUM(p1.o), ROUND(SUM(p1.cost), 4), MAX(p1.rate_from),
+       SUM(p1.est_n), SUM(p1.ev_n), SUM(p1.unpriced_n)
+FROM per_model_tier p1
+GROUP BY p1.model_name
+ORDER BY SUM(p1.o) DESC, p1.model_name;""").fetchall()
+    # by_model is ONE row per model again (F1): a role-tiered model that
+    # served more than one tier lists them ALL, comma-joined in the kit's
+    # display order (tier_rank_case), rather than repeating the model. The
+    # per-model estimated/event/unpriced counts are exactly what main always
+    # computed (each is now already summed across tiers by the SQL above, not
+    # in Python) — the role split lives ONLY in by_tier (and by_rung) below.
     d["by_model"] = [tuple(r[:6]) for r in by_model]
-    est_totals, ev_totals, unpriced_totals = {}, {}, {}
-    for name, _tier, _i, _o, _cost, _rf, est_n, ev_n, unpriced_n in by_model:
-        est_totals[name] = est_totals.get(name, 0) + est_n
-        ev_totals[name] = ev_totals.get(name, 0) + ev_n
-        unpriced_totals[name] = unpriced_totals.get(name, 0) + unpriced_n
-    d["estimated_by_model"] = {k: v for k, v in est_totals.items() if v}
-    d["events_by_model"] = ev_totals
-    d["unpriced_by_model"] = {k: v for k, v in unpriced_totals.items() if v}
+    d["estimated_by_model"] = {r[0]: r[6] for r in by_model if r[6]}
+    d["events_by_model"] = {r[0]: r[7] for r in by_model}
+    d["unpriced_by_model"] = {r[0]: r[8] for r in by_model if r[8]}
     d["models_without_own_price"] = fetch_models_without_own_price(conn)
     d["by_kind"] = conn.execute(
         "SELECT CASE kind WHEN 0 THEN 'main' ELSE 'subagent' END,"
@@ -521,20 +559,24 @@ ORDER BY SUM(out_tok) DESC, model_name;""").fetchall()
         " GROUP BY 1 ORDER BY SUM(e.out_tok) DESC, 1").fetchall()
     # Ladder rungs, broken out from the 'ladder' tier rows above: high / xhigh
     # / max / frontier, read only from the named marvin:escalation-* persona
-    # (see rung_case). A ladder row that reached 'ladder' via the model-prefix
-    # fallback rather than a named escalation persona has no rung and is
-    # dropped here — it still counts toward the tier total above.
+    # (see rung_case). A ladder row with no such name (the model-prefix
+    # fallback, or an unrecognized marvin:escalation-* suffix) is COALESCEd
+    # into RUNG_FALLBACK_LABEL rather than dropped, so the rung breakdown
+    # always sums to the tier total; the label is a real GROUP BY key, so it
+    # only appears — "shown only when non-zero" — when at least one such row
+    # exists in the window.
     d["by_rung"] = conn.execute(
         "SELECT rung, SUM(in_tok), SUM(out_tok), COUNT(*) FROM ("
-        " SELECT " + rung_case(agent="e.agent") + " AS rung,"
+        " SELECT COALESCE(" + rung_case(agent="e.agent") + ", ?) AS rung,"
         " e.in_tok AS in_tok, e.out_tok AS out_tok"
         " FROM events e JOIN models m ON m.id = e.model_id"
         " WHERE e.ts >= strftime('%s','now','-7 days')"
         f" AND {NOT_BACKLOG}"
         " AND (" + tier_case(model="m.name", kind="e.kind", agent="e.agent") +
         ") = 'ladder'"
-        ") r WHERE rung IS NOT NULL"
-        " GROUP BY rung ORDER BY SUM(out_tok) DESC, rung").fetchall()
+        ") r"
+        " GROUP BY rung ORDER BY SUM(out_tok) DESC, rung",
+        (RUNG_FALLBACK_LABEL,)).fetchall()
     d["by_issue"] = conn.execute(
         "SELECT issue_key, SUM(in_tok), SUM(out_tok), SUM(cache_r),"
         " SUM(cache_w), COUNT(*) FROM events WHERE issue_key IS NOT NULL"
