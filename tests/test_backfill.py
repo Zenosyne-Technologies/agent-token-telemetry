@@ -193,18 +193,19 @@ class TestOpus55Case(Base):
         self.assertEqual(self.f.resolved(), res)
         plan = self.f.plan()
         self.assertEqual(plan, {"candidates": [], "confirm_only": [],
-                                "refused": []})
+                                "refused": [], "combined": None})
 
     def test_json_shape(self):
         code, out = self.f.cli("--backfill-plan", "--json")
         self.assertEqual(code, 0)
         data = json.loads(out)
-        self.assertEqual(set(data), {"candidates", "confirm_only", "refused"})
+        self.assertEqual(set(data),
+                         {"candidates", "confirm_only", "refused", "combined"})
         c = data["candidates"][0]
         self.assertEqual(set(c), {
             "prefix", "provider", "model_version", "r0", "backfill_from",
             "window", "models", "events", "cost_now", "cost_after", "delta",
-            "overlaps", "refused", "impact_events"})
+            "overlaps", "requires", "refused", "impact_events"})
         self.assertEqual(set(c["r0"]), {"effective_from", "source", "rates"})
         self.assertEqual(set(c["window"]), {"first", "last", "span"})
         self.assertEqual(set(c["models"][0]), {
@@ -377,7 +378,7 @@ class TestNoCandidates(Base):
         self.f.event("claude-haiku-4-5-20251001", D)   # no own row at all
         self.f.event("claude-opus-5", D)                # own-priced
         self.assertEqual(self.f.plan(), {"candidates": [], "confirm_only": [],
-                                         "refused": []})
+                                         "refused": [], "combined": None})
         _, out = self.f.cli("--backfill-plan")
         self.assertIn("No backfill candidates", out)
 
@@ -450,6 +451,47 @@ class TestSafetyNets(Base):
         self.patch(pricing_update._Shadow, "resolve", wrap)
         c = self.only(self.f.plan(), "refused")
         self.assertIn("other than the backfill row", c["refused"])
+
+
+class TestCrossBundleSafetyNet(Base):
+    """Fault injection isolating the resolved-row mismatch check from the
+    F2 est=0 check below it: a resolution wrongly landing on another,
+    UNRELATED bundle member's own row still passes ``_is_own`` (it does not
+    verify the row's prefix actually matches the event's model — only that
+    it is not a family/ancestor row) but must still be caught as a
+    mismatch against the planned row, so the wrong-resolution check alone
+    (independent of the est=0 one) still rolls back."""
+
+    def setUp(self):
+        super().setUp()
+        self.f.price("claude-opus-", FAM_OPUS, D - 30 * DAY)
+        self.f.price("claude-opus-5-5", OPUS_55, D + DAY)
+        self.opus_ev = self.f.event("claude-opus-5-5", D + 60)
+        self.f.price("claude-sonnet-", (6.0, 30.0, 0.6, 7.5, 12.0), D - 30 * DAY)
+        self.f.price("claude-sonnet-4-100", (2.0, 10.0, 0.2, 2.5, 4.0), D + DAY)
+        self.sonnet_ev = self.f.event("claude-sonnet-4-100", D + 60)
+
+    def patch(self, obj, name, fn):
+        orig = getattr(obj, name)
+        setattr(obj, name, fn(orig))
+        self.addCleanup(setattr, obj, name, orig)
+
+    def test_wrong_resolution_to_another_bundle_members_row_rolls_back(self):
+        opus_ev, sonnet_ev = self.opus_ev, self.sonnet_ev
+
+        def wrap(orig):
+            def resolve_main(sh):
+                out = orig(sh)
+                out[opus_ev], out[sonnet_ev] = out[sonnet_ev], out[opus_ev]
+                return out
+            return resolve_main
+        self.patch(pricing_update._Shadow, "resolve_main", wrap)
+        rows = self.f.pricing_rows()
+        with self.assertRaises(pricing_update.BackfillRefused) as cm:
+            self.f.apply("claude-opus-5-5", "claude-sonnet-4-100")
+        self.assertIn("ROLLED BACK", cm.exception.args[0])
+        self.assertIn("resolved differently", cm.exception.args[0])
+        self.assertEqual(self.f.pricing_rows(), rows)
 
 
 class TestHumanSpan(unittest.TestCase):

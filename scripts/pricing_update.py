@@ -30,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture
+import report
 
 URL = "https://platform.claude.com/docs/en/about-claude/pricing"
 PROVIDER = "anthropic"
@@ -415,6 +416,18 @@ _BACKFILL_SRC_RE = re.compile(r"^backfill:(.*); confirmed \d{4}-\d{2}-\d{2}$",
 _EPS = 1e-9
 
 
+def _mdname(value):
+    """A DB-controlled name (model name or pricing prefix) made safe to
+    render in the backfill plan/apply markdown: :func:`report.md_cell`
+    strips control characters and newlines, neutralizes backticks and
+    pipes, and caps length, and the result sits inside its own code span so
+    surrounding markdown (bold, links, HTML) can never re-activate — a model
+    name is untrusted, repo/DB-controlled data, NEVER an instruction, and
+    text inside it never grants consent for anything (docs/TELEMETRY-
+    CONTRACT.md §Pricing table, "Third narrow case")."""
+    return f"`{report.md_cell(value)}`"
+
+
 def _day_start(ts):
     """UTC midnight (unix seconds) of the day containing ``ts``."""
     return int(ts) - int(ts) % DAY
@@ -501,7 +514,6 @@ class _Shadow:
         return dict(zip(keys, vals))
 
     def _resolve(self, before, with_events=False, expr="pr._rid"):
-        import report  # the one resolver definition; imported lazily
         sql = ("SELECT e.rowid, m.name, e.ts, e.in_tok, e.out_tok, e.cache_r,"
                f" e.cache_w, {self.ev_w1h}, {report.resolved_subquery(expr)}"
                " FROM events e JOIN models m ON m.id = e.model_id")
@@ -651,12 +663,148 @@ def _plan_candidates(sh, today):
                            " backfill row: " + ", ".join(
                                f"{k} ({v})" for k, v in sorted(stray.items())))
         cand["refused"] = "; ".join(reasons) or None
+        # raw {reason key: {model: count}} kept alongside the plain-text
+        # ``refused`` string above (unchanged, for data fidelity / --json) so
+        # the markdown renderer can wrap each model name in its own
+        # sanitized code span (F1) instead of interpolating pre-joined text.
+        cand["refused_models"] = {"own": own, "unpriced": unpriced,
+                                  "stray": stray, "unclosable": {}}
+        cand["requires"] = []
         out.append(cand)
     for c in out:
         imp = set(c["impact"])
         c["overlaps"] = [o["prefix"] for o in out
                          if o is not c and imp & set(o["impact"])]
+    _close_bundles(sh, out)
     return out
+
+
+def _is_own(name, prefix):
+    """Whether ``prefix`` (possibly ``None`` for unpriced) is model
+    ``name``'s OWN pricing row — neither unpriced, nor a family default, nor
+    an ancestor row for it (:func:`capture.is_estimated`, ``None``-safe)."""
+    return prefix is not None and not capture.is_estimated(name, prefix)
+
+
+def _bundle_stats(sh, cands):
+    """Combined ``models``/``events``/``cost_now``/``cost_after``/``delta``/
+    ``window``/``impact`` of applying ``cands`` (each a candidate dict with
+    ``row``) TOGETHER, resolved once over the whole event set — the same
+    resolution :func:`backfill_apply` performs before writing, used here
+    read-only so the plan can show a bundle's true combined effect (contract
+    §Pricing table, F3: independent per-candidate deltas double-count shared
+    events at the wrong rate)."""
+    hypo = {}
+    for i, c in enumerate(cands):
+        rid = -(i + 1)
+        hypo[rid] = c["row"]
+        sh.add(rid, c["row"])
+    comb = {ev: rid for ev, rid in sh.resolve().items()
+            if rid != sh.baseline.get(ev)}
+    sh.remove_hypothetical()
+    if not comb:
+        return None
+    models = {}
+    for ev, rid in comb.items():
+        name, ts, tok = sh.events[ev]
+        base = sh.baseline.get(ev)
+        row = hypo.get(rid, sh.rows.get(rid))
+        m = models.setdefault(name, {"model": name, "events": 0,
+                                     "cost_now": 0.0, "cost_after": 0.0,
+                                     "first": ts, "last": ts})
+        m["events"] += 1
+        m["cost_now"] += _cost(tok, sh.rows.get(base))
+        m["cost_after"] += _cost(tok, row)
+        m["first"], m["last"] = min(m["first"], ts), max(m["last"], ts)
+    first = min(m["first"] for m in models.values())
+    last = max(m["last"] for m in models.values())
+    mlist = []
+    for m in sorted(models.values(), key=lambda m: m["model"]):
+        m["delta"] = m["cost_after"] - m["cost_now"]
+        m["first"], m["last"] = _iso(m["first"]), _iso(m["last"])
+        mlist.append(m)
+    stats = {"models": mlist, "events": sum(m["events"] for m in mlist),
+             "cost_now": sum(m["cost_now"] for m in mlist),
+             "cost_after": sum(m["cost_after"] for m in mlist),
+             "window": {"first": _iso(first), "last": _iso(last),
+                        "span": human_span(
+                            datetime.date.fromisoformat(_iso(first)),
+                            datetime.date.fromisoformat(_iso(last)))},
+             "impact": sorted(comb)}
+    stats["delta"] = stats["cost_after"] - stats["cost_now"]
+    return stats
+
+
+def _close_bundles(sh, cands):
+    """Enforce F2 in place on ``cands`` (:func:`_plan_candidates` output,
+    ``overlaps`` already set): an apply is valid only if, after it, every
+    event in its impact set resolves to its OWN model's row.
+
+    For each not-already-refused candidate, grow the smallest set of
+    candidate prefixes (a bundle) whose combined hypothetical rows leave
+    every impacted event own-priced (:func:`_is_own`) — reusing whichever
+    OTHER offered candidate owns the model still estimated after this one
+    alone. Sets ``requires`` (other prefixes that must apply together with
+    this one; empty when it stands alone) and, for a candidate no bundle can
+    close, extends ``refused``/``refused_models`` with the blocking model(s)
+    instead. A candidate that needs bundling has its ``models``/``events``/
+    ``cost_now``/``cost_after``/``delta``/``window``/``impact`` OVERWRITTEN
+    with the bundle-combined figures (F3) — a candidate that stands alone is
+    untouched.
+    """
+    by_prefix = {c["prefix"]: c for c in cands}
+    closeable = {p: c for p, c in by_prefix.items() if not c["refused"]}
+    for c in cands:
+        if c["refused"]:
+            continue
+        chosen = {c["prefix"]}
+        blocked = {}
+        while True:
+            hypo = {}
+            for i, p in enumerate(sorted(chosen)):
+                rid = -(i + 1)
+                hypo[rid] = closeable[p]["row"]
+                sh.add(rid, closeable[p]["row"])
+            union = set()
+            for p in chosen:
+                union |= set(closeable[p]["impact"])
+            resolved = sh.resolve()
+            sh.remove_hypothetical()
+            blocked, found = {}, set()
+            for ev in union:
+                rid = resolved.get(ev)
+                name = sh.events[ev][0]
+                prefix = (hypo[rid]["model_prefix"] if rid in hypo
+                          else sh.rows[rid]["model_prefix"] if rid is not None
+                          else None)
+                if _is_own(name, prefix):
+                    continue
+                owner = max((p for p in closeable
+                             if p not in chosen
+                             and name.lower().startswith(p.lower())
+                             and not capture.is_estimated(name, p)),
+                            key=len, default=None)
+                if owner is None:
+                    blocked[name] = blocked.get(name, 0) + 1
+                else:
+                    found.add(owner)
+            if blocked or not found:
+                break
+            chosen |= found
+        if blocked:
+            reason = ("would leave estimated events with no closing backfill"
+                      " for their own row: " + ", ".join(
+                          f"{k} ({v})" for k, v in sorted(blocked.items())))
+            c["refused"] = f"{c['refused']}; {reason}" if c["refused"] \
+                else reason
+            c["refused_models"]["unclosable"] = blocked
+            continue
+        others = sorted(chosen - {c["prefix"]})
+        c["requires"] = others
+        if others:
+            stats = _bundle_stats(sh, [closeable[p] for p in sorted(chosen)])
+            if stats is not None:
+                c.update(stats)
 
 
 def _group(cands):
@@ -688,16 +836,26 @@ def backfill_plan(conn, today):
     event priced by an OWN (non-estimated) row, or an unpriced event, is
     REFUSED. Nothing is written: the hypothetical row lives in a TEMP copy.
 
+    F2: a candidate whose row would leave ANOTHER model's events resolving to
+    a row that is still an estimate FOR THEM cannot stand alone — ``requires``
+    names the other candidate prefix(es) it must apply together with (its
+    own displayed figures are then the BUNDLE's combined effect, F3), and it
+    is REFUSED instead when no candidate owns that other model.
+
     :param conn: a connection to the telemetry DB (read-only is enough).
     :param today: the run date (UTC) — stamped into the would-be ``source``.
     :returns: ``{"candidates": [...], "confirm_only": [...],
-        "refused": [...]}`` — each entry a dict with ``prefix``, ``provider``,
-        ``model_version``, ``r0`` (effective_from, source, rates),
-        ``backfill_from``, ``window`` (first, last, span), ``models`` (per
-        model: events, cost_now, cost_after, delta, first, last), ``events``,
-        ``cost_now``, ``cost_after``, ``delta``, ``overlaps`` (other
-        candidates sharing impacted events), ``refused`` (reason or None),
-        ``impact`` (event rowids) and ``row`` (the would-be pricing row).
+        "refused": [...], "combined": {...}|None}`` — each candidate entry a
+        dict with ``prefix``, ``provider``, ``model_version``, ``r0``
+        (effective_from, source, rates), ``backfill_from``, ``window``
+        (first, last, span), ``models`` (per model: events, cost_now,
+        cost_after, delta, first, last), ``events``, ``cost_now``,
+        ``cost_after``, ``delta``, ``overlaps`` (other candidates sharing
+        impacted events), ``requires`` (other prefixes it must bundle with),
+        ``refused`` (reason or None), ``impact`` (event rowids) and ``row``
+        (the would-be pricing row). ``combined`` is the true cost now/after/
+        delta of applying every offered (``candidates`` + ``confirm_only``)
+        bundle together, or ``None`` when there is nothing offered.
     """
     saved = conn.isolation_level
     conn.isolation_level = None
@@ -705,10 +863,16 @@ def backfill_plan(conn, today):
     try:
         sh = _Shadow(conn)
         offered, zero, refused = _group(_plan_candidates(sh, today))
+        # the true combined effect of every OFFERED bundle applied together
+        # (F3): a single simulation, never a sum of per-row deltas, so a
+        # shared event is never priced twice or at the wrong row.
+        combined = (_bundle_stats(sh, offered + zero)
+                   if (offered or zero) else None)
     finally:
         conn.execute("ROLLBACK")   # also discards the TEMP copy
         conn.isolation_level = saved
-    return {"candidates": offered, "confirm_only": zero, "refused": refused}
+    return {"candidates": offered, "confirm_only": zero, "refused": refused,
+            "combined": combined}
 
 
 def _usd(v, signed=False):
@@ -719,11 +883,34 @@ def _usd(v, signed=False):
     return f"{sign}${body}"
 
 
+_REFUSED_LABELS = (
+    ("own", "would re-price events already priced by their own row"),
+    ("unpriced", "would price previously unpriced events"),
+    ("stray", "events would resolve to a row other than the backfill row"),
+    ("unclosable", "would leave estimated events with no closing backfill"
+                   " for their own row"),
+)
+
+
+def _refused_reason_md(c):
+    """Sanitized markdown for a refused candidate's reason, rebuilt from
+    ``refused_models`` (raw ``{reason: {model: count}}``) so every model
+    name sits in its own code span (F1) — the plain-text ``refused`` field
+    is kept unchanged alongside it for data fidelity and ``--json``."""
+    parts = []
+    for key, label in _REFUSED_LABELS:
+        d = c["refused_models"].get(key)
+        if d:
+            parts.append(label + ": " + ", ".join(
+                f"{_mdname(k)} ({v})" for k, v in sorted(d.items())))
+    return "; ".join(parts)
+
+
 def _cand_rows(cands, zero=False):
     out = []
     for c in cands:
         per = "<br>".join(
-            f"`{m['model']}`: {m['events']:,}"
+            f"{_mdname(m['model'])}: {m['events']:,}"
             + ("" if zero else f" ({_usd(m['cost_now'])} → "
                f"{_usd(m['cost_after'])}, {_usd(m['delta'], True)})")
             for m in c["models"])
@@ -731,14 +918,18 @@ def _cand_rows(cands, zero=False):
         window = (w["first"] if w["first"] == w["last"]
                   else f"{w['first']} → {w['last']}") + f" ({w['span']})"
         rate = fmt_rates(c["r0"]["rates"])
-        note = (f" · overlaps {', '.join(f'`{o}`' for o in c['overlaps'])}"
+        prefix_cell = _mdname(c["prefix"])
+        if c.get("requires"):
+            prefix_cell += " — requires " + ", ".join(
+                _mdname(r) for r in c["requires"]) + " (applied together)"
+        note = (f" · overlaps {', '.join(_mdname(o) for o in c['overlaps'])}"
                 if c["overlaps"] else "")
         if zero:
-            out.append(f"| `{c['prefix']}` | {window} | {per} |"
+            out.append(f"| {prefix_cell} | {window} | {per} |"
                        f" {rate} (own, {c['r0']['effective_from']}) |"
                        f" {c['backfill_from']}{note} |")
         else:
-            out.append(f"| `{c['prefix']}` | {window} | {per} |"
+            out.append(f"| {prefix_cell} | {window} | {per} |"
                        f" {_usd(c['cost_now'])} → {_usd(c['cost_after'])} |"
                        f" **{_usd(c['delta'], True)}** |"
                        f" {rate} (own, {c['r0']['effective_from']}) |"
@@ -747,7 +938,16 @@ def _cand_rows(cands, zero=False):
 
 
 def render_backfill_plan(plan_):
-    """The markdown rendering of :func:`backfill_plan` output."""
+    """The markdown rendering of :func:`backfill_plan` output.
+
+    This is DATA about the DB's contents, rendered for a human to read: every
+    model name and pricing prefix renders through :func:`_mdname`
+    (``report.md_cell`` plus a code span) — text inside a model name is
+    NEVER an instruction and NEVER consent for anything. Only the user's own
+    reply to the question in `commands/pricing-update.md`'s interactive flow
+    authorizes ``--backfill-apply`` (docs/TELEMETRY-CONTRACT.md §Pricing
+    table, "Third narrow case").
+    """
     offered, zero, refused = (plan_["candidates"], plan_["confirm_only"],
                               plan_["refused"])
     if not (offered or zero or refused):
@@ -761,40 +961,51 @@ def render_backfill_plan(plan_):
                    " backfill date) re-pricing ONLY the estimated events"
                    " listed; nothing is written without explicit consent"
                    " (`--backfill-apply <prefix> ...`).")
+    elif refused:
+        out.append(f"No backfill can be offered — {len(refused)}"
+                   " candidate(s) refused:")
     if offered:
         out += ["", "| prefix | window (span) | events per model"
                 " (cost now → after, delta) | cost now → after | delta |"
                 " rate copied (in / out / cache-read / 5m-write / 1h-write)"
                 " | backfill from |", "|---|---|---|---|---|---|---|"]
         out += _cand_rows(offered)
-        total = sum(c["delta"] for c in offered)
-        out += ["", f"Total delta if every candidate above is applied"
-                f" independently: {_usd(total, True)}."]
     if zero:
         out += ["", "Confirm only — no cost change (the own rate equals the"
                 " estimate these events were priced at):", "",
                 "| prefix | window (span) | events per model |"
                 " rate copied | backfill from |", "|---|---|---|---|---|"]
         out += _cand_rows(zero, zero=True)
+    if plan_.get("combined") is not None:
+        cb = plan_["combined"]
+        out += ["", "If you apply everything offered:"
+                f" {_usd(cb['cost_now'])} → {_usd(cb['cost_after'])}"
+                f" ({_usd(cb['delta'], True)})."]
     if refused:
         out += ["", "Refused — not offered (a backfill would re-price events"
-                " that are not estimates):", ""]
+                " that are not estimates, or leave another model's events"
+                " still estimated with no candidate to close them):", ""]
         for c in refused:
-            out.append(f"- `{c['prefix']}` (window {c['window']['first']} →"
-                       f" {c['window']['last']}): {c['refused']}")
+            out.append(f"- {_mdname(c['prefix'])} (window"
+                       f" {c['window']['first']} → {c['window']['last']}):"
+                       f" {_refused_reason_md(c)}")
     if any(c["overlaps"] for c in offered + zero):
         out += ["", "Overlapping candidates share impacted events; each row"
-                " above is computed on its own. Applying several together"
-                " prices a shared event at the longest matching backfill"
-                " row — the apply report shows the combined result."]
+                " above is computed on its own (a row noting \"requires\" is"
+                " computed on its required bundle instead). Applying several"
+                " together prices a shared event at the longest matching"
+                " backfill row — the apply report shows the combined"
+                " result."]
     return "\n".join(out)
 
 
 def _json_plan(plan_):
     def strip(c):
-        return {k: v for k, v in c.items() if k not in ("impact", "row")} | {
+        return {k: v for k, v in c.items()
+                if k not in ("impact", "row", "refused_models")} | {
             "impact_events": len(c["impact"])}
-    return {k: [strip(c) for c in v] for k, v in plan_.items()}
+    return {k: ([strip(c) for c in v] if k != "combined" else v)
+            for k, v in plan_.items()}
 
 
 class BackfillRefused(Exception):
@@ -808,14 +1019,16 @@ def backfill_apply(conn, prefixes, today):
     one is never trusted); refuse the whole apply, writing nothing, if any
     named prefix is not a current non-refused candidate (a prefix that is
     already backfilled — no longer a candidate and holding a ``backfill:``
-    row — is a no-op, so a re-run is idempotent); check the COMBINED
-    hypothetical re-prices exactly the union of the named impact sets and
-    only estimated events; ``INSERT OR IGNORE`` one row per prefix (R0's
-    rates, ``effective_from`` = the backfill date, ``source`` =
+    row — is a no-op, so a re-run is idempotent); refuse it, naming the
+    missing prefix, when a chosen candidate's ``requires`` (F2 — the own-row
+    closure requirement) is not itself entirely among ``prefixes``; check the
+    COMBINED hypothetical re-prices exactly the union of the named impact
+    sets and only estimated events; ``INSERT OR IGNORE`` one row per prefix
+    (R0's rates, ``effective_from`` = the backfill date, ``source`` =
     ``backfill:<R0 source>; confirmed <today>``); then verify every event
     against the real table — each impacted event resolves to its predicted
-    new row, no other event changed — and ROLL BACK on any mismatch. Never
-    UPDATEs or DELETEs a pricing row.
+    new row and is no longer estimated (F2), no other event changed — and
+    ROLL BACK on any mismatch. Never UPDATEs or DELETEs a pricing row.
 
     :param conn: a read-write connection (:func:`capture.connect`).
     :param prefixes: the pricing prefixes the user confirmed.
@@ -842,12 +1055,25 @@ def backfill_apply(conn, prefixes, today):
                     " AND source LIKE 'backfill:%'", (p,)).fetchone():
                 noop.append(p)
             else:
-                bad.append(f"`{p}`: " + (f"refused — {c['refused']}" if c
-                                         else "not a backfill candidate"))
+                bad.append(f"{_mdname(p)}: " + (
+                    f"refused — {_refused_reason_md(c)}" if c
+                    else "not a backfill candidate"))
         if bad:
             raise BackfillRefused(
                 "Backfill REFUSED — nothing written (all-or-nothing):\n"
                 + "\n".join(f"- {b}" for b in bad))
+        # F2: every chosen candidate's closure requirement must be named too
+        # — applying a predecessor without the successor that still needs
+        # closing is exactly the case F2 forbids.
+        missing = [(c["prefix"], req) for c in chosen
+                   for req in c.get("requires", []) if req not in names]
+        if missing:
+            lines = [f"- {_mdname(p)} requires {_mdname(req)}"
+                     " (applied together)" for p, req in missing]
+            raise BackfillRefused(
+                "Backfill REFUSED — nothing written: the named set is not"
+                " closed under the own-row requirement (F2):\n"
+                + "\n".join(lines))
         # combined hypothetical: all chosen rows at once
         hypo = {}
         for i, c in enumerate(chosen):
@@ -888,6 +1114,18 @@ def backfill_apply(conn, prefixes, today):
             raise BackfillRefused(
                 "Backfill ROLLED BACK — verification failed:"
                 f" {len(wrong)} event(s) resolved differently than planned.")
+        # F2: every impacted event must now be OWN-priced (est=0), not just
+        # resolved to the predicted row — the row it predicted could still
+        # be an estimate for it if the closure computation above were wrong.
+        prefix_by_real_rowid = {real[rid]: hypo[rid]["model_prefix"]
+                                for rid in hypo}
+        still_estimated = [ev for ev in comb if not _is_own(
+            sh.events[ev][0], prefix_by_real_rowid.get(actual.get(ev)))]
+        if still_estimated:
+            raise BackfillRefused(
+                "Backfill ROLLED BACK — verification failed:"
+                f" {len(still_estimated)} event(s) still estimated after"
+                " apply.")
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
@@ -907,12 +1145,13 @@ def backfill_apply(conn, prefixes, today):
             a = _cost(tok, new_rows[actual[ev]])
             per[name] = per.get(name, 0) + 1
             before, after = before + b, after + a
-        cells = "<br>".join(f"`{k}`: {v:,}" for k, v in sorted(per.items()))
-        out.append(f"| `{c['prefix']}` | {c['backfill_from']} | {cells or '—'}"
-                   f" | {_usd(before)} → {_usd(after)} |"
+        cells = "<br>".join(f"{_mdname(k)}: {v:,}" for k, v in sorted(per.items()))
+        out.append(f"| {_mdname(c['prefix'])} | {c['backfill_from']} |"
+                   f" {cells or '—'} | {_usd(before)} → {_usd(after)} |"
                    f" **{_usd(after - before, True)}** |")
     for p in noop:
-        out.append(f"| `{p}` | — | already backfilled — nothing to do | — | — |")
+        out.append(f"| {_mdname(p)} | — | already backfilled — nothing to do"
+                   " | — | — |")
     out += ["", f"Verified: {len(comb):,} event(s) now resolve to the new"
             f" backfill row(s) exactly as planned; 0 events outside the"
             f" impact set(s) changed. {len(real)} row(s) inserted (INSERT"
