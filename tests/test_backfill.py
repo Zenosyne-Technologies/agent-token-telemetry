@@ -997,6 +997,54 @@ class TestBackfillApplyOptionInjection(Base):
         self.assertEqual(code, 0, out)
 
 
+class TestBackfillFlagsMutuallyExclusive(Base):
+    """AOS-136 hardening: ``--backfill-plan`` and ``--backfill-apply`` must
+    never both take effect on one command line — the prompt-facing command
+    pre-approves `--backfill-plan ...` (a prefix match) while leaving
+    `--backfill-apply` gated behind Claude Code's own permission prompt, so a
+    future refactor of `main`'s branch order must not be able to make a
+    pre-approved plan invocation also apply. Both orderings are rejected
+    before argparse runs and before any DB is opened: nothing is written and
+    no plan report reaches stdout."""
+
+    def setUp(self):
+        super().setUp()
+        self.f.price("claude-opus-", FAM_OPUS, D - 30 * DAY)
+        self.f.price("claude-opus-5-5", OPUS_55, D + DAY)
+        self.f.event("claude-opus-5-5", D + 60)
+
+    def test_plan_then_apply_is_rejected(self):
+        before = (self.f.digest(), self.f.pricing_rows())
+        code, out = self.f.cli("--backfill-plan", "--backfill-apply",
+                               "claude-opus-5-5")
+        self.assertEqual(code, 2, out)
+        self.assertIn("mutually exclusive", out)
+        self.assertNotIn("Backfill available", out)
+        self.assertNotIn("| prefix |", out)
+        self.assertEqual((self.f.digest(), self.f.pricing_rows()), before)
+
+    def test_apply_then_plan_is_rejected(self):
+        # Caught by the pre-existing option-shaped-token guard (--backfill-plan
+        # is option-shaped following --backfill-apply) before the dedicated
+        # mutual-exclusion check is even reached — still exit 2, nothing
+        # written, no plan output.
+        before = (self.f.digest(), self.f.pricing_rows())
+        code, out = self.f.cli("--backfill-apply", "claude-opus-5-5",
+                               "--backfill-plan")
+        self.assertEqual(code, 2, out)
+        self.assertIn("rejected --backfill-apply argument(s) #2", out)
+        self.assertNotIn("Backfill available", out)
+        self.assertNotIn("| prefix |", out)
+        self.assertEqual((self.f.digest(), self.f.pricing_rows()), before)
+
+    def test_flags_alone_still_work(self):
+        code, out = self.f.cli("--backfill-plan")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Backfill available", out)
+        code, out = self.f.cli("--backfill-apply", "claude-opus-5-5")
+        self.assertEqual(code, 0, out)
+
+
 class TestBundleClosure(Base):
     """F2/F3 pinned on the shared-prefix fixture: backfilling the
     predecessor alone would leave the successor's event on an ANCESTOR row

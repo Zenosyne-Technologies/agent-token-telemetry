@@ -20,7 +20,12 @@ consumes every remaining raw argument as a candidate prefix (validated before
 argument parsing even runs — see :func:`_reject_option_shaped_backfill_apply`),
 so `--db`/`--html` MUST be given before `--backfill-apply` on the command line;
 anything after it that is not a well-formed prefix, including another flag,
-is rejected by position, never echoed.
+is rejected by position, never echoed. `--backfill-plan` and
+`--backfill-apply` are mutually exclusive — rejected with exit 2 before any
+DB is opened if both appear anywhere on the command line
+(:func:`_reject_combined_backfill_flags`), and again by the argparse parser
+itself, so a pre-approved `--backfill-plan ...` prefix match can never also
+apply.
 
 Backend seam: DB work goes through capture.connect() (the schema owner);
 parsing and planning are pure functions over plain data, reusable unchanged
@@ -1248,6 +1253,29 @@ class _ArgumentParser(argparse.ArgumentParser):
         self.exit(2, f"{self.prog}: error: {clean}\n")
 
 
+def _reject_combined_backfill_flags(argv):
+    """Defence in depth against a future refactor reordering ``main``'s
+    branches: refuse ``--backfill-plan`` and ``--backfill-apply`` together,
+    BEFORE argparse ever runs and before any DB is opened. argparse's own
+    ``nargs="+"`` on ``--backfill-apply`` only stops consuming values at the
+    next token that LOOKS like an option, so this membership check catches
+    both orderings — ``--backfill-plan`` before ``--backfill-apply`` (which
+    argparse alone would parse as two independent, non-conflicting flags,
+    each branch in ``main`` then deciding which one runs) and
+    ``--backfill-apply`` before ``--backfill-plan`` (already separately
+    caught, earlier in ``main`` and before this function even runs, by
+    :func:`_reject_option_shaped_backfill_apply` treating ``--backfill-plan``
+    as an option-shaped value following ``--backfill-apply``). The two flags
+    are also declared mutually exclusive in the argparse parser itself, as a
+    third, independent layer.
+
+    :param argv: the raw argument list, before ``argparse.parse_args``.
+    :returns: ``True`` when both flags appear anywhere in ``argv``, else
+        ``False``.
+    """
+    return "--backfill-plan" in argv and "--backfill-apply" in argv
+
+
 def _reject_option_shaped_backfill_apply(argv):
     """Defence in depth against option injection: reject any raw argv token
     after ``--backfill-apply`` that is not a well-formed pricing prefix,
@@ -1290,28 +1318,42 @@ def _backfill_apply_refusal(positions):
 
 def main(argv=None):
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    # Validate BEFORE argparse ever runs: argparse would otherwise hand any
-    # option-shaped token following --backfill-apply (or, via abbreviation
-    # matching, a shortened flag) to its own parser first, redirecting the
-    # write or switching modes (--db=, --d=, --backfill-plan, -h) instead of
-    # being rejected as a malformed prefix. Nothing is opened here.
+    # Validate BEFORE argparse ever runs. Nothing is opened here.
+    # First: argparse would otherwise hand any option-shaped token following
+    # --backfill-apply (or, via abbreviation matching, a shortened flag) to
+    # its own parser first, redirecting the write or switching modes
+    # (--db=, --d=, -h) instead of being rejected as a malformed prefix. This
+    # already catches --backfill-apply PREFIX --backfill-plan, since
+    # --backfill-plan is option-shaped.
     bad = _reject_option_shaped_backfill_apply(raw_argv)
     if bad:
         print(_backfill_apply_refusal(bad))
+        return 2
+    # Second: --backfill-plan and --backfill-apply are mutually exclusive —
+    # catches the remaining ordering, --backfill-plan before --backfill-apply,
+    # which argparse alone would parse as two independent, non-conflicting
+    # flags and let main()'s branch order decide which one runs. A future
+    # refactor of that branch order must not be able to make a pre-approved
+    # `--backfill-plan ...` command line also apply.
+    if _reject_combined_backfill_flags(raw_argv):
+        print("Backfill REFUSED — nothing written: --backfill-plan and"
+              " --backfill-apply are mutually exclusive.")
         return 2
 
     ap = _ArgumentParser(prog="pricing_update.py", allow_abbrev=False)
     ap.add_argument("--db", default=None)
     ap.add_argument("--html", default=None,
                     help="parse a local HTML file instead of fetching (tests)")
-    ap.add_argument("--backfill-plan", action="store_true",
-                    help="print the read-only backfill plan and exit")
+    group = ap.add_mutually_exclusive_group()
+    group.add_argument("--backfill-plan", action="store_true",
+                       help="print the read-only backfill plan and exit")
     ap.add_argument("--json", action="store_true",
                     help="with --backfill-plan: machine-readable JSON")
-    ap.add_argument("--backfill-apply", nargs="+", metavar="PREFIX",
-                    help="insert the backfill row for each confirmed prefix"
-                         " (all-or-nothing; re-plans first; --db/--html must"
-                         " be given BEFORE this flag)")
+    group.add_argument("--backfill-apply", nargs="+", metavar="PREFIX",
+                       help="insert the backfill row for each confirmed"
+                            " prefix (all-or-nothing; re-plans first;"
+                            " --db/--html must be given BEFORE this flag;"
+                            " mutually exclusive with --backfill-plan)")
     args = ap.parse_args(argv)
     if args.backfill_apply:
         # Second layer, defence in depth, before the DB is opened: only the
