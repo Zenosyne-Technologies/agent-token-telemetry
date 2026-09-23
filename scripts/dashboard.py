@@ -19,7 +19,9 @@ reattaches instead of starting a duplicate.
 """
 import argparse
 import datetime
+import decimal
 import json
+import math
 import os
 import signal
 import socket
@@ -220,13 +222,17 @@ def fetch_price_warning(conn, models=None):
     :param models: precomputed result of
         :func:`report.fetch_models_without_own_price`, to avoid re-running it
         when the caller already has it; computed here when omitted.
-    :returns: list of ``{model, modelName, events, firstSeen, lastSeen, cost,
-        unpriced}`` dicts, ordered by model name; empty when every logged
-        model has its own price. ``unpriced`` is ``True`` only when NONE of
-        the model's events ever resolved to a pricing row (its cost is then
-        always 0.0, never an estimate); ``False`` means at least one event
-        resolved (family default or ancestor row) and ``cost`` is that
-        estimate.
+    :returns: list of ``{model, modelName, events, pricedEvents, firstSeen,
+        lastSeen, cost, unpriced}`` dicts, ordered by model name; empty when
+        every logged model has its own price. ``pricedEvents`` counts the
+        events that resolved to a pricing row (family default or ancestor
+        rate); ``cost`` is the estimate for exactly those events (the rest
+        contribute 0.0). ``unpriced`` is ``True`` only when NONE of the
+        model's events ever resolved (``pricedEvents == 0``, cost always 0.0,
+        never an estimate); ``False`` means at least one event resolved and
+        ``cost`` is that estimate — possibly for only some of the events
+        (``pricedEvents < events``: a "mixed" model whose earlier events
+        predate the row that prices its later ones).
     """
     if models is None:
         models = report.fetch_models_without_own_price(conn)
@@ -250,7 +256,8 @@ def fetch_price_warning(conn, models=None):
       ORDER BY m.name
     """
     return [{"model": r["model"], "modelName": _pretty_model(r["model"]),
-             "events": r["n"], "firstSeen": r["first_ts"], "lastSeen": r["last_ts"],
+             "events": r["n"], "pricedEvents": r["priced_n"] or 0,
+             "firstSeen": r["first_ts"], "lastSeen": r["last_ts"],
              "cost": r["cost"] or 0.0, "unpriced": (r["priced_n"] or 0) == 0}
             for r in conn.execute(sql, models)]
 
@@ -261,8 +268,7 @@ _WARN_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
 
 def _warn_date(ts):
     """``Mon D, YYYY`` for an epoch-seconds timestamp, in the server's local
-    timezone — matching dashboard.html's own (now-retired) client-side
-    ``fmtDate``. The dashboard is localhost-only (see the timeline bucketing
+    timezone. The dashboard is localhost-only (see the timeline bucketing
     comment above ``_bucket_start``), so the server's clock is the reader's
     clock; there is no cross-timezone reader to mislead."""
     d = datetime.datetime.fromtimestamp(ts)
@@ -275,19 +281,42 @@ def _warn_date_range(first_ts, last_ts):
     return f"{_warn_date(first_ts)} – {_warn_date(last_ts)}"
 
 
+def _js_round(d, places):
+    """Round a non-negative :class:`decimal.Decimal` to ``places`` decimals,
+    ties away from zero — the tie rule both of dashboard.html's number
+    formatters use (``Number.prototype.toFixed``'s "pick the larger n", and
+    ``toLocaleString``'s default ``halfExpand``). Python's own ``format``
+    rounds ties to even, which is why this exists."""
+    return d.quantize(decimal.Decimal(1).scaleb(-places),
+                      rounding=decimal.ROUND_HALF_UP)
+
+
 def _warn_usd(v):
-    """Cost text for the warning banner, matching dashboard.html's general
-    ``fmtUSD`` (thousands-grouped 2dp at/above $1, 3dp at/above 1 cent, else
-    4dp, ``$0.00`` for a falsy/zero value) so a model's cost here reads
-    identically to the same number anywhere else on the page."""
+    """Cost text for the warning banner, character-for-character what
+    dashboard.html's ``fmtUSD`` renders for the same number, so a model's
+    cost here reads identically to the page's "By model" bars, KPIs and
+    tables (tests/test_dashboard_client.py runs the page's real ``fmtUSD``
+    under node against this function to hold that).
+
+    ``fmtUSD`` is ``"$0.00"`` for a falsy value (0, NaN); at/above $1 it is
+    ``toLocaleString("en-US", {2dp})`` — thousands-grouped, rounding the
+    number's SHORTEST round-trip decimal (``repr``) half away from zero, so
+    1.305 -> "$1.31" even though the binary double is 1.30499…; at/above one
+    cent it is ``toFixed(3)`` and below that ``toFixed(4)`` — both of which
+    round the double's EXACT binary value, ties (only exactly-representable
+    ones, e.g. 0.0625) away from zero. Costs are never negative.
+
+    :param v: a cost in USD (``None`` reads as 0).
+    :returns: the display string, e.g. ``"$1,234.57"``, ``"$0.063"``.
+    """
     v = v or 0.0
-    if not v:
+    if not v or math.isnan(v):
         return "$0.00"
     if v >= 1:
-        return f"${v:,.2f}"
+        return f"${_js_round(decimal.Decimal(repr(v)), 2):,.2f}"
     if v >= 0.01:
-        return f"${v:.3f}"
-    return f"${v:.4f}"
+        return f"${_js_round(decimal.Decimal(v), 3):.3f}"
+    return f"${_js_round(decimal.Decimal(v), 4):.4f}"
 
 
 def _warn_events(n):
@@ -310,7 +339,11 @@ def build_price_warning(detail):
     NO event that ever resolved to any pricing row (``unpriced`` True — a
     non-Claude name, or a name matching no seeded family/ancestor prefix at
     all) is listed under "no price at all" with its cost stated as not
-    counted — never rendered as a misleading "$0.00 estimated".
+    counted — never rendered as a misleading "$0.00 estimated". A mixed
+    model (some events resolved, some did not) stays in the estimated group
+    — it DOES carry an estimate — but its cost text says what that figure
+    covers: ``"$2.70 for 1 priced event; 2 unpriced, not counted"``, so the
+    unpriced events are never silently summed as $0.
 
     :param detail: :func:`fetch_price_warning`'s return value.
     :returns: ``{heading, note, estimatedHeading, unpricedHeading, estimated,
@@ -330,12 +363,17 @@ def build_price_warning(detail):
             row["costText"] = "not counted"
             unpriced.append(row)
         else:
-            row["costText"] = _warn_usd(it["cost"])
+            priced, missing = it["pricedEvents"], it["events"] - it["pricedEvents"]
+            cost = _warn_usd(it["cost"])
+            row["costText"] = (cost if missing <= 0 else
+                               f"{cost} for {priced} priced "
+                               f"event{'' if priced == 1 else 's'}; "
+                               f"{missing} unpriced, not counted")
             estimated.append(row)
     total = len(estimated) + len(unpriced)
     return {
         "heading": (f"{total} model{'' if total == 1 else 's'} logged with no "
-                    "price of their own (all time)"),
+                    "price of their own (all time)."),
         "note": "Run /token-telemetry:pricing-update to refresh.",
         "estimatedHeading": "Priced at an estimated rate",
         "unpricedHeading": "No price at all",

@@ -332,7 +332,7 @@ class TestDashboardData(unittest.TestCase):
         self.assertEqual(row["costText"], "$6.38")
         self.assertEqual(row["costText"], dashboard._warn_usd(expected_cost))
         self.assertEqual(pw["heading"],
-                          "1 model logged with no price of their own (all time)")
+                          "1 model logged with no price of their own (all time).")
         self.assertEqual(pw["estimatedHeading"], "Priced at an estimated rate")
 
     def test_price_warning_banner_splits_estimated_and_unpriced_groups(self):
@@ -364,7 +364,7 @@ class TestDashboardData(unittest.TestCase):
         self.assertEqual(unp["eventsText"], "1 event")
         self.assertEqual(unp["costText"], "not counted")
         self.assertEqual(pw["heading"],
-                          "2 models logged with no price of their own (all time)")
+                          "2 models logged with no price of their own (all time).")
         self.assertEqual(pw["estimatedHeading"], "Priced at an estimated rate")
         self.assertEqual(pw["unpricedHeading"], "No price at all")
 
@@ -384,6 +384,151 @@ class TestDashboardData(unittest.TestCase):
         conn.close()
         self.assertEqual(d["priceWarning"]["estimated"], [])
         self.assertEqual(d["priceWarning"]["unpriced"], [])
+
+    def _add_price_row(self, prefix, effective_from, provider="anthropic"):
+        rw = capture.connect(self.db)
+        with rw:
+            rw.execute(
+                "INSERT INTO pricing(provider, model_prefix, in_usd, out_usd,"
+                " cache_r_usd, cache_w_usd, cache_w_1h_usd, effective_from,"
+                " source) VALUES (?, ?, 2.0, 6.0, 0.2, 2.5, NULL, ?, 'test')",
+                (provider, prefix, effective_from))
+        rw.close()
+
+    def test_price_warning_mixed_model_states_what_its_cost_covers(self):
+        # N1: 'mistral-large-2' has 3 events; its ancestor row
+        # 'mistral-large' only takes effect after the first two, so 2 events
+        # are unpriced and 1 is priced at the ancestor (estimated) rate. It
+        # stays in the ESTIMATED group (it does carry an estimate), but the
+        # cost text must say the figure covers 1 event and the other 2 are
+        # not counted — never a bare "$X" that silently sums them as $0.
+        now = int(time.time())
+        for i, age in enumerate((20, 15, 1)):
+            self._insert("/proj", "s1", model="mistral-large-2", inp=1000000,
+                         out=0, cr=0, cw=0, cw1h=0, mid=f"x{i}",
+                         ts=iso(now - age * 86400))
+        self._add_price_row("mistral-large", now - 10 * 86400, provider="mistral")
+        conn = self._ro()
+        d = dashboard.build_data(conn, {"period": ["week"]})
+        conn.close()
+        detail = {r["model"]: r for r in d["modelsWithoutOwnPriceDetail"]}
+        self.assertEqual(detail["mistral-large-2"]["events"], 3)
+        self.assertEqual(detail["mistral-large-2"]["pricedEvents"], 1)
+        self.assertFalse(detail["mistral-large-2"]["unpriced"])
+        self.assertAlmostEqual(detail["mistral-large-2"]["cost"], 2.0, places=9)
+        pw = d["priceWarning"]
+        self.assertEqual(pw["unpriced"], [])
+        self.assertEqual([r["model"] for r in pw["estimated"]], ["mistral-large-2"])
+        row = pw["estimated"][0]
+        self.assertEqual(row["eventsText"], "3 events")
+        self.assertEqual(row["costText"],
+                         "$2.00 for 1 priced event; 2 unpriced, not counted")
+
+    def test_price_warning_mixed_cost_text_plurals(self):
+        pw = dashboard.build_price_warning([{
+            "model": "m", "modelName": "m", "events": 5, "pricedEvents": 2,
+            "firstSeen": 1, "lastSeen": 2, "cost": 0.5, "unpriced": False}])
+        self.assertEqual(pw["estimated"][0]["costText"],
+                         "$0.500 for 2 priced events; 3 unpriced, not counted")
+        self.assertEqual(pw["estimated"][0]["eventsText"], "5 events")
+
+    def test_price_warning_events_text_counts_plural_exactly(self):
+        # M2b: pin n > 1, not just "1 event".
+        now = int(time.time())
+        for i in range(3):
+            self._insert("/proj", "s1", model="claude-sonnet-5", inp=100,
+                         out=50, cr=0, cw=0, cw1h=0, mid=f"p{i}", ts=iso(now - i))
+        conn = self._ro()
+        d = dashboard.build_data(conn, {"period": ["week"]})
+        conn.close()
+        self.assertEqual(d["priceWarning"]["estimated"][0]["eventsText"], "3 events")
+        self.assertEqual(dashboard._warn_events(0), "0 events")
+        self.assertEqual(dashboard._warn_events(1), "1 event")
+        self.assertEqual(dashboard._warn_events(2), "2 events")
+        self.assertEqual(dashboard._warn_events(12), "12 events")
+
+    def test_price_warning_is_all_time_and_includes_backlog_capture_events(self):
+        # M11: the warning's scope is ALL events of the model — outside the
+        # requested window and including 'backlog-capture' roll-ups, which
+        # every dashboard window itself excludes. A model whose only events
+        # are backlog roll-ups from long ago must still be listed, counted
+        # and priced.
+        now = int(time.time())
+        old = now - 400 * 86400
+        conn = capture.connect(self.db)
+        with conn:
+            capture.insert_events(conn, "/proj", "s9", 0, None, capture.aggregate([
+                entry(model="claude-opus-5-5", inp=1000000, out=0, cr=0, cw=0,
+                      cw1h=0, mid="b1", ts=iso(old))]), note="backlog-capture")
+            capture.insert_events(conn, "/proj", "s9", 0, None, capture.aggregate([
+                entry(model="claude-opus-5-5", inp=1000000, out=0, cr=0, cw=0,
+                      cw1h=0, mid="b2", ts=iso(now))]), note="backlog-capture")
+        conn.close()
+        conn = self._ro()
+        d = dashboard.build_data(conn, {"period": ["day"]})
+        conn.close()
+        self.assertEqual(d["kpis"]["events"], 0)            # the window excludes them
+        self.assertEqual(d["modelsWithoutOwnPrice"], ["claude-opus-5-5"])
+        row = {r["model"]: r for r in d["modelsWithoutOwnPriceDetail"]}["claude-opus-5-5"]
+        self.assertEqual(row["events"], 2)
+        self.assertEqual((row["firstSeen"], row["lastSeen"]), (old, now))
+        self.assertAlmostEqual(row["cost"], 2 * 5.0, places=9)  # opus family in_usd 5
+        est = d["priceWarning"]["estimated"][0]
+        self.assertEqual(est["eventsText"], "2 events")
+        self.assertEqual(est["costText"], "$10.00")
+        self.assertEqual(est["dateRangeText"],
+                         f"{dashboard._warn_date(old)} – {dashboard._warn_date(now)}")
+
+    def test_price_warning_cost_equals_the_pages_by_model_cost(self):
+        # The banner's SQL cost must be the same arithmetic the rest of the
+        # page uses (fetch_rows: a NULL rate on a resolved row prices that
+        # token class at 0, the other classes still count). Pinned with a
+        # resolved ancestor row whose in_usd is NULL, plus a family-default
+        # model, against byModel over the same all-in-window events.
+        now = int(time.time())
+        self._insert("/proj", "s1", model="claude-sonnet-5", inp=100000,
+                     out=50000, cr=10000, cw=5000, cw1h=5000, mid="c1", ts=iso(now))
+        self._insert("/proj", "s1", model="acme-big-2", inp=1000000,
+                     out=100000, cr=20000, cw=10000, cw1h=4000, mid="c2", ts=iso(now))
+        rw = capture.connect(self.db)
+        with rw:
+            rw.execute(
+                "INSERT INTO pricing(provider, model_prefix, in_usd, out_usd,"
+                " cache_r_usd, cache_w_usd, cache_w_1h_usd, effective_from,"
+                " source) VALUES ('acme', 'acme-big', NULL, 10.0, 1.0, 2.0,"
+                " 4.0, 1, 'test-null-in')")
+        rw.close()
+        conn = self._ro()
+        d = dashboard.build_data(conn, {"period": ["year"]})
+        conn.close()
+        by_model = {g["key"]: g["cost"] for g in d["byModel"]}
+        detail = {r["model"]: r for r in d["modelsWithoutOwnPriceDetail"]}
+        self.assertEqual(set(detail), {"claude-sonnet-5", "acme-big-2"})
+        # acme: out 100000*10 + cache_r 20000*1 + 6000*2 + 4000*4 = 1.048
+        self.assertAlmostEqual(detail["acme-big-2"]["cost"], 1.048, places=9)
+        for model, row in detail.items():
+            self.assertAlmostEqual(row["cost"], by_model[model], places=9, msg=model)
+            self.assertEqual(row["pricedEvents"], 1, model)
+
+    def test_warn_usd_rounds_like_the_page_on_ties(self):
+        # N2: the page's fmtUSD (toLocaleString, halfExpand on the shortest
+        # decimal) renders 1.305 as "$1.31"; the banner must too. Below $1 it
+        # is toFixed — exact binary value, exact ties away from zero.
+        # tests/test_dashboard_client.py cross-checks against the real fmtUSD.
+        self.assertEqual(dashboard._warn_usd(1.305), "$1.31")
+        self.assertEqual(dashboard._warn_usd(1.005), "$1.01")
+        self.assertEqual(dashboard._warn_usd(2.675), "$2.68")
+        self.assertEqual(dashboard._warn_usd(1234.565), "$1,234.57")
+        self.assertEqual(dashboard._warn_usd(0.0625), "$0.063")
+        self.assertEqual(dashboard._warn_usd(0.0115), "$0.011")   # exact 0.01149…
+        self.assertEqual(dashboard._warn_usd(0.0145), "$0.015")   # exact 0.01450…
+        self.assertEqual(dashboard._warn_usd(0.00005), "$0.0001")
+        # just BELOW a half-cent boundary stays below (no rounding nudge)
+        self.assertEqual(dashboard._warn_usd(1.3049999999), "$1.30")
+        self.assertEqual(dashboard._warn_usd(999.9949999999), "$999.99")
+        self.assertEqual(dashboard._warn_usd(0), "$0.00")
+        self.assertEqual(dashboard._warn_usd(None), "$0.00")
+        self.assertEqual(dashboard._warn_usd(float("nan")), "$0.00")
 
 
 # --- timeline bucketing (v0.11.0: per-bucket columns, not a running total) ---
@@ -592,6 +737,11 @@ class TestBackendBanner(unittest.TestCase):
 
 
 # --- own-price warning renderer structure (AOS-135 S3, F2b) ---------------
+#
+# A cheap first line only: a text scan of one function cannot see a helper
+# defined elsewhere, bracket access, or a sink elsewhere on the render path.
+# The GATE is tests/test_dashboard_client.py, which executes the page's real
+# script under node against a fake DOM that throws on every such write.
 #
 # dashboard.html's renderPriceWarning() must build every node with
 # createElement/textContent and never touch innerHTML/insertAdjacentHTML/

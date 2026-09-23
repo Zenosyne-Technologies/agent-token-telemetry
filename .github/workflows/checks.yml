@@ -41,6 +41,10 @@ jobs:
       PGDATABASE: postgres
       # UTC so date(ts,'localtime') aligns across both dialects.
       TZ: UTC
+      # tests/test_dashboard_client.py runs dashboard.html's real script under
+      # node; locally it skips without node, here a missing node FAILS so the
+      # client-behaviour gate can never silently skip in CI.
+      TOKEN_TELEMETRY_REQUIRE_NODE: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -49,5 +53,7 @@ jobs:
           python-version: "3.12"
       - name: Install Postgres client tools (psql/createdb/dropdb)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+      - name: Node.js on PATH (runner image ships it; the dashboard client tests need it)
+        run: node --version
       - name: Run the test suite (incl. the SQLite<->Postgres equivalence tests)
         run: python3 -m unittest discover -s tests

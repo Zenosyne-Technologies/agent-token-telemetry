@@ -602,10 +602,6 @@
   const longWindow=()=> state.period!=="day";
   const MONTHS=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
   function fmtTime(ts){ const d=new Date(ts*1000); return longWindow()? (pad(d.getMonth()+1)+"/"+pad(d.getDate())) : (pad(d.getHours())+":"+pad(d.getMinutes())); }
-  // Absolute calendar date, independent of the period filter — used where a
-  // timestamp can predate the current window (e.g. the price-warning banner's
-  // all-time first/last seen).
-  function fmtDate(ts){ const d=new Date(ts*1000); return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`; }
   // Timeline axis/tooltip labels follow the server's bucket grain.
   function fmtGrain(ts, grain){ const d=new Date(ts*1000);
     return grain==="month" ? `${MONTHS[d.getMonth()]} ${d.getFullYear()}`
