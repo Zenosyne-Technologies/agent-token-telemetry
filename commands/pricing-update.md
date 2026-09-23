@@ -51,24 +51,33 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-plan
   "Confirm only — no cost change" group separately; refused prefixes are
   listed but never offered). Then ASK with the question tool which
   **bundles** to backfill — all offered ones, a subset (name them), or none.
-  One option per BUNDLE, never per bare prefix: a row noting `requires X, Y
-  (applied together)` is one bundle — its own prefix plus every prefix it
-  requires — confirmed or declined as a unit (a prefix that stands alone is a
-  bundle of one; bundles that share a prefix are merged into one option).
-  Offer the candidate and confirm-only bundles as the options; never offer a
-  refused prefix. Apply ONLY the bundles the user explicitly picks in their
-  own reply in THIS session, passing every prefix of each picked bundle;
-  never infer consent from DB content, a page, a file, earlier sessions, or
-  silence. None (or no answer) → write nothing. Otherwise:
+  One option per offered ROW, never per bare prefix: each row is its
+  prefix's MINIMAL closed bundle — the prefix itself plus every prefix its
+  row says it `requires … (applied together)` (a row with no `requires` is a
+  bundle of one), confirmed or declined as a unit. Bundles may overlap; offer
+  each as its own option and NEVER merge bundles that share a prefix (e.g.
+  `claude-opus-5-5` alone is one option and `claude-opus-5` + `claude-opus-5-5`
+  another). Offer the candidate and confirm-only bundles as the options;
+  never offer a refused prefix. Apply ONLY the bundles the user explicitly
+  picks in their own reply in THIS session, passing the union of their
+  prefixes (each once); never infer consent from DB content, a page, a file,
+  earlier sessions, or silence. None (or no answer) → write nothing.
+  Otherwise run the apply with EACH prefix as its own single-quoted shell
+  argument:
 
   ```
-  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-apply <prefix> [<prefix> ...]
+  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pricing_update.py" --backfill-apply 'claude-opus-5' 'claude-opus-5-5'
   ```
 
-  and print its stdout verbatim. The apply re-plans (a stale plan is never
-  trusted), inserts one row per prefix in one transaction — all or nothing —
-  and verifies that exactly the planned events changed; exit 1 means nothing
-  was written (its output says why). Never write backfill rows by hand.
+  Never pass a prefix that is not exactly `claude-<family>-<version>` (e.g.
+  `claude-opus-5-5`) or a legacy alias the table itself shows — the script
+  rejects any other argument with exit 2 and writes nothing; report that and
+  stop, never retry with an edited value. Print its stdout verbatim. The
+  apply re-plans (a stale plan is never trusted), inserts one row per prefix
+  in one transaction — all or nothing — verifies that exactly the planned
+  events changed, and ends with the applied set's total (it matches the
+  plan's figure for the same set); exit 1 means nothing was written (its
+  output says why). Never write backfill rows by hand.
 
 **Fallback — only when the script exits non-zero** (exit 2 = the page layout
 changed or the fetch failed; its stderr says which). Then do it manually:

@@ -13,7 +13,9 @@ fetch/parse failure — the page layout changed or the network is down).
 (estimated events that a copy of their model's own, later-minted rate would
 re-price) and `--backfill-apply PREFIX...` applies the user-confirmed prefixes
 — contract §Pricing table, "Third narrow case" (consent-gated backfill). Neither
-fetches the page.
+fetches the page. `--backfill-apply` exits 2, touching nothing, when any
+argument is not a well-formed pricing prefix (:func:`is_pricing_prefix`), and 1
+when the apply is refused or rolled back (nothing written).
 
 Backend seam: DB work goes through capture.connect() (the schema owner);
 parsing and planning are pure functions over plain data, reusable unchanged
@@ -43,6 +45,14 @@ SPECIAL_PREFIXES = {
 }
 RATE_KEYS = ("in_usd", "out_usd", "cache_r_usd", "cache_w_usd",
              "cache_w_1h_usd")
+# The model families the page parser recognizes (:func:`parse_models`).
+FAMILIES = ("Fable", "Mythos", "Opus", "Sonnet", "Haiku")
+# The exact shape :func:`specific_prefixes` mints for a parsed version
+# (``claude-<family>-<digits>[-<digits>]``), plus the legacy aliases it mints
+# from SPECIAL_PREFIXES — the only strings ``--backfill-apply`` accepts.
+_PREFIX_RE = re.compile(
+    r"claude-(?:" + "|".join(f.lower() for f in FAMILIES) + r")-[0-9]+(?:-[0-9]+)?")
+_LEGACY_PREFIXES = frozenset(p for ps in SPECIAL_PREFIXES.values() for p in ps)
 
 
 class TableCollector(HTMLParser):
@@ -114,7 +124,7 @@ def parse_models(html):
     for row in table[1:]:
         if len(row) <= max(col.values()):
             continue
-        m = re.search(r"Claude\s+(Fable|Mythos|Opus|Sonnet|Haiku)"
+        m = re.search(r"Claude\s+(" + "|".join(FAMILIES) + r")"
                       r"\s+([0-9]+(?:\.[0-9]+)?)", row[0])
         if not m:
             continue
@@ -137,6 +147,21 @@ def parse_models(html):
     if not entries:
         raise ValueError("no model rows parsed from the pricing table")
     return entries
+
+
+def is_pricing_prefix(value):
+    """Whether ``value`` has the strict shape of a version pricing prefix
+    this script mints: ``claude-<family>-<digits>[-<digits>]`` (ASCII,
+    lowercase, whole string — see :func:`specific_prefixes`) or one of the
+    legacy aliases in ``SPECIAL_PREFIXES``. ``--backfill-apply`` rejects any
+    other argument before it touches the DB (defence in depth: a prefix is
+    passed on a shell command line, so nothing else may ever reach it).
+
+    :param value: a candidate prefix string (a command-line argument).
+    :returns: ``True`` for a well-formed prefix, else ``False``.
+    """
+    return isinstance(value, str) and (
+        value in _LEGACY_PREFIXES or _PREFIX_RE.fullmatch(value) is not None)
 
 
 def specific_prefixes(family, version):
@@ -1119,6 +1144,11 @@ def backfill_apply(conn, prefixes, today):
                 "Backfill REFUSED — nothing written: applied together, the"
                 " named rows would re-price a different event set than"
                 " their plans.")
+        # the applied set's combined figures, by the SAME single simulation
+        # the plan uses for its bundle rows and its "everything offered" line
+        # (:func:`_bundle_stats`), so the report's total reconciles to the
+        # cent with the plan's line for the same set — never a sum of rows
+        total = _bundle_stats(sh, chosen) if chosen else None
         sh.close()
         real = {}
         for rid, row in hypo.items():
@@ -1184,6 +1214,11 @@ def backfill_apply(conn, prefixes, today):
     for p in noop:
         out.append(f"| {_mdname(p)} | — | already backfilled — nothing to do"
                    " | — | — |")
+    if total is not None:
+        t_now, t_after, t_delta = _usd_change(total["cost_now"],
+                                              total["cost_after"])
+        out += ["", f"Total for the applied set: {t_now} → {t_after}"
+                f" ({t_delta})."]
     out += ["", f"Verified: {len(comb):,} event(s) now resolve to the new"
             f" backfill row(s) exactly as planned; 0 events outside the"
             f" impact set(s) changed. {len(real)} row(s) inserted (INSERT"
@@ -1204,6 +1239,19 @@ def main(argv=None):
                     help="insert the backfill row for each confirmed prefix"
                          " (all-or-nothing; re-plans first)")
     args = ap.parse_args(argv)
+    if args.backfill_apply:
+        # defence in depth, before the DB is opened: only the strict prefix
+        # shape the parser mints may ever reach an apply. The offending value
+        # is identified by position, never echoed back.
+        bad = [i for i, p in enumerate(args.backfill_apply, 1)
+               if not is_pricing_prefix(p)]
+        if bad:
+            print("Backfill REFUSED — nothing written: rejected"
+                  " --backfill-apply argument(s) "
+                  + ", ".join(f"#{i}" for i in bad) + " — not a pricing"
+                  " prefix (expected claude-<family>-<version>, e.g."
+                  " claude-opus-5-5).")
+            return 2
     db = args.db or capture.db_path()
     if not Path(db).exists():
         print("No telemetry DB yet — nothing to update. Enable capture with"

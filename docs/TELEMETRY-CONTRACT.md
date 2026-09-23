@@ -271,7 +271,9 @@ estimated event P is the own row for. The plan is read-only; it lists every even
 resolved row would change (other models sharing the prefix included, under their own
 names), the window and its span, and cost now → after. `--backfill-apply <prefix>...`
 re-plans, writes all named rows in one transaction or none, and verifies that exactly
-the planned events changed, rolling back otherwise. This is not a history rewrite: it
+the planned events changed, rolling back otherwise; it accepts only arguments of the
+strict prefix shape the parser mints (`claude-<family>-<version>` or a legacy alias),
+rejecting anything else with exit 2 before the DB is opened. This is not a history rewrite: it
 replaces an ESTIMATE — a family-default or ancestor rate that was never that model's
 own published rate — with the model's own published rate, only for events that were
 estimated, only with the user's explicit consent in the interactive

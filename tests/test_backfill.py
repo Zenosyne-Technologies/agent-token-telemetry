@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -307,12 +308,12 @@ class TestSharedPrefix(Base):
     def test_all_or_nothing_with_an_invalid_prefix(self):
         rows, res = self.f.pricing_rows(), self.f.resolved()
         with self.assertRaises(pricing_update.BackfillRefused) as cm:
-            self.f.apply("claude-opus-5", "claude-opus-5-5", "claude-nope-1")
-        self.assertIn("claude-nope-1", cm.exception.args[0])
+            self.f.apply("claude-opus-5", "claude-opus-5-5", "claude-haiku-9")
+        self.assertIn("claude-haiku-9", cm.exception.args[0])
         self.assertEqual(self.f.pricing_rows(), rows)
         self.assertEqual(self.f.resolved(), res)
         code, out = self.f.cli("--backfill-apply", "claude-opus-5",
-                               "claude-nope-1")
+                               "claude-haiku-9")
         self.assertEqual(code, 1)
         self.assertIn("REFUSED", out)
         self.assertEqual(self.f.pricing_rows(), rows)
@@ -717,18 +718,247 @@ class TestHostileNamesRender(Base, GfmAssertions):
         data = json.loads(js)
         offered = [c["prefix"] for c in data["candidates"]
                    + data["confirm_only"]]
-        code, out = self.f.cli("--backfill-apply", *offered)
-        self.assertEqual(code, 0, out)
+        # hostile prefixes never pass the CLI's argument check (exit 2), so
+        # the renderer is exercised through the function itself
+        out = self.f.apply(*offered)
         self.assert_structurally_safe(out, expect_markers=[
             "INJA", "INJH", "INJP", "INJR"])
         # refused + unknown hostile prefix: plain list lines, no table
-        code, out = self.f.cli("--backfill-apply", "claude-haiku-5-1",
-                               "claude-bogus \\| **INJV** `x`")
-        self.assertEqual(code, 1)
+        with self.assertRaises(pricing_update.BackfillRefused) as cm:
+            self.f.apply("claude-haiku-5-1", "claude-bogus \\| **INJV** `x`")
+        out = cm.exception.args[0]
         for line in out.splitlines():
             self.assertNotIn(self.MARK, code_spans(line)[1], line)
         self.assertIn("INJT", out)
         self.assertIn("INJV", out)
+
+
+def _cmark_row_cells(row):
+    """Independent GFM table-row cell counter (ported from the completion
+    validator's cmark-gfm scanner, NOT the helper above): a backslash plus
+    the next character is one pair, an unescaped ``|`` is a delimiter, and a
+    cell's ``\\|`` becomes a literal ``|`` after the split."""
+    s = row.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    out, cur, i = [], "", 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s):
+            cur += s[i:i + 2]
+            i += 2
+            continue
+        if ch == "|":
+            out.append(cur)
+            cur, i = "", i + 1
+            continue
+        cur += ch
+        i += 1
+    if cur.strip():
+        out.append(cur)
+    return [c.replace("\\|", "|") for c in out]
+
+
+def _cmark_split_code(text):
+    """``(spans, outside)`` per CommonMark (ported from the validator): a
+    backtick run opens a code span only when a run of the same length closes
+    it; an escaped backtick outside a span is literal."""
+    spans, outside, i = [], "", 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text) and text[i + 1] == "`":
+            outside += text[i:i + 2]
+            i += 2
+            continue
+        if text[i] == "`":
+            n = len(re.match(r"`+", text[i:]).group(0))
+            m = re.compile(r"(?<!`)`{%d}(?!`)" % n).search(text, i + n)
+            if m:
+                spans.append(text[i + n:m.start()])
+                outside += "<C>"
+                i = m.end()
+                continue
+            outside += "`" * n
+            i += n
+            continue
+        outside += text[i]
+        i += 1
+    return spans, outside
+
+
+# The renderer's own bold is only ever a signed dollar delta.
+_DELTA_BOLD = re.compile(r"\*\*[+-]?\$[0-9,]+\.[0-9]+\*\*")
+
+
+def _hx(tag):
+    """A maximally hostile name fragment carrying marker ``tag``: backtick
+    spans, a single- and a double-backslash pipe, bold, a link, a newline
+    and U+202E — every way a raw name could split a cell or escape its
+    code span."""
+    return (f"`{tag}`\\|\\\\|**{tag}**[{tag}](u)\n"
+            f"\u202e{tag}``")
+
+
+# predecessor candidate prefix, its successor (an ANCESTOR-shaped extension,
+# so the predecessor needs it: "requires" + overlaps), and a refused prefix
+# whose unclosable successor model is named in the refusal reason
+E2E_PRED = "claude-fable-5 " + _hx("INJP")
+E2E_SUCC = E2E_PRED + "-5-" + _hx("INJS")
+E2E_PRED_MODEL = E2E_PRED + " " + _hx("INJM")
+E2E_SUCC_MODEL = E2E_SUCC + "x"
+E2E_REF = "claude-sonnet-5 " + _hx("INJR")
+E2E_REF_MODEL = E2E_REF + " u"
+E2E_REF_BLOCK = E2E_REF + "-9-" + _hx("INJB")
+E2E_UNKNOWN = "claude-opus-9 " + _hx("INJU")
+
+
+class TestHostileNameEveryRenderPath(Base):
+    """F1 end to end: ONE fixture whose hostile names reach every place the
+    backfill renders a name — candidate prefix, per-model impact list
+    (successor included), "requires" cell, overlaps note, refused prefix and
+    reason, the all-refused plan, and the apply report (table rows, no-op
+    rows, bad/refused list, F2 closure refusal, insert-collision refusal) —
+    parsed with independent GFM rules: every table row has its header's
+    width, every name sits inside a code span, and no bold/link syntax exists
+    outside one. Each of the 13 ``_mdname`` call sites fails this test when
+    it emits a raw code span instead."""
+
+    def setUp(self):
+        super().setUp()
+        f = self.f
+        for n in (E2E_PRED, E2E_SUCC, E2E_PRED_MODEL, E2E_SUCC_MODEL,
+                  E2E_REF, E2E_REF_MODEL, E2E_REF_BLOCK, E2E_UNKNOWN):
+            self.assertLess(len(n), report.MD_CELL_MAX, n)   # markers survive
+        f.price("claude-fable-", FAM_OPUS, D - 30 * DAY)
+        f.price(E2E_PRED, OPUS_55, D + 20 * DAY)
+        f.price(E2E_SUCC, (2.0, 10.0, 0.2, 2.5, 4.0), D + 20 * DAY)
+        f.event(E2E_PRED_MODEL, D + DAY)
+        f.event(E2E_SUCC_MODEL, D + 3 * DAY)
+        f.price("claude-sonnet-", FAM_OPUS, D - 30 * DAY)
+        f.price(E2E_REF, OPUS_55, D + 20 * DAY)
+        f.event(E2E_REF_MODEL, D + DAY)
+        f.event(E2E_REF_BLOCK, D + 2 * DAY)
+
+    def check(self, md, tags):
+        """Assert ``md`` is structurally safe; return the code-span texts."""
+        self.assertNotIn("\u202e", md)
+        spans_all, hdr, tables = [], None, 0
+        for ln, line in enumerate(md.split("\n"), 1):
+            if line.startswith("|"):
+                cells = _cmark_row_cells(line)
+                if hdr is None:
+                    hdr, tables = len(cells), tables + 1
+                self.assertEqual(len(cells), hdr, (ln, line))
+                parts = cells
+            else:
+                hdr, parts = None, [line]
+            for part in parts:
+                spans, outside = _cmark_split_code(part)
+                spans_all += spans
+                self.assertNotIn("INJ", outside, (ln, line))
+                self.assertNotIn("`", outside, (ln, line))
+                rest = _DELTA_BOLD.sub("", outside)
+                self.assertNotIn("**", rest, (ln, line))
+                self.assertNotRegex(rest, r"\]\(|<https?:|<a\b", (ln, line))
+        for t in tags:
+            self.assertTrue(any(t in sp for sp in spans_all),
+                            f"{t} not rendered inside a code span:\n{md}")
+        return tables
+
+    def refusal(self, *prefixes):
+        rows = self.f.pricing_rows()
+        with self.assertRaises(pricing_update.BackfillRefused) as cm:
+            self.f.apply(*prefixes)
+        self.assertEqual(self.f.pricing_rows(), rows)   # nothing written
+        return cm.exception.args[0]
+
+    def test_every_name_render_path(self):
+        f = self.f
+        plan = f.plan()
+        by = {c["prefix"]: c for c in plan["candidates"]}
+        self.assertEqual(set(by), {E2E_PRED, E2E_SUCC})
+        self.assertEqual(by[E2E_PRED]["requires"], [E2E_SUCC])
+        self.assertEqual(by[E2E_PRED]["overlaps"], [E2E_SUCC])
+        self.assertEqual([c["prefix"] for c in plan["refused"]], [E2E_REF])
+        # 1. the mixed plan: prefix cells, per-model lists (successor model
+        # in the predecessor's row), requires cell, overlaps notes, refused
+        # prefix + reason
+        code, md = f.cli("--backfill-plan")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.check(md, [
+            "INJP", "INJS", "INJM", "INJR", "INJB"]), 1)
+        row = next(ln for ln in md.split("\n") if ln.startswith("|")
+                   and " — requires " in ln)
+        spans = _cmark_split_code(_cmark_row_cells(row)[0])[0]
+        self.assertEqual(len(spans), 2, row)          # prefix + requires
+        self.assertIn("INJS", spans[1])
+        self.assertTrue(any("overlaps" in c and "INJS" in
+                            "".join(_cmark_split_code(c)[0])
+                            for c in _cmark_row_cells(row)), row)
+        # 2. apply refusals (nothing written): refused + unknown prefix
+        # (bad list with the refused reason), F2 closure (predecessor names
+        # its successor), and an insert collision (a trigger swallows the
+        # INSERT, so the row "already exists")
+        self.check(self.refusal(E2E_REF, E2E_UNKNOWN),
+                   ["INJR", "INJB", "INJU"])
+        self.check(self.refusal(E2E_PRED), ["INJP", "INJS"])
+        f.conn.execute("CREATE TEMP TRIGGER swallow BEFORE INSERT ON"
+                       " main.pricing BEGIN SELECT RAISE(IGNORE); END")
+        msg = self.refusal(E2E_PRED, E2E_SUCC)
+        f.conn.execute("DROP TRIGGER temp.swallow")
+        self.assertIn("already exists", msg)
+        self.check(msg, ["INJP"])
+        # 3. the apply report table: prefixes and per-model names
+        out = f.apply(E2E_PRED, E2E_SUCC)
+        self.assertEqual(self.check(out, [
+            "INJP", "INJS", "INJM"]), 1)
+        self.assertIn("Total for the applied set:", out)
+        # 4. no-op rows for already-backfilled prefixes
+        out = f.apply(E2E_PRED, E2E_SUCC)
+        self.assertEqual(out.count("already backfilled"), 2, out)
+        self.assertEqual(self.check(out, ["INJP", "INJS"]), 1)
+        # 5. the all-refused plan: header path, refused prefix + reason
+        code, md = f.cli("--backfill-plan")
+        self.assertEqual(code, 0)
+        self.assertTrue(md.startswith("No backfill can be offered"), md)
+        self.check(md, ["INJR", "INJB"])
+
+
+class TestApplyArgumentShape(Base):
+    """Defence in depth: ``--backfill-apply`` accepts only the strict prefix
+    shape the parser mints and rejects anything else with exit 2 before the
+    DB is opened — nothing written, the value not echoed."""
+
+    def setUp(self):
+        super().setUp()
+        self.f.price("claude-opus-", FAM_OPUS, D - 30 * DAY)
+        self.f.price("claude-opus-5-5", OPUS_55, D + DAY)
+        self.f.event("claude-opus-5-5", D + 60)
+
+    def test_shell_metacharacter_prefix_is_rejected_nothing_written(self):
+        evil = "claude-opus-5-5'; touch /tmp/pwned #"
+        before = (self.f.digest(), self.f.pricing_rows())
+        code, out = self.f.cli("--backfill-apply", "claude-opus-5-5", evil)
+        self.assertEqual(code, 2, out)
+        self.assertIn("rejected --backfill-apply argument(s) #2", out)
+        self.assertNotIn("touch", out)
+        self.assertEqual((self.f.digest(), self.f.pricing_rows()), before)
+        # the well-formed prefix alone applies
+        code, out = self.f.cli("--backfill-apply", "claude-opus-5-5")
+        self.assertEqual(code, 0, out)
+
+    def test_only_the_minted_shapes_pass(self):
+        ok = pricing_update.is_pricing_prefix
+        for v in ("claude-opus-5-5", "claude-opus-5", "claude-sonnet-4-5",
+                  "claude-mythos-1", "claude-opus-4-2025", "claude-3-5-haiku",
+                  "claude-opus-4-0"):
+            self.assertTrue(ok(v), v)
+        for v in ("claude-opus-", "claude-opus-5-5\n", "claude-opus-5-5 ",
+                  "Claude-opus-5", "claude-opus-5-5-1", "claude-gpt-5",
+                  "claude-opus-5-5;id", "claude-opus-5-5$(id)", "",
+                  "claude-opus-٥", "-claude-opus-5"):
+            self.assertFalse(ok(v), repr(v))
+        code, out = self.f.cli("--backfill-apply", "claude-3-5-haiku")
+        self.assertEqual(code, 1, out)   # well-formed, just not a candidate
 
 
 class TestBundleClosure(Base):
@@ -789,6 +1019,41 @@ class TestBundleClosure(Base):
         rates = {"claude-opus-5": FAM_OPUS, "claude-opus-5-5": OPUS_55}
         real = sum(ev_cost(rates[p]) for p, _eff in self.f.resolved().values())
         self.assertAlmostEqual(real, cb["cost_after"])
+
+    def test_each_minimal_closed_bundle_is_offered_on_its_own_row(self):
+        # overlapping bundles are NOT merged: the successor alone is a valid
+        # (closed) bundle, and predecessor + successor is another
+        plan = self.f.plan()
+        bundles = sorted(sorted([c["prefix"], *c["requires"]])
+                         for c in plan["candidates"] + plan["confirm_only"])
+        self.assertEqual(bundles, [["claude-opus-5", "claude-opus-5-5"],
+                                   ["claude-opus-5-5"]])
+        _, md = self.f.cli("--backfill-plan")
+        rows = [ln.split(" | ")[0] for ln in md.split("\n")
+                if ln.startswith("| `claude-opus")]
+        self.assertEqual(rows, [
+            "| `claude-opus-5` — requires `claude-opus-5-5` (applied together)",
+            "| `claude-opus-5-5`"])
+        # the one-prefix bundle applies on its own; the predecessor then
+        # stands alone
+        code, out = self.f.cli("--backfill-apply", "claude-opus-5-5")
+        self.assertEqual(code, 0, out)
+        by = {c["prefix"]: c for c in self.f.plan()["candidates"]}
+        self.assertEqual(by["claude-opus-5"]["requires"], [])
+
+    def test_apply_total_matches_the_plan_line_for_the_same_set(self):
+        _, md = self.f.cli("--backfill-plan")
+        line = next(ln for ln in md.split("\n")
+                    if ln.startswith("If you apply everything offered: "))
+        figures = line[len("If you apply everything offered: "):]
+        bundle = next(ln for ln in md.split("\n")
+                      if ln.startswith("| `claude-opus-5` — requires"))
+        now_after = figures.split(" (")[0]
+        self.assertIn(f"| {now_after} |", bundle)   # same set, same figures
+        code, out = self.f.cli("--backfill-apply", "claude-opus-5",
+                               "claude-opus-5-5")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"\nTotal for the applied set: {figures}\n", out)
 
     def test_apply_predecessor_alone_is_refused_naming_the_successor(self):
         rows, res = self.f.pricing_rows(), self.f.resolved()
@@ -962,6 +1227,43 @@ class TestShownFiguresReconcile(Base):
         self.assertNotIn("2.22", md)
         _, out = self.f.cli("--backfill-apply", "claude-opus-5-5")
         self.assertIn("| $12.35 → $10.12 | **-$2.23** |", out)
+
+
+class TestApplyTotalReconciles(Base):
+    """INFO 4: the apply report's total line is the applied set's single
+    combined simulation, displayed like the plan's line — it reconciles to
+    the cent with the plan's figure for the same set even where summing the
+    per-row (individually rounded) figures would be a cent or two off."""
+
+    def test_total_is_the_combined_figure_not_the_sum_of_rows(self):
+        own = (4.1, 20.0, 0.2, 5.0, 8.0)
+        tok = (2_469_200, 0, 0, 0, 0)
+        for fam, prefix in (("claude-opus-", "claude-opus-5-5"),
+                            ("claude-sonnet-", "claude-sonnet-5")):
+            self.f.price(fam, FAM_OPUS, D - 30 * DAY)
+            self.f.price(prefix, own, D + DAY)
+            self.f.event(prefix, D + 60, tok=tok)
+        # each row: $12.346 -> $10.12372, shown $12.35 -> $10.12 (-$2.23);
+        # rows sum to -$4.46, the set is $24.692 -> $20.24744 (-$4.44)
+        _, md = self.f.cli("--backfill-plan")
+        self.assertEqual(md.count("| $12.35 → $10.12 | **-$2.23** |"), 2, md)
+        self.assertIn("If you apply everything offered: $24.69 → $20.25"
+                      " (-$4.44).", md)
+        code, out = self.f.cli("--backfill-apply", "claude-opus-5-5",
+                               "claude-sonnet-5")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count("| $12.35 → $10.12 | **-$2.23** |"), 2)
+        self.assertIn("Total for the applied set: $24.69 → $20.25 (-$4.44).",
+                      out)
+
+    def test_no_total_line_when_every_prefix_is_a_noop(self):
+        self.f.price("claude-opus-", FAM_OPUS, D - 30 * DAY)
+        self.f.price("claude-opus-5-5", OPUS_55, D + DAY)
+        self.f.event("claude-opus-5-5", D + 60)
+        self.f.apply("claude-opus-5-5")
+        out = self.f.apply("claude-opus-5-5")
+        self.assertIn("already backfilled", out)
+        self.assertNotIn("Total for the applied set", out)
 
 
 class TestHumanSpan(unittest.TestCase):
