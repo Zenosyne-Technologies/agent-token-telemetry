@@ -169,7 +169,18 @@ class TableCollector(HTMLParser):
 
     def handle_endtag(self, tag):
         if tag in ("td", "th") and self._cell is not None:
-            self._row.append(" ".join("".join(self._cell).split()))
+            # Join text-node/element boundaries with a single space, THEN
+            # collapse/re-join on whitespace (AOS-151 security correction,
+            # N1 layer 1): a name cell built from several elements — e.g.
+            # ``<a>Claude Sonnet 5</a><span>1M-token…</span>`` — has no
+            # whitespace text node between the tags, so concatenating with
+            # ``""`` glued the tagline straight onto the version
+            # (``"...5" + "1M-token…"`` -> ``"...51M-token…"``). Joining
+            # with ``" "`` first guarantees a boundary space between every
+            # pair of text pieces; the ``.split()``/``" ".join`` pass still
+            # collapses any real multi-space runs within a single piece, so
+            # this changes nothing for a cell built from one text node.
+            self._row.append(" ".join(" ".join(self._cell).split()))
             self._cell = None
         elif tag == "tr" and self._row is not None:
             self._rows.append(self._row)
@@ -390,6 +401,44 @@ def _map_rate_columns(header, needles):
     return col
 
 
+# A data row's model name + version (AOS-151 security correction, N1/N2):
+# ``Claude <Family> <version>``, where the version is CAPPED at two
+# `.`-separated components of at most three digits each. The cap alone would
+# still let a longer/malformed version silently truncate to a well-formed-
+# looking prefix (e.g. ``9_9`` -> ``9``, or a 5,000-digit run -> its leading
+# three digits) — :func:`_version_boundary_ok` is what turns that truncation
+# into a refusal, by checking the character the grammar stopped at.
+_MODEL_NAME_RE = re.compile(
+    r"Claude\s+(" + "|".join(FAMILIES) + r")"
+    r"\s+([0-9]{1,3}(?:\.[0-9]{1,3})?)")
+
+
+def _version_boundary_ok(text, pos):
+    """Whether a model version :data:`_MODEL_NAME_RE` matched in ``text`` is
+    COMPLETE rather than truncated by the regex's capped grammar (AOS-151
+    security correction, N1/N2).
+
+    The character at ``text[pos]`` — immediately after the matched version
+    (:meth:`re.Match.end`) — must be end-of-text, whitespace, or punctuation
+    OTHER than ``.``, ``_`` or ``-``. It must never be a letter or a digit of
+    any script (checked with ``str.isalnum``, which also catches non-ASCII
+    digits) and never one of ``.``, ``_``, ``-``: each of those means the
+    real version continues past what the grammar captured — a tagline glued
+    onto the digits with no separating whitespace (``"...5" + "1M-token…"``),
+    a third ``.``-separated component, an extra digit run past the 3-digit
+    cap, or an underscore/hyphen-separated continuation (``9_9``).
+
+    :param text: the row's name-cell text (already collapsed to single
+        spaces by :class:`TableCollector`).
+    :param pos: the index right after the matched version.
+    :returns: ``True`` when the version is complete, else ``False``.
+    """
+    if pos >= len(text):
+        return True
+    ch = text[pos]
+    return not (ch.isalnum() or ch in "._-")
+
+
 def parse_models(html):
     """The model-pricing table -> ordered entries:
     {family, version, rates, condition: None|('through'|'starting', date)}.
@@ -415,12 +464,33 @@ def parse_models(html):
 
     entries = []
     for row in body:
-        if len(row) <= max(col.values()):
-            continue
-        m = re.search(r"Claude\s+(" + "|".join(FAMILIES) + r")"
-                      r"\s+([0-9]+(?:\.[0-9]+)?)", row[0])
+        # Match the model name FIRST (AOS-151 security correction, N4): a
+        # row with no ``Claude <Family> <version>`` cell is not a data row
+        # at all — e.g. a colspan-merged section heading such as the live
+        # page's single-cell "Additional models" divider — and is skipped,
+        # never subjected to the width check below.
+        m = _MODEL_NAME_RE.search(row[0])
         if not m:
             continue
+        if not _version_boundary_ok(row[0], m.end(2)):
+            raise PricingRefused(
+                "Pricing refresh REFUSED — nothing written: malformed model"
+                " version (a tagline glued onto the digits with no"
+                " separating whitespace, an extra version component past"
+                " the two-component cap, or a `._-`-joined continuation) in"
+                f" row: {_safe_error_text(row[0])}")
+        # A genuine data row's cell count must match the header's column
+        # count exactly (AOS-151 security correction, N4): a wider row (an
+        # extra cell) used to shift every rate one column silently, within
+        # bounds; a narrower row (e.g. a colspan merge) used to be skipped
+        # with no warning. Either shape is now refused rather than
+        # accepted-but-wrong or silently dropped.
+        if len(row) != len(header):
+            raise PricingRefused(
+                "Pricing refresh REFUSED — nothing written: data row width"
+                f" ({len(row)} cells) does not match the header's"
+                f" ({len(header)} cells) for Claude {m.group(1).title()}"
+                f" {m.group(2)}: {_safe_error_text(row[0])}")
         condition = None
         dm = re.search(r"(through|starting)\s+([A-Z][a-z]+ [0-9]{1,2}, [0-9]{4})",
                        row[0])
