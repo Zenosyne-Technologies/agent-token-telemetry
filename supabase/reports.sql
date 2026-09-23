@@ -291,7 +291,7 @@ BEGIN
     'by_model', (
       SELECT coalesce(jsonb_agg(
                jsonb_build_array(model_name, tier, i, o, cost, rate_from)
-               ORDER BY o DESC), '[]'::jsonb)
+               ORDER BY o DESC, model_name COLLATE pg_catalog."C"), '[]'::jsonb)
       FROM (
         SELECT model_name,
                CASE
@@ -333,7 +333,8 @@ BEGIN
       ) q),
     'by_tier', (
       SELECT coalesce(jsonb_agg(
-               jsonb_build_array(tier, i, o, n) ORDER BY o DESC), '[]'::jsonb)
+               jsonb_build_array(tier, i, o, n)
+               ORDER BY o DESC, tier COLLATE pg_catalog."C"), '[]'::jsonb)
       FROM (
         SELECT CASE
                  WHEN pe.model_name LIKE 'claude-fable-%'  THEN 'orchestrator'
@@ -394,11 +395,14 @@ BEGIN
         GROUP BY pe.model_name
       ) q),
     -- Models WITHOUT OWN PRICE, all-time (twin of report.py's
-    -- fetch_models_without_own_price): a model with at least one event and no
-    -- pricing row matching it (any effective_from) that is neither a family
-    -- default row nor an ancestor row for it, i.e. no report_model_pricing row
-    -- with `estimated` false. Sorted by byte order (COLLATE "C") to match
-    -- SQLite's BINARY ORDER BY. RLS scopes every table to the caller.
+    -- fetch_models_without_own_price): a model with at least one NON-ZERO-TOKEN
+    -- event (a model whose events are ALL zero-token — e.g. a synthetic
+    -- bookkeeping model with no input/output/cache tokens — has nothing to
+    -- price and is excluded) and no pricing row matching it (any
+    -- effective_from) that is neither a family default row nor an ancestor row
+    -- for it, i.e. no report_model_pricing row with `estimated` false. Sorted
+    -- by byte order (COLLATE "C") to match SQLite's BINARY ORDER BY. RLS scopes
+    -- every table to the caller.
     'models_without_own_price', (
       SELECT coalesce(
                pg_catalog.jsonb_agg(q.name ORDER BY q.name COLLATE pg_catalog."C"),
@@ -408,7 +412,9 @@ BEGIN
         FROM public.models m
         WHERE EXISTS (
                 SELECT 1 FROM public.events e
-                WHERE e.owner_id = m.owner_id AND e.model_name = m.name)
+                WHERE e.owner_id = m.owner_id AND e.model_name = m.name
+                  AND (e.in_tok <> 0 OR e.out_tok <> 0 OR e.cache_r <> 0
+                       OR e.cache_w <> 0))
           AND NOT EXISTS (
                 SELECT 1 FROM public.report_model_pricing mp
                 WHERE mp.owner_id = m.owner_id AND mp.model_name = m.name

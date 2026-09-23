@@ -122,15 +122,20 @@ def estimated_subquery():
 
 
 def fetch_models_without_own_price(conn):
-    """Model names that have at least one event and NO own pricing row: no
-    row whose prefix matches them (any ``effective_from``) that is neither a
-    family default row nor an ancestor row for that name
-    (``capture.is_estimated``). Every event of such a model prices at an
-    estimate or not at all. Sorted by name. Prefix matching is the resolver's
+    """Model names that have at least one NON-ZERO-TOKEN event and NO own
+    pricing row: no row whose prefix matches them (any ``effective_from``)
+    that is neither a family default row nor an ancestor row for that name
+    (``capture.is_estimated``). Every priceable event of such a model prices
+    at an estimate or not at all. A model whose events are ALL zero-token
+    (e.g. a synthetic bookkeeping model with no input/output/cache tokens) is
+    excluded: there is nothing of theirs to price, so naming them in the
+    footer would be noise. Sorted by name. Prefix matching is the resolver's
     own ``LIKE model_prefix || '%'``."""
     return [r[0] for r in conn.execute(
         "SELECT m.name FROM models m"
-        " WHERE EXISTS (SELECT 1 FROM events e WHERE e.model_id = m.id)"
+        " WHERE EXISTS (SELECT 1 FROM events e WHERE e.model_id = m.id"
+        "   AND (e.in_tok != 0 OR e.out_tok != 0 OR e.cache_r != 0"
+        "        OR e.cache_w != 0))"
         " AND NOT EXISTS (SELECT 1 FROM pricing pr"
         "   WHERE m.name LIKE pr.model_prefix || '%'"
         f"  AND NOT {capture.estimated_sql('m.name', 'pr.model_prefix')})"
@@ -210,7 +215,7 @@ ORDER BY classic_in + classic_out + cached_r + cached_w DESC, output DESC;
     return [dict(zip(STATS_KEYS, r)) for r in rows]
 
 
-def cost_notes(events, unpriced, estimated):
+def cost_notes(events, unpriced, estimated, require_estimated=False):
     """The qualifiers a cost figure carries, as a list of short phrases.
 
     Unpriced and estimated are different things and are reported separately,
@@ -229,11 +234,17 @@ def cost_notes(events, unpriced, estimated):
     :param unpriced: how many of them resolved to no pricing row.
     :param estimated: how many priced at a family default or ancestor row
         (capture.is_estimated).
+    :param require_estimated: when true, the unpriced phrase is withheld
+        unless the same figure also carries an estimated marker
+        (``estimated > 0``) — keeps the two only-distinguishable together
+        (``token-stats``, the scoped rollup); ``project-stats`` always shows
+        unpriced on its own and leaves this at the default ``False``.
     :returns: the phrases, in that order; empty when there is nothing to say.
     """
     events = events or 0
     notes = []
-    if unpriced and 0 < unpriced < events:
+    if (unpriced and 0 < unpriced < events
+            and (not require_estimated or (estimated and estimated > 0))):
         notes.append(f"{unpriced} of {events} events unpriced")
     if estimated and estimated > 0:
         if estimated >= events:
@@ -408,7 +419,8 @@ SELECT model_name,
        SUM(CASE WHEN estimated = 1 THEN 1 ELSE 0 END),
        COUNT(*),
        SUM(CASE WHEN rate_from IS NULL THEN 1 ELSE 0 END)
-FROM priced GROUP BY model_name ORDER BY SUM(out_tok) DESC;""").fetchall()
+FROM priced GROUP BY model_name
+ORDER BY SUM(out_tok) DESC, model_name;""").fetchall()
     # by_model keeps its 6-tuple shape (the renderer and the remote mapper
     # depend on it); the per-model estimated/event/unpriced counts ride
     # alongside.
@@ -435,7 +447,7 @@ FROM priced GROUP BY model_name ORDER BY SUM(out_tok) DESC;""").fetchall()
         " FROM events e JOIN models m ON m.id = e.model_id"
         " WHERE e.ts >= strftime('%s','now','-7 days')"
         f" AND {NOT_BACKLOG}"
-        " GROUP BY 1 ORDER BY SUM(e.out_tok) DESC").fetchall()
+        " GROUP BY 1 ORDER BY SUM(e.out_tok) DESC, 1").fetchall()
     d["by_issue"] = conn.execute(
         "SELECT issue_key, SUM(in_tok), SUM(out_tok), SUM(cache_r),"
         " SUM(cache_w), COUNT(*) FROM events WHERE issue_key IS NOT NULL"
@@ -470,7 +482,7 @@ def render_token_stats(d):
         if ev_by is None:
             return []
         return cost_notes(ev_by.get(name, 0), un_by.get(name, 0),
-                          est_by.get(name, 0))
+                          est_by.get(name, 0), require_estimated=True)
 
     week_cost = sum(r[4] for r in d["by_model"])
     rates = [r[5] for r in d["by_model"] if r[5] is not None]
@@ -482,7 +494,8 @@ def render_token_stats(d):
         cost_label = (f"{fmt_usd(week_cost)} (rates as of "
                       + datetime.date.fromtimestamp(max(rates)).isoformat() + ")")
     week_notes = ([] if ev_by is None else cost_notes(
-        sum(ev_by.values()), sum(un_by.values()), sum(est_by.values())))
+        sum(ev_by.values()), sum(un_by.values()), sum(est_by.values()),
+        require_estimated=True))
     if week_notes:
         cost_label += "; " + ", ".join(week_notes)
     out = [f"**Today: {fmt_n(d['today'][1])} output /"
@@ -757,7 +770,8 @@ def render_scoped_rollup(d):
         cost_label = f"{fmt_usd(d['cost'])} (seed rates)"
     else:
         cost_label = fmt_usd(d["cost"])
-    notes = cost_notes(d["events"], d.get("unpriced"), d.get("estimated"))
+    notes = cost_notes(d["events"], d.get("unpriced"), d.get("estimated"),
+                       require_estimated=True)
     out.append(f"**{cost_label}** — {fmt_n(d['events'])} events,"
                f" {fmt_n(d['in_tok'])} input / {fmt_n(d['out_tok'])} output"
                " tokens" + ("; " + ", ".join(notes) if notes else "") + ".")

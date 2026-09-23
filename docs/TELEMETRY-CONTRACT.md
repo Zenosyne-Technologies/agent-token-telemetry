@@ -266,7 +266,10 @@ epoch date (1970-01-01).
 (Python `capture.is_family_default` / `capture.is_ancestor_row` /
 `capture.is_estimated`, SQLite `capture.family_default_sql` /
 `capture.ancestor_row_sql` / `capture.estimated_sql`, Postgres the `estimated`
-column of `report_priced_events` in `supabase/reports.sql`):
+column of `report_model_pricing` in `supabase/reports.sql` — the single Postgres
+definition of the expression; `report_priced_events` merely PASSES IT THROUGH,
+via its per-event LATERAL join onto the resolved `report_model_pricing` row,
+rather than re-deriving it):
 
 - **Family default row** — a pricing row whose `model_prefix` matches
   `^claude-[a-z]+-$`: a bare family prefix such as `claude-opus-` or `claude-fable-`,
@@ -293,9 +296,10 @@ column of `report_priced_events` in `supabase/reports.sql`):
   a non-Claude model, is therefore included). A model that has an own row is not one,
   even if some of its older events predate that row and are still estimated.
 
-The report data carries these flags (`report_priced_events.estimated`, per-row
-estimated-event counts, the list of models without own price); they do not change
-any computed cost.
+The report data carries these flags (`report_priced_events.estimated` — sourced
+from `report_model_pricing.estimated`, not recomputed — per-row estimated-event
+counts, the list of models without own price); they do not change any computed
+cost.
 
 **`pricing-update` mints only the rate in force today, per listed version.** Each
 model version read off the published page gets its own specific prefix(es)

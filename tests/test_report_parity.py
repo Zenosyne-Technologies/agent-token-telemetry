@@ -722,6 +722,53 @@ class TestPostgresEquivalence(unittest.TestCase):
         self.assertIn("No own published price for", md)
         self.assertIn("4 of 8 events at an estimated rate", md)
 
+    def test_by_model_and_by_tier_tie_break_on_name(self):
+        # AOS-134 F5: a tie on SUM(out_tok) must order identically in both
+        # dialects — byte order (COLLATE "C" here) on the model/tier name.
+        # The class DB is shared across this class's tests (no per-test
+        # transaction), so the inserted rows are torn down via addCleanup —
+        # otherwise they'd leak into the OTHER tests' exact-count assertions.
+        self.addCleanup(lambda: self._run_sql_file(
+            self.dbname,
+            "DELETE FROM public.events WHERE session_uuid = 's-tie';"
+            " DELETE FROM public.sessions WHERE uuid = 's-tie';"
+            " DELETE FROM public.models WHERE name IN"
+            " ('claude-opus-9', 'claude-opus-8');"))
+        self._run_sql_file(self.dbname, "\n".join([
+            f"INSERT INTO public.models(owner_id, name) VALUES"
+            f" ('{OWNER}', 'claude-opus-9'), ('{OWNER}', 'claude-opus-8');",
+            "INSERT INTO public.sessions(owner_id, uuid, project_path)"
+            f" VALUES ('{OWNER}', 's-tie', '/home/user/alpha');",
+            "INSERT INTO public.events(owner_id, session_uuid, model_name, ts,"
+            " kind, agent, in_tok, out_tok, cache_r, cache_w, cache_w_1h,"
+            " issue_key, note) VALUES"
+            f" ('{OWNER}', 's-tie', 'claude-opus-9', {NOW}, 0, NULL, 10, 10,"
+            " 0, 0, 0, NULL, NULL),"
+            f" ('{OWNER}', 's-tie', 'claude-opus-8', {NOW}, 0, NULL, 10, 10,"
+            " 0, 0, 0, NULL, NULL);",
+        ]))
+        ts = supabase_backend._map_token_stats(
+            self._rpc("SELECT public.report_token_stats();"))
+        names = [r[0] for r in ts["by_model"] if r[0].startswith("claude-opus-")
+                 and r[0] not in ("claude-opus-4-8", "claude-opus-5-5")]
+        self.assertEqual(names, ["claude-opus-8", "claude-opus-9"])
+
+    def test_models_without_own_price_requires_an_event(self):
+        # AOS-134 F3: a model row with NO events at all (a pricing-less name
+        # that simply has never been used) must not appear in
+        # models_without_own_price — that list names models with at least
+        # one event that resolves to an estimate or nothing, not every
+        # unpriced name in the table.
+        self.addCleanup(lambda: self._run_sql_file(
+            self.dbname,
+            "DELETE FROM public.models WHERE name = 'claude-ghost-1';"))
+        self._run_sql_file(self.dbname, "INSERT INTO public.models"
+                           f" (owner_id, name) VALUES ('{OWNER}',"
+                           " 'claude-ghost-1');")
+        ts = supabase_backend._map_token_stats(
+            self._rpc("SELECT public.report_token_stats();"))
+        self.assertNotIn("claude-ghost-1", ts["models_without_own_price"])
+
     def test_reapplying_reports_sql_is_safe(self):
         # drop-then-create: applying the file again over itself must succeed
         # and leave the report functions answering identically
@@ -879,6 +926,35 @@ class TestPostgresEstimateRls(unittest.TestCase):
             self._rpc_as("", "SELECT public.report_token_stats();"))
         for k in ESTIMATE_KEYS:
             self.assertFalse(ts[k], k)
+
+    def test_direct_view_queries_stay_owner_scoped(self):
+        # AOS-134 F4: the report_* FUNCTIONS re-filter every join by
+        # `owner_id = caller` at the app level, so a view that lost its own
+        # `security_invoker = true` (evaluates as the view's OWNER, bypassing
+        # RLS on the tables it reads — a "definer view") would NOT show up as
+        # a regression through those functions alone: the app-level filter
+        # masks it. Querying report_model_pricing and report_priced_events
+        # DIRECTLY, the way their `GRANT SELECT ... TO authenticated` allows,
+        # is the only check that actually exercises each view's OWN RLS
+        # posture. Acting as OWNER (with OWNER2's intruder rows present via
+        # pg_intruder_sql), no OWNER2 row — and no OWNER2 owner_id — may
+        # appear in either view's output.
+        pricing_owners = self._rpc_as(
+            OWNER, "SELECT coalesce(json_agg(DISTINCT owner_id), '[]'::json)"
+                   " FROM public.report_model_pricing;")
+        self.assertEqual(pricing_owners, [OWNER])
+        pricing_models = self._rpc_as(
+            OWNER, "SELECT coalesce(json_agg(DISTINCT model_name), '[]'::json)"
+                   " FROM public.report_model_pricing;")
+        self.assertNotIn("claude-intruder-9", pricing_models)
+        event_owners = self._rpc_as(
+            OWNER, "SELECT coalesce(json_agg(DISTINCT owner_id), '[]'::json)"
+                   " FROM public.report_priced_events;")
+        self.assertEqual(event_owners, [OWNER])
+        event_sessions = self._rpc_as(
+            OWNER, "SELECT coalesce(json_agg(DISTINCT session_uuid), '[]'::json)"
+                   " FROM public.report_priced_events;")
+        self.assertNotIn("s-x1", event_sessions)   # OWNER2's intruder session
 
 
 class TestReportsSecurityHardening(unittest.TestCase):

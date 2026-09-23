@@ -175,6 +175,41 @@ class TestReportScript(unittest.TestCase):
         self.assertIn("small", out)          # tier mapping
         self.assertIn("No issue-tagged", out)
 
+    def test_by_model_tie_breaks_on_model_name(self):
+        # AOS-134 F5: when two models tie on SUM(out_tok) (the sort key),
+        # the order must be deterministic — byte order on the model name —
+        # so the local and remote (Postgres) dialects agree on ties.
+        conn = capture.connect(self.db)
+        now = int(time.time())
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now))
+        groups = capture.aggregate([
+            entry(model="claude-opus-2", inp=100, out=1000, mid="m1", ts=ts),
+            entry(model="claude-opus-1", inp=100, out=1000, mid="m2", ts=ts),
+        ])
+        with conn:
+            capture.insert_events(conn, "/proj", "s1", 0, None, groups)
+        conn.close()
+        _, out = run(["token-stats", "--db", str(self.db)])
+        self.assertLess(out.index("claude-opus-1"), out.index("claude-opus-2"))
+
+    def test_by_tier_tie_breaks_on_tier_name(self):
+        # AOS-134 F5: same rule for by_tier — a tie on SUM(out_tok) between
+        # two different tiers breaks on the tier label's byte order.
+        conn = capture.connect(self.db)
+        now = int(time.time())
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now))
+        groups = capture.aggregate([
+            entry(model="claude-sonnet-1", inp=100, out=500, mid="m1", ts=ts),
+            entry(model="claude-opus-1", inp=100, out=500, mid="m2", ts=ts),
+        ])
+        with conn:
+            capture.insert_events(conn, "/proj", "s1", 0, None, groups)
+        conn.close()
+        _, out = run(["token-stats", "--db", str(self.db)])
+        section = out.split("**By tier (7 days)**", 1)[1]
+        # tie on out_tok -> 'heavy' before 'small' (byte order)
+        self.assertLess(section.index("heavy"), section.index("small"))
+
     def test_token_stats_never_groups_by_branch(self):
         self.seed_db()
         conn = sqlite3.connect(self.db)
@@ -591,6 +626,15 @@ class TestEstimateFlags(unittest.TestCase):
                          "$3 — 1 of 10 events unpriced, 6 of 10 events at an"
                          " estimated rate")
 
+    def test_token_stats_unpriced_only_says_nothing_without_an_estimate(self):
+        # AOS-134 F1: the "U of M events unpriced" note in token-stats
+        # (headline and per-model cell) stays silent when NOTHING in the
+        # same figure is also estimated (N == 0) — unpriced-only carries no
+        # note here, unlike project-stats, which is unconditional and unaffected.
+        md = report.render_token_stats(token_data(unpriced=1, estimated=0))
+        self.assertEqual(model_cell(md), "$3")
+        self.assertNotIn("unpriced", md)
+
     def test_token_stats_headline_sums_across_models(self):
         d = token_data(estimated=2)
         d["by_model"].append(("gpt-4o", "unknown", 10, 20, 0.0, None))
@@ -610,6 +654,54 @@ class TestEstimateFlags(unittest.TestCase):
         self.assertEqual(model_cell(md), "$3")
         self.assertNotIn("estimated", md)
         self.assertNotIn("No own published price", md)
+
+    # ---- fetch_models_without_own_price
+    def test_models_without_own_price_requires_an_event(self):
+        # AOS-134 F3: a model row with NO events at all must not appear —
+        # models_without_own_price names models with at least one event that
+        # resolves to an estimate or nothing, not every unpriced name.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = pathlib.Path(tmp.name) / "usage.db"
+        conn = capture.connect(db)
+        now = int(time.time())
+        groups = capture.aggregate([
+            entry(model="claude-sonnet-5", inp=100, out=50, mid="m1",
+                  ts=time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
+                                   time.gmtime(now)))])
+        with conn:
+            capture.insert_events(conn, "/proj", "s1", 0, None, groups)
+        conn.execute("INSERT INTO models(name) VALUES ('claude-ghost-1')")
+        conn.commit()
+        without = report.fetch_models_without_own_price(conn)
+        conn.close()
+        # claude-sonnet-5 has an event and prices only at the seed family
+        # default -> no own row -> included.
+        self.assertIn("claude-sonnet-5", without)
+        # claude-ghost-1 has no events at all -> excluded, despite also
+        # having no matching pricing row.
+        self.assertNotIn("claude-ghost-1", without)
+
+    def test_models_without_own_price_excludes_all_zero_token_models(self):
+        # AOS-134 F2: a model whose every event is zero-token (e.g. a
+        # synthetic bookkeeping entry) has nothing to price and is excluded
+        # from the footer, even though it has events and no own price.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = pathlib.Path(tmp.name) / "usage.db"
+        conn = capture.connect(db)
+        now = int(time.time())
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now))
+        groups = capture.aggregate([
+            entry(model="<synthetic>", inp=0, out=0, cr=0, cw=0, mid="m1",
+                  ts=ts)])
+        with conn:
+            capture.insert_events(conn, "/proj", "s1", 0, None, groups)
+        conn.close()
+        conn = capture.connect(db)
+        without = report.fetch_models_without_own_price(conn)
+        conn.close()
+        self.assertNotIn("<synthetic>", without)
 
     # ---- footer
     def test_footer_absent_when_every_model_has_own_price(self):
@@ -658,6 +750,14 @@ class TestEstimateFlags(unittest.TestCase):
             "in_tok": 1000, "out_tok": 500, "cache_r": 0, "cache_w": 0,
             "events": events, "cost": 3.0, "rate_from": [RATE],
             "unpriced": unpriced, "estimated": estimated})
+
+    def test_scoped_rollup_unpriced_only_says_nothing_without_an_estimate(self):
+        # AOS-134 F1: same gate as token-stats — the scoped rollup's unpriced
+        # note stays silent unless the set also carries an estimated marker.
+        md = self.scoped(unpriced=1, estimated=0)
+        self.assertIn("**$3** — 10 events, 1,000 input / 500 output tokens.",
+                      md)
+        self.assertNotIn("unpriced", md)
 
     def test_scoped_rollup_qualifiers(self):
         base = "**$3** — 10 events, 1,000 input / 500 output tokens"
