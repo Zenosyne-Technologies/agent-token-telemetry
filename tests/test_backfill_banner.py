@@ -192,6 +192,16 @@ class TestCacheWriter(Base):
         self.assertEqual(code, 1, out)
         self.assertTrue(self.cache.exists())
 
+    def test_write_never_chmods_the_final_path(self):
+        # the sidecar's mode is set via fchmod on the temp fd before the
+        # rename; no path-based chmod may run afterwards (that would follow
+        # a symlink planted at the target name in the window after replace)
+        with mock.patch("os.chmod") as chmod:
+            backfill_summary.write({"bundles": 1, "deltaText": "-$1.00"},
+                                   self.fp(), int(time.time()), self.cache)
+            chmod.assert_not_called()
+        self.assertEqual(stat.S_IMODE(os.stat(self.cache).st_mode), 0o600)
+
     def test_nothing_offered_writes_zero_bundles(self):
         f2 = Fixture()
         self.addCleanup(f2.close)
@@ -396,6 +406,29 @@ class TestBannerLine(Base):
             self.assertRegex(d, backfill_summary.DELTA_RE)
         for d in ("$3.6", "3.60", "-$3.60 ", "$1,23.00", "+-$1.00", ""):
             self.assertNotRegex(d, backfill_summary.DELTA_RE)
+
+    def test_delta_with_trailing_newline_is_rejected_by_read(self):
+        # DELTA_RE must anchor to the true end of the string, not just
+        # before a trailing newline (`$` semantics), or a forged sidecar
+        # could smuggle an extra line into the rendered banner text
+        self.write_raw(self.valid(deltaText="-$1.00\n"))
+        self.assertIsNone(backfill_summary.read(self.cache))
+
+    def test_fingerprint_with_trailing_newline_is_rejected_by_read(self):
+        self.write_raw(self.valid(fingerprint=self.fp() + "\n"))
+        self.assertIsNone(backfill_summary.read(self.cache))
+
+    def test_deeply_nested_json_is_no_summary_and_never_raises(self):
+        # read() must never raise (its docstring promises it), including
+        # when the JSON parser itself overflows the recursion limit on a
+        # deeply nested payload; simulate that deterministically since
+        # whether a 4096-byte nested payload actually triggers RecursionError
+        # depends on the Python build (it does on CPython 3.9, not on
+        # 3.12+, per AOS-149 security report N3)
+        self.write_raw(b'{"version": 1}')
+        with mock.patch.object(backfill_summary.json, "loads",
+                               side_effect=RecursionError("max recursion")):
+            self.assertIsNone(backfill_summary.read(self.cache))
 
     def test_delta_regex_matches_every_usd_change_output(self):
         for now, after in ((8.0, 6.2), (0.0, 0.0), (1.0, 1.0042), (0.5, 1e7),

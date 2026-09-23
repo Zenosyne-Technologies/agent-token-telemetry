@@ -51,8 +51,8 @@ MAX_FUTURE_SKEW_S = 300
 # The only shape a stored delta may take — exactly what
 # pricing_update._usd_change renders ("-$272.46", "+$1.20", "$0.00",
 # "+$0.0042"); anything else is treated as corrupt.
-DELTA_RE = re.compile(r"^[+-]?\$[0-9]{1,3}(,[0-9]{3})*\.[0-9]{2}([0-9]{2})?$")
-_FP_RE = re.compile(r"^[0-9a-f]{64}$")
+DELTA_RE = re.compile(r"^[+-]?\$[0-9]{1,3}(,[0-9]{3})*\.[0-9]{2}([0-9]{2})?\Z")
+_FP_RE = re.compile(r"^[0-9a-f]{64}\Z")
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
@@ -139,9 +139,12 @@ def write(summary, fp, computed_at, path=None):
 
     A fresh temp file beside the target is created ``O_CREAT | O_EXCL |
     O_NOFOLLOW`` with mode 0600 (an existing file or symlink at that name
-    fails the open), written, then :func:`os.replace`-d over the target, and
-    the final mode is forced to 0600. A target that already exists as a
-    symlink (or any non-regular file) is refused and left untouched.
+    fails the open), then ``fchmod``-ed to 0600 on its own fd (belt-and-
+    suspenders against an unusual umask), written, then :func:`os.replace`-d
+    over the target — no path-based ``chmod`` ever runs on the final path, so
+    nothing after the rename can be tricked into following a symlink. A
+    target that already exists as a symlink (or any non-regular file) is
+    refused and left untouched.
 
     :param summary: :func:`summarize` output.
     :param fp: :func:`fingerprint` of the state the plan was computed over.
@@ -165,6 +168,7 @@ def write(summary, fp, computed_at, path=None):
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
     try:
+        os.fchmod(fd, 0o600)  # belt-and-suspenders against an unusual umask
         with os.fdopen(fd, "wb") as f:
             f.write(body)
             f.flush()
@@ -176,10 +180,6 @@ def write(summary, fp, computed_at, path=None):
         except OSError:
             pass
         raise
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
     return path
 
 
@@ -239,7 +239,7 @@ def read(path=None, now=None):
         return None
     try:
         d = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, TypeError, UnicodeDecodeError, RecursionError):
         return None
     if not isinstance(d, dict) or d.get("version") != CACHE_VERSION:
         return None
