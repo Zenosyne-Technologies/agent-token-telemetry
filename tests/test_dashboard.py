@@ -1,3 +1,4 @@
+import json
 import os
 import pathlib
 import sqlite3
@@ -201,6 +202,81 @@ class TestDashboardData(unittest.TestCase):
         self.assertEqual(len(p0["events"]["rows"]), 2)
         self.assertEqual(len(p2["events"]["rows"]), 1)          # last page remainder
         self.assertAlmostEqual(p0["events"]["sums"]["cost"], 5 * 1.083, places=3)
+
+    # ---- own-price warning detail (AOS-135) ------------------------------
+
+    def test_price_warning_detail_for_model_without_own_price(self):
+        # seed_one is priced off the sonnet FAMILY DEFAULT (no own row for
+        # claude-sonnet-5), so it must show up with its count/seen/cost.
+        now = int(time.time())
+        self.seed_one(ts=now)
+        conn = self._ro()
+        d = dashboard.build_data(conn, {"period": ["week"]})
+        conn.close()
+        detail = d["modelsWithoutOwnPriceDetail"]
+        self.assertEqual(len(detail), 1)
+        row = detail[0]
+        self.assertEqual(row["model"], "claude-sonnet-5")
+        self.assertEqual(row["modelName"], "Sonnet 5")
+        self.assertEqual(row["events"], 1)
+        self.assertEqual(row["firstSeen"], now)
+        self.assertEqual(row["lastSeen"], now)
+        self.assertAlmostEqual(row["cost"], 1.083, places=3)
+
+    def test_price_warning_detail_empty_when_every_model_has_own_price(self):
+        self.seed_one()
+        rw = capture.connect(self.db)
+        with rw:
+            rw.execute(
+                "INSERT INTO pricing(provider, model_prefix, in_usd, out_usd,"
+                " cache_r_usd, cache_w_usd, cache_w_1h_usd, effective_from,"
+                " source) SELECT provider, 'claude-sonnet-5', in_usd, out_usd,"
+                " cache_r_usd, cache_w_usd, cache_w_1h_usd, 1, 'test'"
+                " FROM pricing WHERE model_prefix = 'claude-sonnet-'")
+        rw.close()
+        conn = self._ro()
+        d = dashboard.build_data(conn, {"period": ["week"]})
+        conn.close()
+        self.assertEqual(d["modelsWithoutOwnPrice"], [])
+        self.assertEqual(d["modelsWithoutOwnPriceDetail"], [])
+
+    def test_price_warning_detail_covers_multiple_events_and_is_all_time(self):
+        # first/last seen and the event count span BOTH events even though one
+        # is outside the requested "day" period — the warning is an all-time
+        # signal, same scope as modelsWithoutOwnPrice itself, not windowed.
+        now = int(time.time())
+        old = now - 40 * 86400
+        self.seed_one(ts=old)
+        self.seed_one(ts=now)
+        conn = self._ro()
+        d = dashboard.build_data(conn, {"period": ["day"]})
+        conn.close()
+        self.assertEqual(d["kpis"]["events"], 1)          # window itself IS filtered
+        detail = d["modelsWithoutOwnPriceDetail"]
+        self.assertEqual(len(detail), 1)
+        self.assertEqual(detail[0]["events"], 2)
+        self.assertEqual(detail[0]["firstSeen"], old)
+        self.assertEqual(detail[0]["lastSeen"], now)
+        self.assertAlmostEqual(detail[0]["cost"], 2 * 1.083, places=3)
+
+    def test_price_warning_detail_carries_a_hostile_model_name_raw(self):
+        # The model name is untrusted transcript data. The server must not try
+        # to sanitize or escape it — JSON-encoding it here is safe by
+        # construction; HTML-escaping it is the RENDERER's job (dashboard.html
+        # esc(), exercised by the dashboard's own browser smoke test). This
+        # only guards against the server mangling or double-escaping it.
+        hostile = "<img src=x onerror=alert(1)>\"'\n"
+        self._insert("/proj", "s1", model=hostile, inp=100, out=50, cr=0,
+                     cw=0, cw1h=0, mid="m9", ts=iso(int(time.time())))
+        conn = self._ro()
+        d = dashboard.build_data(conn, {"period": ["year"]})
+        conn.close()
+        self.assertIn(hostile, d["modelsWithoutOwnPrice"])
+        names = {row["model"] for row in d["modelsWithoutOwnPriceDetail"]}
+        self.assertIn(hostile, names)
+        # round-trips unmodified through JSON, exactly like every other field
+        encoded = json.loads(json.dumps(d["modelsWithoutOwnPriceDetail"]))
+        self.assertIn(hostile, {row["model"] for row in encoded})
 
 
 # --- timeline bucketing (v0.11.0: per-bucket columns, not a running total) ---

@@ -194,6 +194,56 @@ def fetch_domains(conn, since):
     }
 
 
+def fetch_price_warning(conn, models=None):
+    """All-time detail for the dashboard's own-price warning banner (AOS-135).
+
+    For every model :func:`report.fetch_models_without_own_price` flags (at
+    least one event, no pricing row of its own at any ``effective_from`` —
+    see docs/TELEMETRY-CONTRACT.md's Pricing table), returns its event count,
+    first/last-seen epoch seconds and the cost currently carried at the
+    resolved rate. Uses the same per-event pricing resolution (:func:`_rate`
+    / :func:`_resolved`) and cost arithmetic as :func:`fetch_rows` — no new
+    pricing rule — summed with ``COALESCE(rate, 0)`` so an unpriced event (no
+    row resolves at all) contributes zero instead of erroring; by
+    construction every event of these models is estimated or unpriced, never
+    own-priced. Not windowed by period and not filtered by the
+    backlog-capture note, matching the all-time scope of the model list
+    itself (a model must stay listed even if its only events are outside the
+    current window or are backlog roll-ups).
+
+    :param conn: read-only sqlite3 connection.
+    :param models: precomputed result of
+        :func:`report.fetch_models_without_own_price`, to avoid re-running it
+        when the caller already has it; computed here when omitted.
+    :returns: list of ``{model, modelName, events, firstSeen, lastSeen,
+        cost}`` dicts, ordered by model name; empty when every logged model
+        has its own price.
+    """
+    if models is None:
+        models = report.fetch_models_without_own_price(conn)
+    if not models:
+        return []
+    placeholders = ",".join("?" * len(models))
+    cw1h_rate = _resolved("COALESCE(pr.cache_w_1h_usd, pr.cache_w_usd)")
+    sql = f"""
+      SELECT m.name AS model, COUNT(*) AS n,
+             MIN(e.ts) AS first_ts, MAX(e.ts) AS last_ts,
+             SUM(e.in_tok * COALESCE({_rate('in_usd')}, 0)
+                 + e.out_tok * COALESCE({_rate('out_usd')}, 0)
+                 + e.cache_r * COALESCE({_rate('cache_r_usd')}, 0)
+                 + (e.cache_w - e.cache_w_1h) * COALESCE({_rate('cache_w_usd')}, 0)
+                 + e.cache_w_1h * COALESCE({cw1h_rate}, 0)) / 1e6 AS cost
+      FROM events e JOIN models m ON m.id = e.model_id
+      WHERE m.name IN ({placeholders})
+      GROUP BY m.name
+      ORDER BY m.name
+    """
+    return [{"model": r["model"], "modelName": _pretty_model(r["model"]),
+             "events": r["n"], "firstSeen": r["first_ts"], "lastSeen": r["last_ts"],
+             "cost": r["cost"] or 0.0}
+            for r in conn.execute(sql, models)]
+
+
 def fetch_rows(conn, since, models, agents):
     """Priced per-event rows in the window, filtered by model/agent in SQL.
     SQL resolves each pricing rate; Python derives every token/cost split so the
@@ -402,6 +452,7 @@ def build_data(conn, q):
         page_size = 12
 
     domains = fetch_domains(conn, since)
+    models_without_own_price = report.fetch_models_without_own_price(conn)
     base_rows = fetch_rows(conn, since, models, agents)   # window + model/agent
     backlog_excluded = conn.execute(
         "SELECT COUNT(*) FROM events WHERE ts >= ?"
@@ -443,8 +494,10 @@ def build_data(conn, q):
         },
         "backlogExcluded": backlog_excluded,
         # models without an own pricing row (every event estimated/unpriced);
-        # data only — the page does not render it yet.
-        "modelsWithoutOwnPrice": report.fetch_models_without_own_price(conn),
+        # modelsWithoutOwnPriceDetail (AOS-135) is what the own-price warning
+        # banner renders from — count/first/last/cost per model, all-time.
+        "modelsWithoutOwnPrice": models_without_own_price,
+        "modelsWithoutOwnPriceDetail": fetch_price_warning(conn, models_without_own_price),
         "generatedAt": now,
     }
 

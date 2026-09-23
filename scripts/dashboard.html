@@ -127,6 +127,27 @@
     font-family:var(--font-mono);font-size:.85em;}
   .backend-note-dot{width:8px;height:8px;border-radius:50%;background:var(--accent-2);flex:0 0 auto;}
 
+  /* ============ PRICE WARNING ============ */
+  /* Populated client-side by renderPriceWarning() from /api/data's
+     modelsWithoutOwnPriceDetail (AOS-135). No `display` here — only under
+     `:not([hidden])` — so the `hidden` attribute's UA default keeps winning;
+     an author rule that set `display` unconditionally would override it and
+     the banner would never truly hide. Empty + hidden on every load until
+     that data says otherwise, so the no-warning DOM is unchanged. */
+  .price-warn{flex-direction:column;gap:10px;margin:0 0 14px;padding:12px 16px;
+    border-radius:14px;background:var(--panel-2);border:1px solid var(--panel-brd);
+    color:var(--ink-2);font-size:.86rem;}
+  .price-warn:not([hidden]){display:flex;}
+  .price-warn-head{display:flex;align-items:flex-start;gap:10px;}
+  .price-warn-dot{width:8px;height:8px;border-radius:50%;background:var(--warn);flex:0 0 auto;margin-top:6px;}
+  .price-warn code{background:var(--track);padding:1px 6px;border-radius:6px;
+    font-family:var(--font-mono);font-size:.85em;}
+  .price-warn-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;}
+  .price-warn-list li{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 14px;
+    padding:6px 0 6px 18px;border-top:1px solid var(--panel-brd);}
+  .price-warn-list li:first-child{border-top:none;}
+  .price-warn-model{font-weight:600;color:var(--ink);}
+
   /* ============ HEADER ============ */
   header.hd{display:flex;flex-wrap:wrap;align-items:flex-end;gap:18px 26px;justify-content:space-between;margin-bottom:22px;}
   .brand{display:flex;flex-direction:column;gap:8px;min-width:0;}
@@ -368,6 +389,17 @@
       </div>
     </header>
 
+    <!-- Populated client-side from /api/data's modelsWithoutOwnPriceDetail
+         (AOS-135, see renderPriceWarning()); stays empty and hidden when
+         every logged model has its own price. -->
+    <div class="price-warn" id="price-warn" hidden role="note" aria-live="polite">
+      <div class="price-warn-head">
+        <span class="price-warn-dot" aria-hidden="true"></span>
+        <span id="price-warn-msg"></span>
+      </div>
+      <ul class="price-warn-list" id="price-warn-list"></ul>
+    </div>
+
     <section class="filters scope glass" aria-label="Window and measure">
       <div class="frow">
         <span class="flabel">Period</span>
@@ -550,6 +582,10 @@
   const longWindow=()=> state.period!=="day";
   const MONTHS=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
   function fmtTime(ts){ const d=new Date(ts*1000); return longWindow()? (pad(d.getMonth()+1)+"/"+pad(d.getDate())) : (pad(d.getHours())+":"+pad(d.getMinutes())); }
+  // Absolute calendar date, independent of the period filter — used where a
+  // timestamp can predate the current window (e.g. the price-warning banner's
+  // all-time first/last seen).
+  function fmtDate(ts){ const d=new Date(ts*1000); return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`; }
   // Timeline axis/tooltip labels follow the server's bucket grain.
   function fmtGrain(ts, grain){ const d=new Date(ts*1000);
     return grain==="month" ? `${MONTHS[d.getMonth()]} ${d.getFullYear()}`
@@ -756,9 +792,32 @@
     $("tfoot-r").textContent=`\u03a3 ${fmtUSD(ev.sums.cost)} \u00b7 ${fmtTok(ev.sums.total)} tokens (all ${total})`;
   }
 
+  // ---- own-price warning (AOS-135) ----
+  // Model names are untrusted — they come straight from transcripts — so
+  // every one goes through esc(), same as every other transcript-sourced
+  // string rendered on this page (event/project tables, filter chips).
+  function renderPriceWarning(items){
+    const box=$("price-warn");
+    if(!items || !items.length){ box.hidden=true; box.innerHTML=""; return; }
+    $("price-warn-msg").innerHTML =
+      `${items.length} model${items.length===1?"":"s"} logged with no price of its own`
+      + ` &mdash; the cost below is priced at a family-default or predecessor rate`
+      + ` and is an estimate. Run <code>/token-telemetry:pricing-update</code> to refresh.`;
+    $("price-warn-list").innerHTML = items.map(it=>{
+      const seen = it.firstSeen===it.lastSeen ? fmtDate(it.firstSeen)
+                 : `${fmtDate(it.firstSeen)} – ${fmtDate(it.lastSeen)}`;
+      return `<li><span class="price-warn-model">${esc(it.modelName)}</span>`
+           + `<span>${fmtInt(it.events)} event${it.events===1?"":"s"}</span>`
+           + `<span>${seen}</span>`
+           + `<span>${fmtUSD(it.cost)} at an estimated rate</span></li>`;
+    }).join("");
+    box.hidden=false;
+  }
+
   // ---- render everything from the last response ----
   function renderAll(){
     buildChips("model"); buildChips("agent");
+    renderPriceWarning(D.modelsWithoutOwnPriceDetail);
     renderKPIs(D.kpis);
     renderBars("bars-model",D.byModel,"model");
     renderBars("bars-agent",D.byAgent,"agent");
