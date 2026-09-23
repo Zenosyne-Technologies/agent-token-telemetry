@@ -60,7 +60,7 @@ functions, hand-written and reviewed:
   `estimated_events` per project (events priced at a family-default or ancestor
   row; `NULL`/false both count 0, mirroring `report.py`'s `SUM(CASE WHEN
   estimated = 1 ...)`); `report_token_stats()` → the `/token-stats` object
-  (today/week windows, by project/agent/model/kind/tier/issue), now also
+  (today/week windows, by project/agent/model/kind/tier/rung/issue), now also
   carrying `estimated_by_model`, `events_by_model`, `unpriced_by_model` (all
   keyed by model name over the same 7-day backlog-excluded window as
   `by_model`) and `models_without_own_price` (all-time, sorted `COLLATE "C"` to
@@ -68,6 +68,19 @@ functions, hand-written and reviewed:
   names, read only through the SECURITY INVOKER view and RLS-scoped tables, so
   they widen nothing a caller can see; `report_info(p_project_path)` → the
   DB-derived `/info` block.
+- **Tier is role-based (AOS-141), not model-based**, mirroring the kit's
+  `token-economics.md` verbatim: the main session (`kind=0`, `agent` NULL) is
+  always `orchestrator`; named `marvin:*` personas route to their own tier;
+  any other agent falls back to its model's prefix. `by_model` now groups by
+  `(model, tier)` — the same model can land in more than one tier row (e.g.
+  the main session's `orchestrator` vs. a `marvin:developer` subagent's
+  `heavy`). `by_rung` breaks `by_tier`'s `ladder` rows down by escalation
+  rung (`high`/`xhigh`/`max`/`frontier`), read only from the named
+  `marvin:escalation-<rung>` persona; a `ladder` row reached via the
+  model-prefix fallback has no rung and is left out of `by_rung`, though it
+  still counts toward `by_tier`'s ladder total. Both `report.py`'s
+  `tier_case()`/`rung_case()` and `reports.sql`'s inline CASE expressions
+  implement the SAME rule — see `docs/TELEMETRY-CONTRACT.md`'s "Tier mapping".
 
 Each returns `jsonb` the client maps 1:1 into the shape `report.py`'s matching
 `fetch_*` returns, so the **same `render_*` functions** produce the markdown.

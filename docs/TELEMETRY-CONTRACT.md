@@ -179,19 +179,33 @@ consumer must treat "no project row" as "no data", never as an error.
 
 ## Tier mapping
 
-Model name prefix → kit tier, mirroring the `pricing` table's own prefixes (used by
-`commands/token-stats.md`'s by-tier breakdown and the kit's own
-`docs/agents/token-economics.md`):
+**ROLE-based, not model-based** — this section mirrors the agent-operating-kit's
+`templates/marvin/agents/token-economics.md` (kit v0.30.0) verbatim: since that kit
+version the orchestrator runs on the heavy tier's own model, so a model name prefix
+can no longer tell orchestrator and heavy-worker cost apart. Used by
+`commands/token-stats.md`'s by-tier breakdown (`scripts/report.py`'s `tier_case()`,
+mirrored in Postgres by `supabase/reports.sql`).
 
-| Model prefix | Tier |
+| Events | Tier |
 |---|---|
-| `claude-fable-*` | orchestrator |
-| `claude-opus-*` | heavy |
-| `claude-sonnet-*` | small |
-| `claude-haiku-*` | micro |
+| main session (`events.kind = 0`, `events.agent` NULL) | orchestrator |
+| `marvin:developer` · `marvin:researcher` · `marvin:validator-*` | heavy |
+| `marvin:escalation-*` | ladder (per rung from `events.agent`: high · xhigh · max · frontier) |
+| `marvin:developer-small` · `marvin:documenter` | small |
+| `marvin:ponytail` | micro |
 
-`events.agent` + `events.kind` further distinguish main-session vs subagent work
-within a tier.
+Any other agent — a persona the kit hasn't named, or a NULL agent on a row that is
+NOT the main session (e.g. `kind = 1` with no agent) — falls back to its model name's
+prefix: `claude-opus-*` heavy · `claude-sonnet-*` small · `claude-haiku-*` micro ·
+`claude-fable-*` ladder; no match is `unknown`. Tier names and order match the kit.
+
+`by_model` groups by `(model, tier)`, not model alone: the same model can legitimately
+land in more than one tier row (e.g. as the main session's `orchestrator` and as a
+`marvin:developer` subagent's `heavy`). `by_rung` breaks the `ladder` rows of `by_tier`
+down by escalation rung, read only from the named `marvin:escalation-<rung>` persona
+(`events.agent`) — never inferred from a model or effort setting; a `ladder` row that
+reached that tier through the model-prefix fallback has no rung and is left out of
+`by_rung`, though it still counts toward `by_tier`'s ladder total.
 
 ## Scoping recipes (with pre-v2 fallback)
 

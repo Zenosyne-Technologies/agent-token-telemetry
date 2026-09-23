@@ -26,7 +26,11 @@ disagree with your machine's local day if their timezones differ (see
   activity, and how many turns/subagent runs were recorded.
 - **By project, by agent, by model, by tier** — the same totals broken down
   different ways, so you can see which project or which kind of agent is
-  using the most.
+  using the most. Tier reflects the AGENT'S ROLE (the main session vs. a
+  named sub-agent persona), not just which model answered — two rows can
+  share a model and still fall in different tiers. When any of that usage
+  came from an escalation persona, a further **by ladder rung** breakdown
+  shows how much went to each escalation level.
 - **Estimated cost** — a dollar estimate per model, worked out from current
   published pricing. This is an estimate for visibility, not a bill.
 - **By issue** — usage rolled up under a tracked issue key, when that
