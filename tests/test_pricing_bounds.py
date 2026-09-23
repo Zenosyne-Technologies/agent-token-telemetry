@@ -755,7 +755,11 @@ class TestErrorSanitization(Base):
         self.assertLess(len(str(ctx.exception)), 300)
 
     def test_rate_cell_error_message_has_no_raw_control_or_bidi_chars(self):
-        name_cell = "Claude Sonnet 5\x1b[31mevil‮reordered"
+        # A space after the version: since AOS-151 round 2 (C2) a control
+        # character right after it refuses earlier, at the version check
+        # (pinned in TestVersionBoundaryIsStrict), and this test is about
+        # the rate-cell error message.
+        name_cell = "Claude Sonnet 5 \x1b[31mevil‮reordered"
         html = self._html([(name_cell, "not a dollar amount",
                             "$2.50 / MTok", "$4 / MTok", "$0.20 / MTok",
                             "$10 / MTok")])
@@ -768,7 +772,7 @@ class TestErrorSanitization(Base):
         self.assertIn("reordered", msg)
 
     def test_cli_stderr_carries_no_raw_control_chars_on_parse_failure(self):
-        html = self._html([("Claude Sonnet 5\x1b[31m", "nope",
+        html = self._html([("Claude Sonnet 5 \x1b[31m", "nope",
                             "$2.50 / MTok", "$4 / MTok", "$0.20 / MTok",
                             "$10 / MTok")])
         path = self.f.write_html(html)
@@ -1547,30 +1551,53 @@ class TestTwoRowLiveFixture(Base):
         with self.assertRaises(ValueError):
             old.parse_models(self.FIXTURE.read_text())
 
-    def test_n1_n2_n4_fixes_mint_the_same_18_entries_and_24_prefixes(self):
-        # AOS-151 security correction (N1, N2, N4): none of the three fixes
-        # — space-joining element boundaries, capping/refusing a malformed
-        # version, and refusing a width-mismatched data row — may change
-        # what the REAL, currently-published two-row page mints. Every name
-        # cell on the live page is a single legitimate ``<a>`` model name
-        # plus a tagline that starts with a letter (never a digit or a
-        # bare ``.``), every version is well-formed and short, and every
-        # data row's width already matches the header, so all three fixes
-        # are no-ops here — pinned by asserting the exact (family, version)
-        # set AND the exact set of minted `model_prefix` values, not just a
-        # count.
-        entries = pricing_update.parse_models(self.FIXTURE.read_text())
-        pairs = {(e["family"], e["version"]) for e in entries}
-        self.assertEqual(len(pairs), 18)
-        self.assertEqual(pairs, {
-            ("fable", "5"), ("fable", "5.1"),
-            ("haiku", "3.5"), ("haiku", "4.5"),
-            ("mythos", "5"), ("mythos", "5.1"),
-            ("opus", "4"), ("opus", "4.1"), ("opus", "4.5"),
-            ("opus", "4.6"), ("opus", "4.7"), ("opus", "4.8"), ("opus", "5"),
-            ("opus", "5.5"),
-            ("sonnet", "4"), ("sonnet", "4.5"), ("sonnet", "4.6"),
-            ("sonnet", "5")})
+    # The 18 rows the live capture lists, with every rate, exactly as the
+    # parser minted them before AOS-151's round-2 correction (3c8001e):
+    # (in, out, cache-read, 5m-write, 1h-write) USD per MTok.
+    LIVE_ENTRIES = {
+        ("fable", "5.1"): (10, 50, 0.25, 12.5, 20),
+        ("opus", "5.5"): (4, 20, 0.2, 5, 8),
+        ("sonnet", "5"): (2, 10, 0.2, 2.5, 4),
+        ("haiku", "4.5"): (1, 5, 0.1, 1.25, 2),
+        ("mythos", "5.1"): (10, 50, 0.25, 12.5, 20),
+        ("fable", "5"): (10, 50, 1, 12.5, 20),
+        ("mythos", "5"): (10, 50, 1, 12.5, 20),
+        ("opus", "5"): (5, 25, 0.5, 6.25, 10),
+        ("opus", "4.8"): (5, 25, 0.5, 6.25, 10),
+        ("opus", "4.7"): (5, 25, 0.5, 6.25, 10),
+        ("opus", "4.6"): (5, 25, 0.5, 6.25, 10),
+        ("opus", "4.5"): (5, 25, 0.5, 6.25, 10),
+        ("opus", "4.1"): (15, 75, 1.5, 18.75, 30),
+        ("opus", "4"): (15, 75, 1.5, 18.75, 30),
+        ("sonnet", "4.6"): (3, 15, 0.3, 3.75, 6),
+        ("sonnet", "4.5"): (3, 15, 0.3, 3.75, 6),
+        ("sonnet", "4"): (3, 15, 0.3, 3.75, 6),
+        ("haiku", "3.5"): (0.8, 4, 0.08, 1, 1.6),
+    }
+
+    def test_live_capture_mints_the_same_18_entries_rates_and_24_prefixes(self):
+        # AOS-151 security correction (N1, N2, N4, and round 2's C1, C2,
+        # C3): none of the fixes — rendered-text cell semantics, the strict
+        # version boundary, skipping a width-mismatched model row — may
+        # change what the REAL, currently-published two-row page mints. The
+        # live name cells separate the model name from its tagline with a
+        # flex column (`<div class="flex … flex-col"><a>…</a><span>…`), so
+        # the rendered text has a boundary space after every version; every
+        # version is well-formed and short; every model row is six cells
+        # wide like the header. Pinned by the exact entry list (page order,
+        # every rate, no conditions, nothing skipped) AND the exact set of
+        # minted `model_prefix` values.
+        skipped = []
+        entries = pricing_update.parse_models(self.FIXTURE.read_text(),
+                                              skipped)
+        self.assertEqual(skipped, [])
+        got = [((e["family"], e["version"]),
+                tuple(e["rates"][k] for k in ("in_usd", "out_usd",
+                                              "cache_r_usd", "cache_w_usd",
+                                              "cache_w_1h_usd")),
+                e["condition"]) for e in entries]
+        self.assertEqual(got, [(k, v, None)
+                               for k, v in self.LIVE_ENTRIES.items()])
         candidates = pricing_update.build_candidates(
             entries, datetime.date(2026, 9, 23))
         prefixes = {c["prefix"] for c in candidates}
@@ -1587,66 +1614,179 @@ class TestTwoRowLiveFixture(Base):
             "claude-sonnet-", "claude-sonnet-4", "claude-sonnet-4-5",
             "claude-sonnet-4-6", "claude-sonnet-5"})
 
+    def test_live_name_cells_read_as_rendered_text(self):
+        # The live page's name cell is `<a>` + `<span>` inside a flex column
+        # (and, for retired models, the name inside an `inline-flex` badge
+        # span): the flex items are separate boxes, so the tagline is its
+        # own word and never glues onto the version.
+        tc = pricing_update.TableCollector()
+        tc.feed(self.FIXTURE.read_text())
+        header, body, _ = pricing_update._locate_rate_table(tc.tables)
+        names = {r[0] for r in body}
+        self.assertIn("Claude Opus 5.5 For long-running agentic coding and"
+                      " knowledge work", names)
+        # A retired model's name sits in an `inline-flex` badge span beside
+        # an icon button whose glyph is a private-use character (U+E0F0):
+        # the button is a flex item, so the glyph is its own word. Read as
+        # one inline run it would glue onto the version ("Claude Opus
+        # 4\ue0f0") and the strict version boundary would refuse the page.
+        self.assertIn("Claude Opus 4 \ue0f0", names)
+        self.assertEqual(header.width, len(header))
 
-class TestNameCellElementGluing(Base):
-    """AOS-151 security correction, N1 (scripts/pricing_update.py: layer 1
-    — ``TableCollector.handle_endtag``'s cell-text join; layer 2 —
-    ``_MODEL_NAME_RE``/``_version_boundary_ok`` in the data-row loop).
 
-    A name cell built from several elements/text nodes, e.g. an `<a>` model
-    name immediately followed by a `<span>` tagline with no whitespace text
-    node between the tags, used to be concatenated with NO separator
-    (layer 1), so a tagline that starts with a digit or a bare `.digit`
-    glued straight onto the parsed version (`"...5" + "1M-token…"` ->
-    `"...51M-token…"`, minting `claude-sonnet-51` instead of
-    `claude-sonnet-5`; `"...4" + ".5x faster"` -> `claude-opus-4-5`, another
-    real version's prefix). Layer 1 now always inserts a boundary space, so
-    a genuine tagline can never extend a parsed version. Layer 2 is the
-    backstop for a name with no element boundary at all (a single text
-    node) where a digit or `.digit` genuinely follows the version with no
-    separator: `_version_boundary_ok` refuses the whole run instead of
-    minting whatever the grammar happened to match."""
+# Two rate sets that differ in every column, so a row minted onto the wrong
+# prefix — or a rate read from the wrong column — is visible in the DB.
+# Row-tuple order is ROW_KEYS: (name, in, w5, w1h, cr, out).
+_RATES_A = ("$11 / MTok", "$13.75 / MTok", "$22 / MTok", "$1.10 / MTok",
+            "$55 / MTok")
+_RATES_B = ("$3 / MTok", "$3.75 / MTok", "$6 / MTok", "$0.30 / MTok",
+            "$15 / MTok")
+# The same, as pricing_rows()' (in, out, cache-read, 5m-write, 1h-write).
+_DB_A = (11.0, 55.0, 1.1, 13.75, 22.0)
+_DB_B = (3.0, 15.0, 0.3, 3.75, 6.0)
+
+
+class TestNameCellRenderedText(Base):
+    """AOS-151 security correction, round 2, C1 (scripts/pricing_update.py:
+    ``TableCollector`` and its ``_BLOCK_TAGS``/``_FLEX_GRID_CLASSES``).
+
+    A cell's text is the text a browser renders. 3c8001e joined EVERY
+    element/comment boundary with a space (to stop a tagline gluing onto a
+    version), which split a markup-split version — `4<!-- -->.<!-- -->5`
+    (React's text-node separator; the live rate table carries 85 of them)
+    or `4<b>.5</b>` — into "4 .5", silently minting the row's rates onto
+    Opus 4's legacy aliases. Now: comments contribute nothing, inline
+    elements concatenate, block-level elements, `<br>` and flex/grid items
+    are a boundary. Each probe page lists the probe row at rates A and a
+    control row for the OTHER candidate version at rates B, so a mis-mint
+    shows up as the wrong rates on a prefix."""
 
     LAYOUT = "two-row"
 
-    def _row(self, name_html):
-        return [(name_html, "$2 / MTok", "$2.50 / MTok", "$4 / MTok",
-                 "$0.20 / MTok", "$10 / MTok")]
+    def _run(self, probe_name, control_name):
+        path = self.f.write_html(self._html([
+            (probe_name, *_RATES_A), (control_name, *_RATES_B)]))
+        code, out, err = self.f.cli("--html", str(path))
+        return code, out, err
 
-    def test_digit_led_tagline_across_an_element_boundary_does_not_extend_the_version(
-            self):
-        html = self._html(self._row(
-            "<a>Claude Sonnet 5</a><span>1M-token context</span>"))
-        entries = pricing_update.parse_models(html)
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["version"], "5")
-        self.assertEqual(
-            pricing_update.specific_prefixes("sonnet", entries[0]["version"]),
-            ["claude-sonnet-5"])
+    def _latest(self, prefix):
+        rows = self.f.pricing_rows(prefix)
+        return tuple(rows[-1][1:6]) if rows else None
 
-    def test_dot_digit_led_tagline_across_an_element_boundary_does_not_mint_a_subversion(
-            self):
-        # "Opus 6" (not "Opus 4") to sidestep SPECIAL_PREFIXES' real
-        # `("opus", "4")` alias entry, which would otherwise mint
-        # `claude-opus-4-0`/`claude-opus-4-2025` and obscure the assertion.
-        html = self._html(self._row(
-            "<a>Claude Opus 6</a><span>.5x faster inference</span>"))
-        entries = pricing_update.parse_models(html)
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["version"], "6")
-        self.assertEqual(
-            pricing_update.specific_prefixes("opus", entries[0]["version"]),
-            ["claude-opus-6"])
+    def _assert_reads_as_opus_4_5(self, probe_name):
+        code, out, err = self._run(probe_name, "Claude Opus 4")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self._latest("claude-opus-4-5"), _DB_A)
+        self.assertEqual(self._latest("claude-opus-4-0"), _DB_B)
+        self.assertEqual(self._latest("claude-opus-4-2025"), _DB_B)
+
+    def test_comment_split_version_reads_as_one_version(self):
+        self._assert_reads_as_opus_4_5("Claude Opus 4<!-- -->.<!-- -->5")
+
+    def test_inline_element_split_version_reads_as_one_version(self):
+        self._assert_reads_as_opus_4_5("Claude Opus 4<b>.5</b>")
+
+    def test_inline_spans_with_a_whitespace_node_between(self):
+        self._assert_reads_as_opus_4_5(
+            "<span>Claude Opus</span> <span>4.5</span>")
+
+    def test_block_tagline_after_the_version_is_a_boundary(self):
+        self._assert_reads_as_opus_4_5(
+            "Claude Opus 4.5<div>1M-token context</div>")
+
+    def test_br_tagline_after_the_version_is_a_boundary(self):
+        code, out, err = self._run("Claude Sonnet 5<br>1M-token context",
+                                   "Claude Sonnet 4.5")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self._latest("claude-sonnet-5"), _DB_A)
+        self.assertEqual(self._latest("claude-sonnet-4-5"), _DB_B)
+        self.assertIsNone(self._latest("claude-sonnet-51"))
+
+    def test_block_paragraph_after_the_version_is_a_boundary(self):
+        # A browser shows "Claude Opus 4" with ".5x faster" as a separate
+        # paragraph below it: the row is Opus 4's, not Opus 4.5's.
+        code, out, err = self._run("Claude Opus 4<p>.5x faster</p>",
+                                   "Claude Opus 4.5")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self._latest("claude-opus-4-0"), _DB_A)
+        self.assertEqual(self._latest("claude-opus-4-2025"), _DB_A)
+        self.assertEqual(self._latest("claude-opus-4-5"), _DB_B)
+
+    def test_flex_column_tagline_is_a_boundary_like_the_live_page(self):
+        for container in ('<div class="flex min-w-0 flex-col">',
+                          '<div class="grid">',
+                          '<span class="inline-flex items-center">',
+                          '<div style="gap: 1px; display: flex">'):
+            with self.subTest(container=container):
+                tag = container[1:container.index(" ")]
+                code, out, err = self._run(
+                    f"{container}<a>Claude Sonnet 5</a>"
+                    f"<span>1M-token context</span></{tag}>",
+                    "Claude Sonnet 4.5")
+                self.assertEqual(code, 0, out + err)
+                self.assertEqual(self._latest("claude-sonnet-5"), _DB_A)
+                self.assertIsNone(self._latest("claude-sonnet-51"))
+
+    def test_inline_tagline_outside_a_flex_container_glues_and_refuses(self):
+        # Without a flex/grid parent an <a> and a <span> render as ONE run
+        # of text ("Claude Sonnet 51M-token…"), and a responsive variant
+        # (`md:flex`) is conditional, so it is not a container either: the
+        # glued version is refused by the strict boundary, never minted as
+        # Sonnet 51 or Opus 6.5.
+        for name in ("<a>Claude Sonnet 5</a><span>1M-token context</span>",
+                     "<a>Claude Opus 6</a><span>.5x faster</span>",
+                     '<div class="md:flex"><a>Claude Sonnet 5</a>'
+                     "<span>1M-token context</span></div>"):
+            with self.subTest(name=name):
+                before = self.f.digest()
+                code, out, err = self._run(name, "Claude Sonnet 4.5")
+                self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED,
+                                 out + err)
+                self.assertIn("REFUSED", out)
+                self.assertEqual(self.f.digest(), before)
 
     def test_single_text_node_glued_version_refuses_the_whole_run(self):
         before = self.f.digest()
-        path = self.f.write_html(self._html(self._row("Claude Opus 4.5x")))
-        code, out, err = self.f.cli("--html", str(path))
+        code, out, err = self._run("Claude Opus 4.5x", "Claude Opus 4")
         self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED, out + err)
         self.assertIn("REFUSED", out)
         self.assertEqual(self.f.digest(), before)
-        self.assertEqual(self.f.pricing_rows("claude-opus-4"), [])
-        self.assertEqual(self.f.pricing_rows("claude-opus-4-5"), [])
+
+    def test_cell_text_semantics_directly(self):
+        cases = {
+            "a<!-- x -->b": "ab",
+            "a<span>b</span>c": "abc",
+            "a<div>b</div>c": "a b c",
+            "a<br>b": "a b",
+            "a<br/>b": "a b",
+            "a</br>b": "a b",
+            "a<wbr>b": "ab",
+            "a<img>b": "ab",
+            '<div class="flex">a<img>b</div>': "a b",
+            "a<p>b": "a b",
+            "a</span>b": "ab",
+            "a</p>b": "a b",
+            "a \n\t b": "a b",
+            "<p><b>a</p>b": "a b",
+        }
+        for html, text in cases.items():
+            with self.subTest(html=html):
+                tc = pricing_update.TableCollector()
+                tc.feed(f"<table><tr><td>{html}</td></tr></table>")
+                self.assertEqual(tc.tables[0][0][0], text)
+
+    def test_stray_end_tags_do_not_rescan_a_deep_element_stack(self):
+        # 40,000 unclosed <span> then 40,000 unmatched </b>: each stray end
+        # tag is an O(1) no-op, not a scan of the whole open-element stack
+        # (which would be ~1.6e9 steps).
+        n = 40000
+        html = ("<table><tr><td>Claude Opus 4.5" + "<span>" * n
+                + "</b>" * n + "</td></tr></table>")
+        start = time.monotonic()
+        tc = pricing_update.TableCollector()
+        tc.feed(html)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertEqual(tc.tables[0][0][0], "Claude Opus 4.5")
 
 
 class TestVersionMalformedRefusesInsteadOfTruncating(Base):
@@ -1684,65 +1824,214 @@ class TestVersionMalformedRefusesInsteadOfTruncating(Base):
         self.assertEqual(self.f.pricing_rows("claude-opus-999"), [])
 
 
-class TestDataRowWidthMustMatchHeader(Base):
-    """AOS-151 security correction, N4 (scripts/pricing_update.py: the
-    ``len(row) != len(header)`` guard in the data-row loop): a data row
-    whose cell count differs from the header's — an extra cell (which used
-    to silently shift every rate one column, within bounds) or a short one
-    (which used to be silently skipped with no warning) — now refuses the
-    whole run instead. A row with no model-name cell at all (a colspan-
-    merged section heading, e.g. the live page's single-cell "Additional
-    models" divider — see
-    TestTwoRowLiveFixture.test_n1_n2_n4_fixes_mint_the_same_18_entries_and_24_prefixes
-    for proof the real fixture parses unchanged) is matched out BEFORE this
-    check ever runs, so a genuinely non-data row is never refused for its
-    width."""
+class TestVersionBoundaryIsStrict(Base):
+    """AOS-151 security correction, round 2, C2
+    (scripts/pricing_update.py: ``_version_boundary_ok``): the character
+    right after a matched version must be end-of-text or whitespace. The
+    earlier rule let any punctuation but `._-` through, so a separator
+    lookalike, a comma or slash, or an invisible format/combining character
+    silently truncated `4<ch>5` to Opus 4. Every such character now refuses
+    the whole run (EXIT_BOUNDS_REFUSED), nothing written."""
+
+    LAYOUT = "two-row"
+
+    # Separator lookalikes (the money() truncation classes and more), ASCII
+    # punctuation, and invisible format (Cf) / combining (Mn) characters.
+    REFUSED = ("٫", "．", "․", "·", "–", "‐", "＿", "٬", "，", "’", "'",
+               ",", "/", "%", "*", ")", ":", ";", "!", "?", "(", "+",
+               ".", "_", "-", "x", "٥", "²",
+               "​", "⁠", "﻿", "­", "‎", "́")
+
+    def _run(self, name):
+        path = self.f.write_html(self._html([(name, *_RATES_A)]))
+        return self.f.cli("--html", str(path))
+
+    def test_every_non_whitespace_character_after_the_version_refuses(self):
+        for ch in self.REFUSED:
+            # `4.5` itself is a well-formed version, so `.` is probed only
+            # after a complete one (`4.5.`).
+            names = [f"Claude Opus 4.5{ch}"]
+            if ch != ".":
+                names.append(f"Claude Opus 4{ch}5 tagline")
+            for name in names:
+                with self.subTest(ch=f"U+{ord(ch):04X}", name=name):
+                    before = self.f.digest()
+                    code, out, err = self._run(name)
+                    self.assertEqual(code,
+                                     pricing_update.EXIT_BOUNDS_REFUSED,
+                                     out + err)
+                    self.assertIn("malformed model version", out)
+                    self.assertEqual(self.f.digest(), before)
+                    self.assertEqual(self.f.pricing_rows("claude-opus-4-0"),
+                                     [])
+
+    def test_refusal_message_is_sanitized(self):
+        code, out, err = self._run("Claude Opus 4.5\x1b]0;pwned\x07\u202e")
+        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED, out + err)
+        for bad in ("\x1b", "\x07", "\u202e"):
+            self.assertNotIn(bad, out + err)
+
+    def test_whitespace_or_end_after_the_version_is_accepted(self):
+        for name in ("Claude Opus 4.5", "Claude Opus 4.5 (retired)",
+                     "Claude Opus 4.5&nbsp;Extended",
+                     "Claude Opus 4.5 Extended"):
+            with self.subTest(name=name):
+                entries = pricing_update.parse_models(
+                    self._html([(name, *_RATES_A)]))
+                self.assertEqual(
+                    [(e["family"], e["version"]) for e in entries],
+                    [("opus", "4.5")])
+
+
+class TestWidthMismatchedModelRowIsSkipped(Base):
+    """AOS-151 security correction, N4, reworked in round 2, C3
+    (scripts/pricing_update.py: the width guard in ``parse_models``'s row
+    loop, ``_Row.width``/``_colspan``, and the SKIPPED-ROW warning in
+    ``render``).
+
+    A model row that does not occupy the header's columns cell for cell —
+    wider (an extra cell), narrower (a short or colspan-merged row), or
+    holding a merged cell — used to shift every rate one column silently
+    (wider) or vanish with no warning (narrower); 3c8001e then refused the
+    WHOLE run for it, so one benign layout change blocked every refresh.
+    Now the row is SKIPPED: its rates are never read (so never shifted),
+    it is named in a sanitized SKIPPED-ROW warning (capped with the other
+    warnings), and every other model on the page is still recorded. A row
+    with no model name at all (the live page's "Additional models"
+    divider) is not a model row and is skipped without a warning, as
+    before."""
 
     LAYOUT = "two-row"
 
     HEADER_ROW = ("<tr><th>Name</th><th>Input</th><th>Output</th>"
                  "<th>5m writes</th><th>1h writes</th>"
                  "<th>Hits and refreshes</th></tr>")
+    GOOD_ROW = ("<tr><td>Claude Sonnet 5</td><td>$2 / MTok</td>"
+                "<td>$10 / MTok</td><td>$2.50 / MTok</td><td>$4 / MTok</td>"
+                "<td>$0.20 / MTok</td></tr>")
+    # Distinctive rates on the odd rows: none may appear anywhere in the DB.
+    ODD_RATES = (41.0, 42.0, 43.0, 44.0, 45.0, 46.0)
 
-    def _refused(self, data_row_html):
+    ODD_ROWS = {
+        "wider (extra middle cell)":
+            "<tr><td>Claude Opus 4.5</td><td>$41 / MTok</td>"
+            "<td>$42 / MTok</td><td>$43 / MTok</td><td>$44 / MTok</td>"
+            "<td>$45 / MTok</td><td>$46 / MTok</td></tr>",
+        "narrower (short row)":
+            "<tr><td>Claude Opus 4.5</td><td>$41 / MTok</td>"
+            "<td>$42 / MTok</td><td>$43 / MTok</td><td>$44 / MTok</td></tr>",
+        "wider by colspan":
+            "<tr><td>Claude Opus 4.5</td><td colspan=2>$41 / MTok</td>"
+            "<td>$42 / MTok</td><td>$43 / MTok</td><td>$44 / MTok</td>"
+            "<td>$45 / MTok</td></tr>",
+        "merged cell, header width (Contact sales)":
+            "<tr><td>Claude Opus 4.5</td><td colspan=5>Contact sales"
+            "</td></tr>",
+        "colspan-merged legacy heading":
+            '<tr><td colspan="6">Claude Opus 4 and earlier (legacy)'
+            "</td></tr>",
+    }
+
+    def _page(self, *rows):
+        return (f"<html><body><table>{_TWO_ROW_GROUP}{self.HEADER_ROW}"
+                + "".join(rows) + "</table></body></html>")
+
+    def _no_odd_rate_anywhere(self):
+        for row in self.f.pricing_rows():
+            for v in row[1:6]:
+                self.assertNotIn(v, self.ODD_RATES, row)
+
+    def test_odd_row_is_skipped_with_a_warning_and_the_rest_recorded(self):
+        for label, odd in self.ODD_ROWS.items():
+            with self.subTest(label):
+                opus45_before = self.f.pricing_rows("claude-opus-4-5")
+                opus4_before = self.f.pricing_rows("claude-opus-4-0")
+                path = self.f.write_html(self._page(odd, self.GOOD_ROW))
+                code, out, err = self.f.cli("--html", str(path))
+                self.assertEqual(code, 0, out + err)
+                self.assertIn("SKIPPED-ROW WARNING: Claude Opus", out)
+                self.assertIn("rate-table row 1", out)
+                self.assertEqual(
+                    self.f.pricing_rows("claude-opus-4-5"), opus45_before)
+                self.assertEqual(
+                    self.f.pricing_rows("claude-opus-4-0"), opus4_before)
+                self.assertEqual(
+                    tuple(self.f.pricing_rows("claude-sonnet-5")[-1][1:6]),
+                    (2.0, 10.0, 0.2, 2.5, 4.0))
+                self._no_odd_rate_anywhere()
+
+    def test_parse_models_reports_the_skipped_row(self):
+        skipped = []
+        entries = pricing_update.parse_models(
+            self._page(self.GOOD_ROW, self.ODD_ROWS["wider (extra middle cell)"]),
+            skipped)
+        self.assertEqual([(e["family"], e["version"]) for e in entries],
+                         [("sonnet", "5")])
+        self.assertEqual(skipped, [("opus", "4.5", 2, 7, 7, 6,
+                                    "Claude Opus 4.5")])
+
+    def test_only_width_mismatched_rows_means_no_model_rows(self):
         before = self.f.digest()
-        html = (f"<html><body><table>{_TWO_ROW_GROUP}{self.HEADER_ROW}"
-                f"{data_row_html}</table></body></html>")
-        path = self.f.write_html(html)
+        path = self.f.write_html(
+            self._page(self.ODD_ROWS["narrower (short row)"]))
         code, out, err = self.f.cli("--html", str(path))
-        self.assertEqual(code, pricing_update.EXIT_BOUNDS_REFUSED, out + err)
+        self.assertEqual(code, pricing_update.EXIT_OTHER_ERROR, out + err)
+        self.assertIn("1 model row(s) skipped", err)
         self.assertEqual(self.f.digest(), before)
-        return out, err
 
-    def test_wider_row_extra_middle_cell_refuses(self):
-        self._refused(
-            "<tr><td>Claude Opus 5.5</td><td>$4.00 / MTok</td>"
-            "<td>extra cell</td><td>$20.00 / MTok</td><td>$5.00 / MTok</td>"
-            "<td>$8.00 / MTok</td><td>$0.20 / MTok</td></tr>")
-
-    def test_narrower_row_colspan_merge_refuses(self):
-        self._refused(
-            "<tr><td>Claude Opus 5.5</td><td>$4.00 / MTok</td>"
-            "<td>$20.00 / MTok</td><td>$5.00 / MTok</td>"
-            "<td>$8.00 / MTok</td></tr>")
-
-    def test_section_heading_row_without_a_model_name_is_not_width_checked(
-            self):
-        # A colspan-merged, single-cell section heading (no "Claude
-        # <Family> <version>" text) is skipped by the model-name match
-        # before the width check runs, exactly like the live fixture's own
-        # "Additional models" divider row.
-        html = (f"<html><body><table>{_TWO_ROW_GROUP}{self.HEADER_ROW}"
-               '<tr><td>Additional models</td></tr>'
-               "<tr><td>Claude Opus 5.5</td><td>$4.00 / MTok</td>"
-               "<td>$20.00 / MTok</td><td>$5.00 / MTok</td>"
-               "<td>$8.00 / MTok</td><td>$0.20 / MTok</td></tr>"
-               "</table></body></html>")
-        path = self.f.write_html(html)
+    def test_skipped_row_warnings_are_capped(self):
+        n = pricing_update.WARNING_CAP + 5
+        odd = [f"<tr><td>Claude Opus {100 + i}</td><td>$41 / MTok</td></tr>"
+               for i in range(n)]
+        path = self.f.write_html(self._page(*odd, self.GOOD_ROW))
         code, out, err = self.f.cli("--html", str(path))
         self.assertEqual(code, 0, out + err)
+        self.assertEqual(out.count("SKIPPED-ROW WARNING:"),
+                         pricing_update.WARNING_CAP)
+        self.assertIn("… and 5 more SKIPPED-ROW warning(s)", out)
+
+    def test_skipped_row_warning_is_sanitized(self):
+        name = "Claude Opus 4.5 \x1b]0;pwned\x07 ‮evil \x9b31m"
+        path = self.f.write_html(self._page(
+            f"<tr><td>{name}</td><td>$41 / MTok</td></tr>", self.GOOD_ROW))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, 0, out + err)
+        line = next(l for l in out.splitlines()
+                    if l.startswith("SKIPPED-ROW WARNING"))
+        for bad in ("\x1b", "\x07", "‮", "\x9b"):
+            self.assertNotIn(bad, line)
+
+    def test_section_heading_row_without_a_model_name_is_not_a_model_row(
+            self):
+        path = self.f.write_html(self._page(
+            '<tr><td colspan="6">Additional models</td></tr>',
+            self.GOOD_ROW))
+        code, out, err = self.f.cli("--html", str(path))
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("SKIPPED-ROW", out)
         self.assertEqual(
-            [r[1] for r in self.f.pricing_rows("claude-opus-5-5")], [4.0])
+            [r[1] for r in self.f.pricing_rows("claude-sonnet-5")], [2.0])
+
+    def test_a_merged_header_cell_refuses_the_mapping(self):
+        # Rates are mapped by header CELL index, so a header whose cells do
+        # not line up one-to-one with the grid is a structural failure.
+        header = ("<tr><th>Name</th><th>Input</th><th>Output</th>"
+                  "<th>5m writes</th><th>1h writes</th>"
+                  "<th colspan=2>Hits and refreshes</th></tr>")
+        html = (f"<html><body><table>{_TWO_ROW_GROUP}{header}"
+                f"{self.GOOD_ROW}</table></body></html>")
+        with self.assertRaises(ValueError) as ctx:
+            pricing_update.parse_models(html)
+        self.assertIn("merged cell", str(ctx.exception))
+
+    def test_colspan_values_are_parsed_as_a_browser_clamps_them(self):
+        cases = {None: 1, "2": 2, "0": 1, "-5": 1, "abc": 1, "": 1,
+                 " +3": 3, "3.7": 3, "1000": 1000, "1001": 1000,
+                 "9" * 5000: 1000, "1e21": 1}
+        for value, span in cases.items():
+            with self.subTest(value=value if value is None else value[:12]):
+                attrs = [] if value is None else [("colspan", value)]
+                self.assertEqual(pricing_update._colspan(attrs), span)
 
 
 # Every class that renders a page through self._html() runs a second time

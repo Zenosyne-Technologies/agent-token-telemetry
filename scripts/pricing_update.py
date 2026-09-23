@@ -152,35 +152,193 @@ def _safe_error_text(value):
     return s if len(s) <= _ERROR_TEXT_MAX else s[:_ERROR_TEXT_MAX] + "…"
 
 
+# Cell text follows RENDERED-TEXT semantics (AOS-151 security correction,
+# round 2, C1): a cell's text is what a browser shows, not a join of its raw
+# text nodes. A comment contributes nothing and is never a boundary (the live
+# page is React SSR and splits text nodes with ``<!-- -->``); an inline
+# element concatenates with its neighbours with no inserted space (so
+# ``4<b>.5</b>`` reads ``4.5``, as it renders); a block-level element, a
+# ``<br>``, or a flex/grid ITEM is a boundary and inserts one space (so
+# ``5<br>1M-token`` reads ``5 1M-token``). Whitespace then collapses to single
+# spaces.
+#
+# Block-level: the HTML UA-stylesheet elements whose default ``display`` is
+# block, list-item or a table part.
+_BLOCK_TAGS = frozenset((
+    "address", "article", "aside", "blockquote", "body", "caption", "center",
+    "col", "colgroup", "dd", "details", "dialog", "dir", "div", "dl", "dt",
+    "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
+    "h4", "h5", "h6", "header", "hgroup", "hr", "html", "legend", "li",
+    "listing", "main", "menu", "nav", "ol", "p", "plaintext", "pre",
+    "search", "section", "summary", "table", "tbody", "td", "tfoot", "th",
+    "thead", "tr", "ul", "xmp"))
+# Void elements never get an end tag, so they are never pushed on the
+# element stack.
+_VOID_TAGS = frozenset((
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr"))
+# Flex/grid containers BLOCKIFY their children (CSS Display 3 §2.7): every
+# child element, and every run of text directly inside, becomes its own
+# block-level flex/grid item, so two inline elements that are siblings inside
+# a flex container render as separate boxes, not one run of text. This is
+# how the live page separates a model name from its tagline: the name cell is
+# ``<div class="flex min-w-0 flex-col"><a …>Claude Opus 5.5</a><span …>For
+# long-running…</span></div>`` — an ``<a>`` and a ``<span>``, both inline, with
+# no whitespace between them, shown on two lines only because their parent is
+# a flex column (and retired-model badges sit in ``<span class="inline-flex
+# …">``). The page's CSS is Tailwind utility classes, so a container is
+# recognized by an exact unprefixed class token below (a responsive/state
+# variant such as ``md:flex`` is conditional and ignored) or by an inline
+# ``style`` declaring ``display: [inline-]flex|grid``. No other CSS is
+# modelled: an element restyled some other way reads as its tag's default,
+# and where that glues text onto a version the strict version boundary in
+# :func:`_version_boundary_ok` refuses the run rather than guessing.
+_FLEX_GRID_CLASSES = frozenset(("flex", "inline-flex", "grid", "inline-grid"))
+_FLEX_GRID_STYLE_RE = re.compile(
+    r"(?:^|;)\s*display\s*:\s*(?:inline-)?(?:flex|grid)\b", re.I)
+
+
+# A browser clamps a cell's colspan to 1..1000 (HTML "rules for parsing
+# non-negative integers"; 0 or unparseable -> 1).
+_MAX_COLSPAN = 1000
+_COLSPAN_RE = re.compile(r"[\t\n\f\r ]*\+?([0-9]+)")
+
+
+def _colspan(attrs):
+    """A cell's column span as a browser computes it: the leading
+    non-negative integer of its ``colspan`` attribute, 1 when the attribute
+    is absent, unparseable or 0, and clamped to :data:`_MAX_COLSPAN`. A
+    digit run longer than four characters is already over the clamp, so it
+    is never converted (a hostile 5 MB digit string costs nothing).
+
+    :param attrs: the cell's ``(name, value)`` attribute pairs.
+    :returns: the span, ``1``..``_MAX_COLSPAN``.
+    """
+    for name, value in attrs:
+        if name != "colspan":
+            continue
+        m = _COLSPAN_RE.match(value or "")
+        if not m:
+            return 1
+        digits = m.group(1)
+        n = _MAX_COLSPAN if len(digits) > 4 else int(digits)
+        return min(max(n, 1), _MAX_COLSPAN)
+    return 1
+
+
+class _Row(list):
+    """One table row: a list of cell texts, plus ``width`` — the row's
+    EFFECTIVE width, the sum of its cells' :func:`_colspan` (AOS-151 security
+    correction, round 2, C3). A plain list compares equal to it."""
+
+    def __init__(self):
+        super().__init__()
+        self.width = 0
+
+
+def _is_flex_or_grid_container(attrs):
+    """Whether an element's attributes make it a flex or grid container
+    (see :data:`_FLEX_GRID_CLASSES`): an exact ``flex``/``inline-flex``/
+    ``grid``/``inline-grid`` class token, or an inline ``style`` declaring
+    ``display: [inline-]flex|grid``.
+
+    :param attrs: the ``(name, value)`` pairs :class:`HTMLParser` passes to
+        ``handle_starttag``.
+    :returns: ``True`` for a flex/grid container, else ``False``.
+    """
+    for name, value in attrs:
+        if not value:
+            continue
+        if name == "class" and not _FLEX_GRID_CLASSES.isdisjoint(value.split()):
+            return True
+        if name == "style" and _FLEX_GRID_STYLE_RE.search(value):
+            return True
+    return False
+
+
 class TableCollector(HTMLParser):
-    """Every <table> as a list of rows, each row a list of cell texts."""
+    """Every <table> as a list of rows, each row a list of cell texts.
+
+    A cell's text is its RENDERED text (AOS-151 security correction, round
+    2, C1): comments contribute nothing, inline elements concatenate with no
+    inserted space, block-level elements, ``<br>`` and flex/grid items
+    (:data:`_FLEX_GRID_CLASSES`) insert one boundary space, and whitespace
+    collapses to single spaces. Inside a cell an element stack tracks which
+    open element is a flex/grid container (its children are blockified) and
+    which ones must emit a boundary when they close; a per-tag count keeps
+    an end tag with no matching open element an O(1) no-op, so a flood of
+    stray end tags can never make each one rescan a deep stack."""
 
     def __init__(self):
         super().__init__()
         self.tables, self._rows, self._row, self._cell = [], None, None, None
+        self._cell_span = 1
+        # In-cell element stack: [tag, is_flex_or_grid_container,
+        # emits_a_boundary_when_closed] per open element, plus a count of
+        # each tag's open entries.
+        self._stack, self._open = [], {}
+
+    def _start_cell(self, attrs):
+        self._cell, self._cell_span = [], _colspan(attrs)
+        self._stack = [["td", _is_flex_or_grid_container(attrs), False]]
+        self._open = {}
+
+    def _in_cell_start(self, tag, attrs):
+        parent_is_container = self._stack[-1][1] if self._stack else False
+        if tag in _VOID_TAGS:
+            # <br>/<hr> always break the line; any other void element (an
+            # <img>, say) is a boundary only as a flex/grid item. <wbr>
+            # generates no box and never breaks the text.
+            if tag in ("br", "hr") or (parent_is_container and tag != "wbr"):
+                self._cell.append(" ")
+            return
+        boundary = tag in _BLOCK_TAGS or parent_is_container
+        if boundary:
+            self._cell.append(" ")
+        self._stack.append([tag, _is_flex_or_grid_container(attrs), boundary])
+        self._open[tag] = self._open.get(tag, 0) + 1
+
+    def _in_cell_end(self, tag):
+        if tag in _VOID_TAGS:
+            # A stray </br> is a <br> to a browser; other void end tags are
+            # ignored.
+            if tag == "br":
+                self._cell.append(" ")
+            return
+        if not self._open.get(tag):
+            # No matching open element: a stray block end tag still breaks
+            # the line (a browser opens and closes an empty one); a stray
+            # inline end tag is ignored.
+            if tag in _BLOCK_TAGS:
+                self._cell.append(" ")
+            return
+        # Close up to and including the most recent open ``tag`` — every
+        # element it implicitly closes emits its own boundary as well.
+        while True:
+            name, _container, boundary = self._stack.pop()
+            self._open[name] -= 1
+            if boundary:
+                self._cell.append(" ")
+            if name == tag:
+                break
 
     def handle_starttag(self, tag, attrs):
         if tag == "table":
             self._rows = []
         elif tag == "tr" and self._rows is not None:
-            self._row = []
+            self._row = _Row()
         elif tag in ("td", "th") and self._row is not None:
-            self._cell = []
+            self._start_cell(attrs)
+        elif self._cell is not None:
+            self._in_cell_start(tag, attrs)
 
     def handle_endtag(self, tag):
         if tag in ("td", "th") and self._cell is not None:
-            # Join text-node/element boundaries with a single space, THEN
-            # collapse/re-join on whitespace (AOS-151 security correction,
-            # N1 layer 1): a name cell built from several elements — e.g.
-            # ``<a>Claude Sonnet 5</a><span>1M-token…</span>`` — has no
-            # whitespace text node between the tags, so concatenating with
-            # ``""`` glued the tagline straight onto the version
-            # (``"...5" + "1M-token…"`` -> ``"...51M-token…"``). Joining
-            # with ``" "`` first guarantees a boundary space between every
-            # pair of text pieces; the ``.split()``/``" ".join`` pass still
-            # collapses any real multi-space runs within a single piece, so
-            # this changes nothing for a cell built from one text node.
-            self._row.append(" ".join(" ".join(self._cell).split()))
+            # Collapse whitespace (any Unicode whitespace, as it always has)
+            # to single spaces and trim — the boundary spaces inserted above
+            # included.
+            self._row.append(" ".join("".join(self._cell).split()))
+            self._row.width += self._cell_span
             self._cell = None
         elif tag == "tr" and self._row is not None:
             self._rows.append(self._row)
@@ -188,8 +346,12 @@ class TableCollector(HTMLParser):
         elif tag == "table" and self._rows is not None:
             self.tables.append(self._rows)
             self._rows = None
+        elif self._cell is not None:
+            self._in_cell_end(tag)
 
     def handle_data(self, data):
+        # A comment never reaches here (HTMLParser.handle_comment is a
+        # no-op), so the text on either side of one concatenates directly.
         if self._cell is not None:
             self._cell.append(data)
 
@@ -416,30 +578,32 @@ _MODEL_NAME_RE = re.compile(
 def _version_boundary_ok(text, pos):
     """Whether a model version :data:`_MODEL_NAME_RE` matched in ``text`` is
     COMPLETE rather than truncated by the regex's capped grammar (AOS-151
-    security correction, N1/N2).
+    security correction, N1/N2; strict since round 2, C2).
 
     The character at ``text[pos]`` — immediately after the matched version
-    (:meth:`re.Match.end`) — must be end-of-text, whitespace, or punctuation
-    OTHER than ``.``, ``_`` or ``-``. It must never be a letter or a digit of
-    any script (checked with ``str.isalnum``, which also catches non-ASCII
-    digits) and never one of ``.``, ``_``, ``-``: each of those means the
-    real version continues past what the grammar captured — a tagline glued
-    onto the digits with no separating whitespace (``"...5" + "1M-token…"``),
-    a third ``.``-separated component, an extra digit run past the 3-digit
-    cap, or an underscore/hyphen-separated continuation (``9_9``).
+    (:meth:`re.Match.end`) — must be end-of-text or Unicode whitespace
+    (``str.isspace``). ANYTHING else refuses: a letter or digit of any
+    script (a tagline glued onto the digits, an extra digit run past the
+    3-digit cap), ``.``/``_``/``-``/``,``/``/`` (a third component, a
+    ``9_9``/``4-5``/``4,5``/``4/5`` continuation), a separator lookalike
+    (``٫``, ``．``, ``․``, ``·``, ``–``, ``‐``, ``＿`` …) and an invisible
+    format or combining character (category Cf/Mn such as U+200B, U+2060,
+    U+FEFF, U+00AD, U+200E, U+0301). The earlier rule allowed "punctuation
+    other than ``._-``", and every lookalike above slipped through it,
+    silently truncating ``4٫5`` to Opus 4. No punctuation is allowed: none of
+    the committed page captures (tests/fixtures) has a rate-table model name
+    followed by anything but end-of-cell or whitespace, so no legitimate
+    form needs an exception.
 
-    :param text: the row's name-cell text (already collapsed to single
+    :param text: the row's name-cell text (rendered and collapsed to single
         spaces by :class:`TableCollector`).
     :param pos: the index right after the matched version.
     :returns: ``True`` when the version is complete, else ``False``.
     """
-    if pos >= len(text):
-        return True
-    ch = text[pos]
-    return not (ch.isalnum() or ch in "._-")
+    return pos >= len(text) or text[pos].isspace()
 
 
-def parse_models(html):
+def parse_models(html, skipped=None):
     """The model-pricing table -> ordered entries:
     {family, version, rates, condition: None|('through'|'starting', date)}.
 
@@ -447,6 +611,13 @@ def parse_models(html):
     current two-row layout or the older single-row one) and mapped by
     :func:`_map_rate_columns`; every data row, whichever layout matched,
     then goes through the same token, bound and sanitization checks below.
+
+    A model row that does not occupy the header's columns cell for cell —
+    its effective width (colspan summed) differs from the header's, or it
+    holds a merged cell — is SKIPPED, never read (AOS-151 security
+    correction, round 2, C3): its rates are never shifted into other
+    columns, the rest of the page is still recorded, and the row is
+    reported through ``skipped`` rather than dropped silently.
 
     Raises :class:`ValueError` for a structural parse failure (table/column
     not found, a cell with no dollar amount at all, no model rows) — main()
@@ -456,41 +627,67 @@ def parse_models(html):
     outside :data:`MAX_RATE_USD`/:data:`MIN_INOUT_RATE_USD` — which main()
     maps to :data:`EXIT_BOUNDS_REFUSED` instead: the page read and parsed
     fine, it is just untrustworthy, a different failure mode from either a
-    fetch failure or a structural one."""
+    fetch failure or a structural one — and, since AOS-151, for a malformed
+    model version (:func:`_version_boundary_ok`).
+
+    :param html: the pricing page HTML.
+    :param skipped: an optional list; each skipped model row is appended to
+        it as ``(family, version, row_number, cells, width, header_width,
+        name_text)`` — ``row_number`` is 1-based among the table's data rows
+        and ``name_text`` is the sanitized (:func:`_safe_error_text`) name
+        cell. :func:`run_update` renders them as SKIPPED-ROW warnings.
+    :returns: the parsed entries, in page order.
+    """
     tc = TableCollector()
     tc.feed(html)
     header, body, needles = _locate_rate_table(tc.tables)
     col = _map_rate_columns(header, needles)
+    # The columns are mapped by header CELL index, so a header holding a
+    # merged cell would map every rate against the wrong grid column.
+    if getattr(header, "width", len(header)) != len(header):
+        raise ValueError("unexpected pricing table header (merged cell):"
+                         f" {_safe_error_text(header)}")
+    if skipped is None:
+        skipped = []
 
     entries = []
-    for row in body:
+    for row_number, row in enumerate(body, 1):
         # Match the model name FIRST (AOS-151 security correction, N4): a
-        # row with no ``Claude <Family> <version>`` cell is not a data row
+        # row with no ``Claude <Family> <version>`` cell is not a model row
         # at all — e.g. a colspan-merged section heading such as the live
-        # page's single-cell "Additional models" divider — and is skipped,
-        # never subjected to the width check below.
+        # page's single-cell "Additional models" divider — and is passed
+        # over without a warning, never reaching the width check below.
         m = _MODEL_NAME_RE.search(row[0])
         if not m:
             continue
         if not _version_boundary_ok(row[0], m.end(2)):
             raise PricingRefused(
                 "Pricing refresh REFUSED — nothing written: malformed model"
-                " version (a tagline glued onto the digits with no"
-                " separating whitespace, an extra version component past"
-                " the two-component cap, or a `._-`-joined continuation) in"
-                f" row: {_safe_error_text(row[0])}")
-        # A genuine data row's cell count must match the header's column
-        # count exactly (AOS-151 security correction, N4): a wider row (an
-        # extra cell) used to shift every rate one column silently, within
-        # bounds; a narrower row (e.g. a colspan merge) used to be skipped
-        # with no warning. Either shape is now refused rather than
-        # accepted-but-wrong or silently dropped.
-        if len(row) != len(header):
-            raise PricingRefused(
-                "Pricing refresh REFUSED — nothing written: data row width"
-                f" ({len(row)} cells) does not match the header's"
-                f" ({len(header)} cells) for Claude {m.group(1).title()}"
-                f" {m.group(2)}: {_safe_error_text(row[0])}")
+                " version (the character right after the version is neither"
+                " whitespace nor the end of the name: a glued tagline, an"
+                " extra version component or digit run, a punctuation or"
+                " lookalike-separator continuation, or an invisible format"
+                f" character) in row: {_safe_error_text(row[0])}")
+        # A model row must occupy the header's columns cell for cell
+        # (AOS-151 security correction, N4; skip-and-warn since round 2,
+        # C3): a wider row (an extra cell) used to shift every rate one
+        # column silently, and a narrower one (a colspan merge, a "Contact
+        # sales" row) was dropped with no warning. Such a row is now
+        # SKIPPED — its rates are never read, so never shifted — and
+        # reported as a SKIPPED-ROW warning; one odd row never blocks the
+        # refresh of every other model on the page. ``width`` is the row's
+        # EFFECTIVE width (colspan summed, :class:`_Row`), and a merged cell
+        # (cells != width) is skipped too, since rates are read by cell
+        # index. Ordering matters: the model name is matched and its version
+        # checked first, so a non-model row (the live page's "Additional
+        # models" divider) is not a skipped model row, and a malformed
+        # version still refuses the whole run whatever the row's width.
+        width = getattr(row, "width", len(row))
+        if len(row) != len(header) or width != len(header):
+            skipped.append((m.group(1).lower(), m.group(2), row_number,
+                            len(row), width, len(header),
+                            _safe_error_text(row[0])))
+            continue
         condition = None
         dm = re.search(r"(through|starting)\s+([A-Z][a-z]+ [0-9]{1,2}, [0-9]{4})",
                        row[0])
@@ -528,7 +725,10 @@ def parse_models(html):
         entries.append({"family": m.group(1).lower(), "version": m.group(2),
                         "rates": rates, "condition": condition})
     if not entries:
-        raise ValueError("no model rows parsed from the pricing table")
+        raise ValueError(
+            "no model rows parsed from the pricing table"
+            + (f" ({len(skipped)} model row(s) skipped: width mismatch or"
+               " merged cells)" if skipped else ""))
     return entries
 
 
@@ -889,13 +1089,15 @@ def fmt_rates(r):
             f" / {n(r['cache_w_usd'])} / {n(r['cache_w_1h_usd'])}")
 
 
-WARNING_CAP = 20   # per-category cap on STALE/BACKDATED/FUTURE report lines
+WARNING_CAP = 20   # per-category cap on STALE/BACKDATED/FUTURE/SKIPPED-ROW
+                   # report lines
 
 
 def _capped_warnings(items, line_fn, kind):
     """At most :data:`WARNING_CAP` rendered ``kind`` warning lines for
     ``items`` (:func:`stale_intros` / :func:`filter_backdated_starting` /
-    :func:`future_only_newest` output), each its own blank-line-prefixed
+    :func:`future_only_newest` output, or :func:`parse_models`' skipped
+    model rows), each its own blank-line-prefixed
     block via ``line_fn``, plus one "... and N more" summary line when
     ``items`` holds more than the cap (AOS-143 correction, F3 sev4-low): an
     adversarial or just very large page can otherwise print thousands of
@@ -921,7 +1123,7 @@ def _capped_warnings(items, line_fn, kind):
 
 
 def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
-           future_only=()):
+           future_only=(), skipped_rows=()):
     """The finished markdown run report.
 
     :param candidates: planned+applied candidates (:func:`plan`,
@@ -938,6 +1140,9 @@ def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
     :param future_only: :func:`future_only_newest` output — one FUTURE-RATE
         WARNING line per family whose newest version's only rate has not
         started yet.
+    :param skipped_rows: :func:`parse_models`' ``skipped`` tuples — one
+        SKIPPED-ROW WARNING line per model row whose width did not match
+        the header (AOS-151 security correction, round 2, C3).
     :returns: the report text.
     """
     out = ["| model prefix | in / out / cache-read / 5m-write / 1h-write"
@@ -971,6 +1176,15 @@ def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
                 " old and was not recorded; the rows already recorded for"
                 f" {name} are unchanged.")
 
+    def _skipped_line(item):
+        fam, ver, row_number, cells, width, header_width, name_text = item
+        return (f"SKIPPED-ROW WARNING: Claude {fam.capitalize()} {ver}"
+                f" (rate-table row {row_number}: \"{name_text}\") — the row"
+                f" has {cells} cell(s) spanning {width} column(s) but the"
+                f" header has {header_width}; its rates were NOT read (never"
+                " shifted into other columns) and nothing was minted for it."
+                " Every other listed model was processed as usual.")
+
     def _future_line(item):
         fam, ver, date = item
         return (f"FUTURE-RATE WARNING: Claude {fam.capitalize()} {ver}"
@@ -981,6 +1195,7 @@ def render(candidates, inserted, unpriced, today, stale=(), backdated=(),
     out += _capped_warnings(stale, _stale_line, "STALE-PRICE")
     out += _capped_warnings(backdated, _backdated_line, "BACKDATED-STARTING")
     out += _capped_warnings(future_only, _future_line, "FUTURE-RATE")
+    out += _capped_warnings(skipped_rows, _skipped_line, "SKIPPED-ROW")
     out += ["", f"Source: {URL} — checked {today.isoformat()},"
             f" {inserted} row(s) inserted (history is insert-only; existing"
             " rows are never modified)."]
@@ -996,7 +1211,7 @@ class PricingRefused(Exception):
     structural parse failure (:class:`ValueError`)."""
 
 
-def run_update(conn, entries, today, source=URL):
+def run_update(conn, entries, today, source=URL, skipped_rows=()):
     """Plan, apply and report one pricing refresh of parsed page ``entries``.
 
     Two bounds (AOS-143) can refuse work before any write reaches the DB: an
@@ -1015,10 +1230,13 @@ def run_update(conn, entries, today, source=URL):
     :param entries: :func:`parse_models` output, in page order.
     :param today: the run date (UTC).
     :param source: the ``source`` column value for inserted rows.
+    :param skipped_rows: the model rows :func:`parse_models` skipped for a
+        width mismatch (its ``skipped`` list), reported as SKIPPED-ROW
+        warnings.
     :returns: the finished markdown run report (:func:`render`), including a
-        STALE-PRICE / BACKDATED-STARTING / FUTURE-RATE WARNING line per
-        :func:`stale_intros` / :func:`filter_backdated_starting` /
-        :func:`future_only_newest`.
+        STALE-PRICE / BACKDATED-STARTING / FUTURE-RATE / SKIPPED-ROW WARNING
+        line per :func:`stale_intros` / :func:`filter_backdated_starting` /
+        :func:`future_only_newest` / ``skipped_rows`` item.
     :raises PricingRefused: the candidate count exceeds
         :data:`MAX_CANDIDATES`; nothing was planned or applied.
     """
@@ -1034,7 +1252,7 @@ def run_update(conn, entries, today, source=URL):
     inserted = apply(conn, candidates, source)
     return render(candidates, inserted, unpriced_models(conn), today,
                   stale_intros(entries, today), backdated,
-                  future_only_newest(entries, today))
+                  future_only_newest(entries, today), skipped_rows)
 
 
 # ------------------------------------------------------------------ backfill
@@ -2299,8 +2517,9 @@ def main(argv=None):
     # distinct outcome — also no fallback, since a page that read fine but
     # did not parse as expected is exactly the kind of anomaly the
     # fallback's unbounded manual read must not be trusted with either.
+    skipped_rows = []
     try:
-        entries = parse_models(html)
+        entries = parse_models(html, skipped_rows)
     except PricingRefused as exc:
         print(exc.args[0])
         return EXIT_BOUNDS_REFUSED
@@ -2320,7 +2539,7 @@ def main(argv=None):
         print(f"pricing DB error: {_safe_error_text(exc)}", file=sys.stderr)
         return EXIT_OTHER_ERROR
     try:
-        print(run_update(conn, entries, today))
+        print(run_update(conn, entries, today, skipped_rows=skipped_rows))
     except PricingRefused as exc:
         print(exc.args[0])
         return EXIT_BOUNDS_REFUSED

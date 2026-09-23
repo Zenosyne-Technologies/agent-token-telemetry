@@ -2,8 +2,8 @@
 doc: Pricing Updates
 type: handbook
 status: active
-summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection across the live page's two-row header and the older single-row one, minting only the rate in force today per listed version (with warnings for an expired intro or a future-only-newest version), the own-price-vs-estimate definitions, the dashboard's own-price warning banner (AOS-135) that now surfaces them with its node-gated client tests, the consent-gated backfill of estimated events, the narrow exceptions to the pricing table's immutability contract, and the AOS-143 parser bounds (backdated-starting refusal, malformed-token rejection extended in round 2 to separator/suffix/notation characters, rate-magnitude/floor and row-count caps, capped per-row warnings, three distinct exit codes so the command's fallback can never bypass a bound, a wall-clock fetch deadline and body-size cap closing a hang/DoS gap, an unopenable-DB error mapped to its documented exit code, sanitized error and fetch-failure text, and round 2's F1b fix that closed the fallback itself — it now only ever re-fetches the page and re-runs this same script, never on an unattended/scheduled run) that keep a hostile or broken page from minting permanent bad rows.
-keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning, future-rate-warning, backdated-starting-warning, parser-bounds, max-rate-usd, min-inout-rate-usd, max-candidates, warning-cap, exit-bounds-refused, exit-fetch-failed, exit-other-error, dashboard, price-warning-banner, node-gated-tests, require-node, backfill, backfill-plan, backfill-apply, f1b, fetch-timeout-s, fetch-max-bytes, strict-number-token]
+summary: How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection across the live page's two-row header and the older single-row one, rendered-text cell reading with a strict model-version boundary and skip-and-warn for width-mismatched model rows (AOS-151), minting only the rate in force today per listed version (with warnings for an expired intro or a future-only-newest version), the own-price-vs-estimate definitions, the dashboard's own-price warning banner (AOS-135) that now surfaces them with its node-gated client tests, the consent-gated backfill of estimated events, the narrow exceptions to the pricing table's immutability contract, and the AOS-143 parser bounds (backdated-starting refusal, malformed-token rejection extended in round 2 to separator/suffix/notation characters, rate-magnitude/floor and row-count caps, capped per-row warnings, three distinct exit codes so the command's fallback can never bypass a bound, a wall-clock fetch deadline and body-size cap closing a hang/DoS gap, an unopenable-DB error mapped to its documented exit code, sanitized error and fetch-failure text, and round 2's F1b fix that closed the fallback itself — it now only ever re-fetches the page and re-runs this same script, never on an unattended/scheduled run) that keep a hostile or broken page from minting permanent bad rows.
+keywords: [pricing, pricing-update, parse_models, build_candidates, immutability, effective_from, in-force, estimated, family-default, ancestor-row, stale-price-warning, future-rate-warning, backdated-starting-warning, parser-bounds, max-rate-usd, min-inout-rate-usd, max-candidates, warning-cap, exit-bounds-refused, exit-fetch-failed, exit-other-error, dashboard, price-warning-banner, node-gated-tests, require-node, backfill, backfill-plan, backfill-apply, f1b, fetch-timeout-s, fetch-max-bytes, strict-number-token, rendered-text, version-boundary, skipped-row-warning, colspan]
 level: project
 audience: developer
 module: pricing-update
@@ -61,6 +61,75 @@ value bounds, and the sanitization below apply identically.
 `tests/test_pricing_bounds.py` runs every class that builds a page twice,
 once per layout (the generated `...TwoRowLayout` twins), and fails if a new
 page-building class is added without a twin.
+
+## Reading a data row: cell text, model name, row width (AOS-151)
+
+**Cell text is the text a browser renders.** `TableCollector` builds every
+cell's text as follows:
+
+- An HTML comment contributes nothing and is never a boundary. The live page
+  is React SSR and splits text nodes with `<!-- -->`, so
+  `4<!-- -->.<!-- -->5` reads `4.5`.
+- An inline element (`span`, `a`, `b`, `strong`, `i`, `em`, `sup`, `code`, …)
+  concatenates with its neighbours with no inserted space, so `4<b>.5</b>`
+  reads `4.5`.
+- A block-level element (`div`, `p`, `li`, headings, table parts, …, the list
+  is `_BLOCK_TAGS`), a `<br>`, and a flex/grid item insert one boundary space,
+  so `Claude Sonnet 5<br>1M-token` reads `Claude Sonnet 5 1M-token`.
+- Whitespace then collapses to single spaces.
+
+A flex or grid container blockifies its children (CSS Display §2.7), and that
+is how the live page separates a model name from its tagline. The name cell is
+`<div class="flex min-w-0 flex-col"><a>Claude Opus 5.5</a><span>For …</span></div>`:
+two inline elements with no whitespace between them, on separate lines only
+because their parent is a flex column. A retired model's name sits in a
+`<span class="inline-flex">` beside a badge button whose icon is a
+private-use glyph (U+E0F0). The page's CSS is Tailwind, so a container is
+recognized by an exact, unprefixed `flex`/`inline-flex`/`grid`/`inline-grid`
+class token or an inline `style` declaring `display: [inline-]flex|grid`. A
+responsive variant such as `md:flex` is conditional and is ignored. No other
+CSS is modelled. An `<a>` + `<span>` outside any flex container reads as one
+run of text (`Claude Sonnet 51M-token`), which the version boundary below then
+refuses.
+
+**Model name and version.** `_MODEL_NAME_RE` matches
+`Claude <Family> <version>`, where the version is at most two `.`-separated
+components of at most three digits each. `_version_boundary_ok` then requires
+the character right after the version to be end-of-text or whitespace
+(`str.isspace`). Anything else refuses the whole run (`PricingRefused`, exit
+1, nothing written):
+
+- a letter or a digit of any script
+- `.`, `_`, `-`, `,`, `/`, `%` or other ASCII punctuation
+- a separator lookalike (`٫`, `．`, `․`, `·`, `–`, `‐`, `＿`, …)
+- an invisible format or combining character (U+200B, U+2060, U+FEFF, U+00AD,
+  U+200E, U+0301, …)
+
+No punctuation is allowed. In every committed page capture under
+`tests/fixtures/`, a rate-table model name is followed only by end-of-cell or
+whitespace.
+
+**Row width.** Rates are read by cell index, so a model row must occupy the
+header's columns cell for cell: its cell count and its effective width (each
+cell's `colspan`, parsed and clamped to 1..1000 the way a browser does it,
+summed) must both equal the header's cell count. A model row that does not
+(an extra cell, a short row, a merged "Contact sales" cell, a colspan'd
+"Claude Opus 4 and earlier" heading) is **skipped**:
+
+- its rates are never read, so they are never shifted into other columns
+- every other model on the page is still recorded
+- the report prints a `SKIPPED-ROW WARNING` naming the model, its rate-table
+  row number and its sanitized name-cell text; these lines are capped at
+  `WARNING_CAP` like the other warning categories
+
+The order of checks is: model name, then version boundary, then width. So a row
+with no model name at all (the live page's "Additional models" divider) is
+passed over without a warning, and a malformed version still refuses the run
+whatever the row's width. If every model row is skipped, the run ends with
+"no model rows" (`EXIT_OTHER_ERROR`), and the message gives the skipped count.
+A header holding a merged cell raises "unexpected pricing table header"
+(`EXIT_OTHER_ERROR`), because every rate would otherwise map against the wrong
+column.
 
 ## Never mint a future-dated row
 
@@ -249,12 +318,12 @@ REFUSING a page bound, a different failure mode from either a fetch or a
 structural parse failure.
 
 **Unbounded per-row warning lines (`WARNING_CAP`, in `render()`, AOS-143
-corrected).** A STALE-PRICE, BACKDATED-STARTING or FUTURE-RATE warning is
-not a candidate row, so `MAX_CANDIDATES` above does not bound how many of
+corrected).** A STALE-PRICE, BACKDATED-STARTING, FUTURE-RATE or (AOS-151)
+SKIPPED-ROW warning is not a candidate row, so `MAX_CANDIDATES` above does not bound how many of
 them one run can print, and the command prints stdout "verbatim" into the
 agent's context. `_capped_warnings()` renders at most `WARNING_CAP` (20)
 lines per category, plus one "... and N more" summary line when there are
-more — independently for each of the three categories.
+more — independently for each of the four categories.
 
 **Raw page text and fetch-error text in printed messages
 (`_safe_error_text()`).** The two parse-failure messages that embed page
