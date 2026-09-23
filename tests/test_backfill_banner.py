@@ -26,7 +26,7 @@ import dashboard
 import pricing_update
 import settings
 
-from tests.test_backfill import D, DAY, FAM_OPUS, OPUS_55, Fixture, ev_cost
+from tests.test_backfill import D, DAY, FAM_OPUS, OPUS_55, Fixture
 
 LINE_TAIL = (" — run /token-telemetry:pricing-update to review and confirm"
              " (plan computed just now).")
@@ -308,12 +308,22 @@ class TestBannerLine(Base):
             "delta missing": self.valid(deltaText=None),
             "delta number": self.valid(deltaText=-3.6),
             "oversized": json.dumps(self.valid(pad="x" * 5000)).encode(),
+            # valid JSON whose first MAX_CACHE_BYTES still parse: only the
+            # size check (not the bounded read) rejects it
+            "oversized padded": (json.dumps(self.valid()) + " " * 5000).encode(),
         }
         for name, data in cases.items():
             with self.subTest(name):
                 self.write_raw(data)
                 self.assertIsNone(self.line(now), name)
                 self.assertIsNone(self.payload()["priceWarning"]["backfill"], name)
+
+    def test_fingerprint_error_is_no_line_and_no_error(self):
+        self.cli("--backfill-plan")
+        with mock.patch.object(backfill_summary, "fingerprint",
+                               side_effect=dashboard.sqlite3.OperationalError("boom")):
+            self.assertIsNone(self.line())
+            self.assertIsNone(self.payload()["priceWarning"]["backfill"])
 
     def test_directory_at_cache_path_is_no_line(self):
         self.cache.mkdir()
