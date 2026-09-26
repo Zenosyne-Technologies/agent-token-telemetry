@@ -2,15 +2,15 @@
 doc: Capture Pipeline
 type: handbook
 status: active
-summary: "Stop/SubagentStop capture hook: never-break-a-session guarantee, cursor/offset transcript tailing, lock ordering, migration post-conditions and the version hop chain, storage modes and central authority, mirror metadata semantics, sidecar attribution, project-name ladder resolution, pricing-at-query-time"
-keywords: [capture, stop-hook, subagentstop, never-break-a-session, transcript-tailing, cursor, lock-ordering, migrations, version-hop-chain, storage-modes, central-authority, mirror, sidecar-attribution, project-name-ladder, pricing-at-query-time]
+summary: "Stop/SubagentStop capture hook: never-break-a-session guarantee, cursor/offset transcript tailing, lock ordering, migration post-conditions and the version hop chain, project root resolution (linked worktrees key to their main repo) and the one-time v8 worktree fold, storage modes and central authority, mirror metadata semantics, sidecar attribution, project-name ladder resolution, pricing-at-query-time"
+keywords: [capture, stop-hook, subagentstop, never-break-a-session, transcript-tailing, cursor, lock-ordering, migrations, version-hop-chain, project-root, worktree, worktree-fold, storage-modes, central-authority, mirror, sidecar-attribution, project-name-ladder, pricing-at-query-time]
 level: project
 audience: developer
 module: capture
 sources: [scripts/capture.py, hooks/hooks.json, docs/TELEMETRY-CONTRACT.md]
 related: ["[[pricing-updates]]"]
 created: 2026-08-05
-updated: 2026-09-22
+updated: 2026-09-26
 ---
 
 # Capture Pipeline
@@ -80,13 +80,104 @@ pricing WHERE source=?`), not on the table's existence.
 
 Versions are applied as a **chain of hops**, each returning whether its own
 shape landed: `migrate_v2()` (the kit-aware `events` columns + `pricing`) then
-`migrate_v3()` (mirror metadata on `projects` + `audit_log`). `migrate_v3` runs
+`migrate_v3()` (mirror metadata on `projects` + `audit_log`), and so on up to
+`migrate_v8()` (the worktree fold below). `migrate_v3` runs
 only if `migrate_v2` reported success — attempting v3 on a DB whose v2 hop just
 failed would either fail again or, worse, stamp past a gap. A v1 DB therefore
 walks the whole chain in a single `connect()`, and a DB that fails halfway
 simply retries from where it stopped on the next hook firing. The fast path
 checks the shape of *every* hop (v2 columns, mirror columns, `audit_log`), not
 just the newest, which is what lets a DB stranded at any version heal itself.
+
+## Project root: a worktree belongs to its main repository
+
+Two roots are in play for every capture. The **checkout root** is
+`find_project_root(cwd)` — the nearest ancestor holding a `.git` entry. Inside
+a linked git worktree (Claude Code puts them at `<main>/.claude/worktrees/<name>`)
+that entry is a pointer FILE, so the checkout root is the worktree folder;
+keyed on it, every worktree used to become its own nameless project row, and
+reports fell back to the folder basename. `main_repo_root(checkout)` now maps
+such a checkout to its **main repository**, which is what the project is:
+
+| read from the main root (when there is one) | read from the checkout (cwd) |
+|---|---|
+| project key (`projects.path`), kit name (`project_name_from_kit`), mirror DB location | branch/sha (`git_meta`), commit-subject issue key (`issue_key_from_git`) |
+| opt-in marker and storage mode — **fallback** after the checkout's own marker | the sidecar — **first**, then the main root's |
+
+The kit writes `.claude/telemetry-context.json` into the checkout the session
+runs in ("the repo root" of that session, i.e. the worktree), hence
+worktree-first for the sidecar. The marker is dual too: a worktree's own
+marker still counts and wins for the storage mode, and a main repo's opt-in
+now covers its worktrees — previously uncaptured worktree sessions start being
+captured, a deliberate behaviour change.
+
+`main_repo_root()` is pure bounded filesystem reads — no git subprocess, since
+capture has a hard latency budget — and never raises. It accepts the pointer
+only when the whole structure holds: `.git` is a regular non-symlink file
+(`O_NOFOLLOW`, and `O_NONBLOCK` so a FIFO can't hang the hook) of at most
+`GITFILE_MAX_BYTES` (4096) with one `gitdir:` line; the gitdir resolves to
+`<common>/worktrees/<id>` and its `commondir` (same cap) resolves back to
+`<common>`; `<common>` is a directory named `.git` whose parent is a directory.
+This is a structural boundary rather than an escape rule, and it is what keeps
+the exceptions exact: a submodule's gitdir sits under `.git/modules/`, a bare
+repo's common dir is not named `.git`, and a plain checkout or non-git
+directory has no pointer file — all of them stay their own project, as before.
+Anything malformed degrades to the pre-v8 behaviour (the checkout is the key).
+
+The key's **spelling** must equal how the main repo's own sessions spell it, or
+one repository would split into two rows. A checkout at
+`<M>/.claude/worktrees/<…>` therefore keys as `<M>` string-for-string (when
+`<M>` realpaths to the resolved main); any other worktree keys as the realpath
+of the main root, and `canonical_project_path()` then reuses an existing row
+that is realpath-equal to it, under that row's stored spelling. That lookup
+runs only for worktree sessions and before `BEGIN IMMEDIATE`. `report.py`'s
+this-project views (`/info`, scoped roll-ups) resolve the same key, so they
+show the main project's numbers from inside a worktree. The enable/disable
+commands still resolve `git rev-parse --show-toplevel`, i.e. the worktree —
+a marker written there simply counts as the worktree's own.
+
+## One-time fold of existing worktree rows (v8)
+
+`migrate_v8()` is a data step with no shape change: `fold_worktree_projects()`
+moves each worktree row into its main repository's row. A row is a worktree
+row by either of two rules (`worktree_fold_target()`):
+
+1. **Path convention** — needed because the folder is usually gone. `<M>` is
+   the prefix before the FIRST `/.claude/worktrees/` component, and at least
+   one name segment must follow (nested names fold too). It folds only when
+   `<M>` is realpath-equal to another row's path or is an existing directory
+   holding a `.git` directory; an unrelated path that merely contains the
+   component deeper down (`…/vendor/.claude/worktrees/x`, no repo at the
+   prefix) is left alone.
+2. **Resolution** — the path still exists and `main_repo_root()` maps it to a
+   different directory (worktrees created outside `.claude/worktrees/`).
+
+The target row is found by realpath equality (stored spelling kept) or created
+spelled `<M>`. Tables: `sessions.project_id` is reassigned — the only column
+keyed by project id; `events` (via `session_id`) and `cursors` (via transcript)
+follow without being touched; the main row takes the worktree's `name` only if
+it has none, and its `mirror_path`/`mirror_last_at` pair only if it has no
+mirror configured (never overwriting its own); the worktree row is deleted.
+`audit_log.project` is free text recording what was done at the time — it is
+history, left untouched, as `/storage-delete` leaves it.
+
+The fold and the `user_version=8` stamp share one `BEGIN IMMEDIATE`
+transaction (`user_version` is transactional), the version is re-read under
+the lock so a peer that folded first makes it a no-op, and any exception rolls
+back and returns False so the next `connect()` retries — the capture itself is
+never failed over it. A v8 DB is never folded again. **Limitation:** a
+worktree created outside `.claude/worktrees/` whose folder has been deleted
+matches neither rule, so its row stays separate.
+
+**Remote (Supabase) history is not folded.** New remote captures key
+correctly, since the remote write reuses the same `event_args`. A remote fold
+could apply only the path-convention rule, and not safely: SQL has no
+filesystem, so neither the "existing repo at `<M>`" check nor realpath
+equality is available, and the remaining exact-string rule would be a
+different, weaker contract than the local one. It would also be a new
+row-mutating function in the security-gated remote surface. The local central
+DB is authoritative and folds itself; remote history keeps its old worktree
+rows until the maintainer chooses to act on them.
 
 ## Storage modes: two DBs, one authority
 
@@ -136,7 +227,9 @@ not capture's job, so a hand-edited marker can leave a stale value behind.
 ## Sidecar enrichment: last-declared-task attribution
 
 `read_sidecar()` reads `.claude/telemetry-context.json`, which the kit
-rewrites whenever the agent switches tracker tasks. Any problem reading it —
+rewrites whenever the agent switches tracker tasks — from the checkout root,
+falling back to the main repository root inside a worktree (see *Project
+root* above). Any problem reading it —
 absent, unreadable, malformed, or implausibly large (`SIDECAR_MAX_BYTES`) — is
 a silent `None`; enrichment is never worth failing a capture over. The size
 check runs first and cheapest, before any parse attempt, because a runaway

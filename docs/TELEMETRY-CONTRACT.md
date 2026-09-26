@@ -13,11 +13,36 @@ any consumer: the file exists AND a `projects` row's `path` matches the consumer
 project root. Absent → the consumer omits its token output silently; nothing fails,
 nothing warns.
 
+### Project key: a worktree belongs to its main repository (schema v8)
+
+`projects.path` is the project's **main repository root**. The checkout root is the
+nearest ancestor of the session's cwd holding a `.git` entry. When that `.git` is a
+linked-worktree pointer file, the key is the main repository instead, so every
+`git worktree` (Claude Code's `<main>/.claude/worktrees/<name>` included) records under
+its main repo's row and name. A pointer file counts as a worktree only when **all** of
+these hold (else the checkout itself is the key, as before v8):
+
+- `.git` is a regular file (not a symlink) of at most 4096 bytes with one `gitdir:` line;
+- that gitdir resolves to `<common>/worktrees/<id>`, and its `commondir` file (≤4096
+  bytes) resolves to `<common>`;
+- `<common>` is a directory named `.git`, and its parent is a directory.
+
+A submodule (`gitdir` under `.git/modules/…`), a bare repo's worktree (common dir not
+named `.git`), a plain checkout and a non-git directory are their own project, unchanged.
+**Spelling:** a checkout at `<M>/.claude/worktrees/<…>` keys as `<M>` exactly as spelled
+(how the main repo's own sessions write it); any other worktree keys as the realpath of
+the main root, and capture reuses an existing row that is realpath-equal to it under
+that row's stored spelling — one repository, one row. A consumer running inside a
+worktree resolves its own project root the same way. Branch, commit sha and the
+commit-subject `issue_key` fallback still come from the worktree checkout.
+
 ## Storage modes (v0.3.0)
 
 The opt-in marker `.claude/telemetry` gained content. Its **first line** selects
-storage; the file is read from the project root (the nearest ancestor containing
-`.git`, the same resolution the sidecar uses):
+storage; the file is read from the checkout root (the nearest ancestor containing
+`.git`). Inside a linked worktree with no marker of its own, the main repository's
+marker applies — both to opt-in and to the storage mode — and the mirror lives at the
+main repository root:
 
 | First line | Mode | Effect |
 |---|---|---|
@@ -106,7 +131,7 @@ The mirror exists for retention and reuse — it travels with the repo or the te
 
 ## Schema version
 
-Current: `PRAGMA user_version = 7`. Migrations are additive deltas applied in
+Current: `PRAGMA user_version = 8`. Migrations are additive deltas applied in
 `capture.py`'s `migrate()`, run from `connect()`, and are idempotent — safe to run
 concurrently from multiple hook invocations. Hops run in order and each is gated on its
 own post-condition: a version is stamped only once the shape it promises is verifiably
@@ -143,6 +168,21 @@ heals itself.
   nullable `sessions.owner_id` (FK → `users.uuid`). Additive and inert — this hop only
   lays the schema down; nothing yet mints uuids or stamps `owner_id`. **NULL `owner_id` =
   pre-identity, never backfilled except by a later retro-link step.**
+- **v7 → v8** — a **data** step, no shape change: the one-time fold of
+  linked-worktree `projects` rows into their main repository's row (see *Project key*
+  above). A row folds when its path is `<M>/.claude/worktrees/<name…>` (`<M>` = the
+  prefix before the FIRST such component, at least one name segment after it) AND `<M>`
+  is realpath-equal to another row's path or is an existing directory with a `.git`
+  directory — or when its path still exists and resolves to a different main root. The
+  main row is created (spelled `<M>`) when absent. `sessions.project_id` is reassigned;
+  the main row takes the worktree's `name` only if it has none, and its
+  `mirror_path`/`mirror_last_at` pair only if it has no mirror configured; the worktree
+  row is deleted. `events` and `cursors` hang off sessions/transcripts and do not move;
+  `audit_log.project` is historical free text and stays untouched. Fold and stamp share
+  one transaction; a v8 DB is never folded again. **Limitation:** a worktree that lived
+  outside `.claude/worktrees/` and has since been deleted cannot be recognised, so its
+  row stays. **Remote (Supabase):** new captures key correctly (same resolution), but
+  remote history is **not** folded — see the developer handbook `capture-pipeline.md`.
 
 No column has ever been renamed or removed. v0.3.0 changed no schema at all — it added
 storage modes. A project-local mirror is byte-for-byte the same schema as the central DB;
@@ -541,9 +581,10 @@ mutated".
 
 ## Context sidecar (kit → telemetry)
 
-`capture.py` reads `.claude/telemetry-context.json` from the **project root only**
-(the nearest ancestor containing `.git`, same resolution `is_enabled()` uses) — a
-sidecar written under a subdirectory's `.claude/` is not picked up. Malformed, absent,
+`capture.py` reads `.claude/telemetry-context.json` from the **checkout root** (the
+nearest ancestor containing `.git`) — the kit writes it into the checkout the session
+runs in — and, inside a linked worktree that has none, from the main repository root.
+A sidecar written under a subdirectory's `.claude/` is not picked up. Malformed, absent,
 or non-dict content is silently treated as no sidecar; capture never fails on it.
 Non-scalar values (a JSON object/array under any key) are dropped for that key
 (coerced to null) rather than stringified. Shape:

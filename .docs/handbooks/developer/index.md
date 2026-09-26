@@ -6,7 +6,7 @@ summary: The table of contents for one handbook audience — every page in this 
 keywords: [handbook, index, pages, audience]
 level: project
 created: 2026-09-21
-updated: 2026-09-23
+updated: 2026-09-26
 ---
 
 # Handbook Index
@@ -19,7 +19,7 @@ updated: 2026-09-23
 
 | item | sources | what it covers | status | updated |
 |---|---|---|---|---|
-| [[capture-pipeline]] | `scripts/capture.py`, `hooks/hooks.json`, `docs/TELEMETRY-CONTRACT.md` | Stop/SubagentStop capture hook: never-break-a-session guarantee, cursor/offset transcript tailing, lock ordering, migration post-conditions and the version hop chain, storage modes and central authority, mirror metadata semantics, sidecar attribution, project-name ladder resolution, pricing-at-query-time | active | 2026-09-22 |
+| [[capture-pipeline]] | `scripts/capture.py`, `hooks/hooks.json`, `docs/TELEMETRY-CONTRACT.md` | Stop/SubagentStop capture hook: never-break-a-session guarantee, cursor/offset transcript tailing, lock ordering, migration post-conditions and the version hop chain, project root resolution (linked worktrees key to their main repo) and the one-time v8 worktree fold, storage modes and central authority, mirror metadata semantics, sidecar attribution, project-name ladder resolution, pricing-at-query-time | active | 2026-09-26 |
 | [[pricing-updates]] | `scripts/pricing_update.py`, `commands/pricing-update.md`, `commands/schedule-pricing.md`, `docs/TELEMETRY-CONTRACT.md`, `tests/pricing_golden.py`, `scripts/dashboard.py`, `scripts/dashboard.html`, `tests/test_dashboard_client.py`, `tests/dashboard_dom_harness.js`, `tests/test_backfill.py`, `scripts/backfill_summary.py`, `tests/test_backfill_banner.py` | How `pricing_update.py` refreshes the `pricing` table from Anthropic's published pricing page — case-insensitive table/column detection, minting only the rate in force today per listed version (with a stale-price warning for an expired intro with nothing else listed), the own-price-vs-estimate definitions, the dashboard's own-price warning banner (AOS-135) that now surfaces them with its node-gated client tests, the consent-gated backfill of estimated events (plan reads the DB read-only and caches a plan summary for the dashboard, verified all-or-nothing apply) and the dashboard's fingerprint-keyed "backfill available" line (AOS-149), and the narrow exceptions to the pricing table's immutability contract. | active | 2026-09-23 |
 | [[identity-model]] | `scripts/settings.py`, `scripts/manage.py`, `scripts/capture.py`, `commands/enable.md`, `docs/TELEMETRY-CONTRACT.md` | How a person is attached to their telemetry — the central `settings.json` (uuid + full name, mode 0600), the `users` table and `sessions.owner_id`, where the name is captured (the interactive enable command, never capture), and how capture stamps `owner_id` on new sessions without ever prompting. | active | 2026-09-22 |
 | [[storage-backend]] | `scripts/storage.py`, `scripts/capture.py`, `scripts/report.py`, `docs/TELEMETRY-CONTRACT.md` | The `StorageBackend` seam — the abstract interface capture's write path and report's read path call instead of `sqlite3` directly, `LocalSqliteBackend` as today's only implementation, how a remote backend (Supabase, later) plugs in, and why the read path stays SQL-coupled until the remote read-parity phase. | active | 2026-09-22 |
