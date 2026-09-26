@@ -518,13 +518,12 @@ def worktree_fold_target(path, other_paths):
     :param other_paths: every OTHER row's stored path.
     :returns: the main-root path string, or None.
     """
-    dotgit = os.path.join(path, ".git")
-    if os.path.isdir(dotgit):
-        return None
-    # A `.git` FILE that is not a linked-worktree pointer (a submodule's
-    # `.git/modules/…` gitdir, anything malformed): capture keeps keying that
-    # checkout as its own project, so the fold must leave it too.
-    if os.path.lexists(dotgit) and main_repo_root(path) is None:
+    # A live `.git` that is not a linked-worktree pointer — a DIRECTORY (a
+    # real clone), a submodule's `.git/modules/…` file, anything malformed:
+    # capture keeps keying that checkout as its own project, so the fold must
+    # leave it too.
+    if (os.path.lexists(os.path.join(path, ".git"))
+            and main_repo_root(path) is None):
         return None
     i = path.find(WORKTREE_COMPONENT)
     if i > 0 and any(path[i + len(WORKTREE_COMPONENT):].split("/")):

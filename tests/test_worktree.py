@@ -461,6 +461,34 @@ class TestEnableDisableScope(Fixture):
             self.capture(cwd, session=sid)
         self.assertFalse(self.db.exists())
 
+    def test_fifo_marker_is_left_and_reported(self):
+        m = self.main_repo()
+        ext = self.ext_worktree(m)
+        (ext / ".claude").mkdir()
+        os.mkfifo(ext / ".claude" / "telemetry")
+        summary = json.loads(self.run_manage(
+            "disable", "--cwd", str(m), expect_rc=2))
+        self.assertTrue(os.path.lexists(ext / ".claude" / "telemetry"))
+        self.assertEqual(len(summary["failed"]), 1)
+        self.assertFalse((m / ".claude" / "telemetry").exists())
+
+    def test_unremovable_marker_is_reported_and_the_rest_go(self):
+        m = self.main_repo()
+        wt = self.claude_worktree(m)
+        ext = self.ext_worktree(m)
+        (ext / ".claude").mkdir()
+        (ext / ".claude" / "telemetry").write_text("central\n")
+        os.chmod(ext / ".claude", 0o555)
+        self.addCleanup(os.chmod, ext / ".claude", 0o755)
+        (wt / ".claude").mkdir()
+        (wt / ".claude" / "telemetry").write_text("central\n")
+        summary = json.loads(self.run_manage(
+            "disable", "--cwd", str(wt), expect_rc=2))
+        self.assertEqual(len(summary["failed"]), 1)
+        self.assertTrue((ext / ".claude" / "telemetry").exists())
+        self.assertFalse((wt / ".claude" / "telemetry").exists())
+        self.assertFalse((m / ".claude" / "telemetry").exists())
+
     def test_newline_in_worktree_path_cannot_inject_an_entry(self):
         m = self.main_repo()
         other = make_repo(self.base / "other")
