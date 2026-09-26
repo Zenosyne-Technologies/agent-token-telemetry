@@ -25,6 +25,8 @@ import argparse
 import json
 import os
 import sqlite3
+import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -485,6 +487,38 @@ def import_project(db, source, project, name=None):
     return 0
 
 
+def list_worktrees(base):
+    """The OTHER checkouts of the repository at ``base``, from
+    ``git worktree list --porcelain -z`` — NUL-separated, so a path holding a
+    newline can never inject an extra entry. Same hardening overrides as
+    :func:`capture.git` (a hostile repo config cannot run programs).
+
+    :param base: the main repository root.
+    :returns: ``(paths, error)`` — ``error`` is None on success, else a short
+        reason; a failure is never silently "no worktrees".
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false",
+             "-c", "core.hooksPath=/dev/null", "-C", str(base),
+             "worktree", "list", "--porcelain", "-z"],
+            capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        return [], f"git worktree list failed: {e}"
+    if out.returncode != 0:
+        msg = out.stderr.decode("utf-8", "replace").strip().splitlines()
+        return [], ("git worktree list failed: "
+                    + (msg[0] if msg else f"exit {out.returncode}"))
+    base_real = os.path.realpath(base)
+    paths = []
+    for field in out.stdout.split(b"\0"):
+        if field.startswith(b"worktree "):
+            wt = os.fsdecode(field[len(b"worktree "):])
+            if os.path.realpath(wt) != base_real:
+                paths.append(wt)
+    return paths, None
+
+
 def repo_scope(cwd, db):
     """The repository ``/enable`` and ``/disable`` act on — resolved exactly as
     capture resolves its project key, so the commands and capture can never
@@ -499,9 +533,14 @@ def repo_scope(cwd, db):
 
     :param cwd: the directory the command runs from.
     :param db: the central DB path (may not exist yet).
+    A ``.claude`` that is a symlink is never followed: its marker is not
+    listed but reported under ``refused``.
+
     :returns: dict — ``root`` (project key), ``checkout``, ``is_worktree``,
-        ``worktrees`` (other checkouts of the repo), ``markers`` (existing
-        ``.claude/telemetry`` files in root, worktrees, checkout and cwd).
+        ``worktrees`` (other checkouts of the repo), ``worktree_error`` (None,
+        or why they could not be listed), ``markers`` (existing
+        ``.claude/telemetry`` entries in root, worktrees, checkout and cwd),
+        ``refused`` (``[{path, reason}]``).
     """
     cwd = Path(cwd)
     checkout = capture.find_project_root(cwd)
@@ -517,49 +556,70 @@ def repo_scope(cwd, db):
                 conn.close()
         except sqlite3.Error:
             pass
-    worktrees = []
+    worktrees, worktree_error = [], None
     if (Path(base) / ".git").is_dir():
-        out = capture.git(base, "worktree", "list", "--porcelain") or ""
-        base_real = os.path.realpath(base)
-        for line in out.splitlines():
-            if line.startswith("worktree "):
-                wt = line[len("worktree "):]
-                if os.path.realpath(wt) != base_real:
-                    worktrees.append(wt)
-    markers, seen = [], set()
+        worktrees, worktree_error = list_worktrees(base)
+    markers, refused, seen = [], [], set()
     for d in (base, *worktrees, checkout, cwd):
-        m = Path(d) / ".claude" / "telemetry"
-        key = os.path.realpath(m)
-        if key not in seen and os.path.lexists(m):
-            seen.add(key)
+        real_dir = os.path.realpath(d)
+        if real_dir in seen:
+            continue
+        seen.add(real_dir)
+        claude = Path(d) / ".claude"
+        if os.path.islink(claude):
+            refused.append({"path": str(claude / "telemetry"),
+                            "reason": ".claude is a symlink - not followed"})
+            continue
+        m = claude / "telemetry"
+        if os.path.lexists(m):
             markers.append(str(m))
     return {"root": root, "checkout": str(checkout),
             "is_worktree": main_root is not None, "worktrees": worktrees,
-            "markers": markers}
+            "worktree_error": worktree_error, "markers": markers,
+            "refused": refused}
 
 
 def disable(db, cwd):
     """Turn capture off for the WHOLE repository ``cwd`` belongs to: remove
     every opt-in marker :func:`repo_scope` finds (main root, every worktree,
-    the checkout and cwd — a symlinked marker is unlinked, never followed),
-    then clear the root row's mirror metadata. Prints one JSON summary.
+    the checkout and cwd), then clear the root row's mirror metadata. Prints
+    one JSON summary: ``root``, ``worktrees``, ``removed``, ``failed``
+    (``[{path, reason}]``) and ``worktree_error``.
+
+    Every marker is attempted independently — one failure never stops the
+    rest, so the current checkout's marker always goes. Only a regular file
+    or a symlink (unlinked, never followed) is removed; a directory or any
+    other type is left and reported. A symlinked ``.claude`` is refused
+    (:func:`repo_scope`).
 
     :param db: the central DB path.
     :param cwd: the directory the command runs from.
-    :returns: exit code 0.
+    :returns: 0 when every marker was removed and the worktrees could be
+        listed; 2 otherwise (capture may continue where ``failed`` says).
     """
     scope = repo_scope(cwd, db)
-    removed = []
+    removed, failed = [], list(scope["refused"])
     for m in scope["markers"]:
         try:
+            mode = os.lstat(m).st_mode
+            if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                kind = "a directory" if stat.S_ISDIR(mode) else "not a file"
+                failed.append({"path": m, "reason": f"marker is {kind} - left"})
+                continue
             os.unlink(m)
             removed.append(m)
         except FileNotFoundError:
-            pass
-    clear_mirror_meta(db, scope["root"])
+            continue
+        except OSError as e:
+            failed.append({"path": m, "reason": e.strerror or str(e)})
+    try:
+        clear_mirror_meta(db, scope["root"])
+    except sqlite3.Error as e:
+        failed.append({"path": str(db), "reason": f"mirror meta not cleared: {e}"})
     print(json.dumps({"root": scope["root"], "worktrees": scope["worktrees"],
-                      "removed": removed}))
-    return 0
+                      "removed": removed, "failed": failed,
+                      "worktree_error": scope["worktree_error"]}))
+    return 2 if failed or scope["worktree_error"] else 0
 
 
 def main(argv=None):

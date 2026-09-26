@@ -123,6 +123,10 @@ the exceptions exact: a submodule's gitdir sits under `.git/modules/`, a bare
 repo's common dir is not named `.git`, and a plain checkout or non-git
 directory has no pointer file — all of them stay their own project, as before.
 Anything malformed degrades to the pre-v8 behaviour (the checkout is the key).
+**Known limitation:** a hand-made `.git` pointer file aimed at another of the
+user's repos' LIVE worktree gitdir passes the structural check, so that
+directory is captured, named and folded as that repo (git itself honours the
+same pointer; it cannot arrive by `git clone`).
 
 The key's **spelling** must equal how the main repo's own sessions spell it, or
 one repository would split into two rows. A checkout at
@@ -146,12 +150,18 @@ this-project views (`/info`, scoped roll-ups) resolve the same key, so they
 show the main project's numbers from inside a worktree. `/enable` and
 `/disable` resolve the same root through `manage.py resolve-root` /
 `manage.py disable` (`repo_scope()`): the main repository plus every checkout
-`git worktree list --porcelain` names. Enable writes the marker at the main
-root and tells the user it applies to the main repo and all its worktrees;
-disable removes the marker from the main root, every worktree, the current
-checkout and the cwd, then clears the root row's mirror metadata — so a
-disable run inside a worktree really stops capture in every checkout. A
-marker hand-placed in some other subdirectory is not searched for.
+`git worktree list --porcelain -z` names (NUL-separated, so a newline in a
+path cannot inject an entry; a git failure is reported as `worktree_error`,
+never read as "no worktrees"). Enable writes the marker at the main root and
+tells the user it applies to the main repo and all its worktrees; disable
+removes the marker from the main root, every worktree, the current checkout
+and the cwd, then clears the root row's mirror metadata — so a disable run
+inside a worktree really stops capture in every checkout. Each marker is
+attempted independently; only a regular file or symlink is unlinked (never
+followed), a directory at a marker path or a symlinked `.claude` is left and
+listed under `failed`, and any failure or `worktree_error` exits non-zero so
+the command never reports "disabled" while capture continues. A marker
+hand-placed in some other subdirectory is not searched for.
 
 ## One-time fold of existing worktree rows (v8)
 
@@ -169,9 +179,11 @@ row by either of two rules (`worktree_fold_target()`):
 2. **Resolution** — the path still exists and `main_repo_root()` maps it to a
    different directory (worktrees created outside `.claude/worktrees/`).
 
-A row whose path still exists with its own `.git` DIRECTORY is never folded
-by either rule: it is a separate repository (a real clone placed under
-`.claude/worktrees/`), and capture keys its sessions at that path too.
+A row whose path still exists with its own `.git` DIRECTORY, or with a `.git`
+FILE that fails `main_repo_root()`'s structural check (a submodule), is never
+folded by either rule: it is a separate repository (a real clone or a
+submodule placed under `.claude/worktrees/`), and capture keys its sessions at
+that path too.
 
 The target row is found by realpath equality (stored spelling kept) or created
 spelled `<M>`. Tables: `sessions.project_id` is reassigned — the only column

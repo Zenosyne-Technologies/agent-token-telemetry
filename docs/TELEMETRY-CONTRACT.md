@@ -187,8 +187,9 @@ heals itself.
   `mirror_path`/`mirror_last_at` pair only if it has no mirror configured; the worktree
   row is deleted. `events` and `cursors` hang off sessions/transcripts and do not move;
   `audit_log.project` is historical free text and stays untouched. A path that still
-  exists with its own `.git` directory (a real clone under `.claude/worktrees/`) is a
-  separate repository and never folds. Fold and stamp share one transaction. The fold is
+  exists with its own `.git` directory (a real clone under `.claude/worktrees/`), or with
+  a `.git` file that fails the worktree check above (a submodule), is a separate
+  repository and never folds. Fold and stamp share one transaction. The fold is
   idempotent: a DB at v8 skips it on the fast path; a v8 DB whose shape check fails
   (the self-heal path) re-walks the hop chain, runs the fold again and changes nothing
   already folded — it folds only worktree rows that appeared since. **Limitation:** a worktree that lived

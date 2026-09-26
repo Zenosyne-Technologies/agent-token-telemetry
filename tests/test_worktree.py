@@ -431,12 +431,73 @@ class TestProjectRowDedup(Fixture):
 class TestEnableDisableScope(Fixture):
     """/enable and /disable act on the repository capture keys to."""
 
-    def run_manage(self, *argv):
+    def run_manage(self, *argv, expect_rc=0):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = manage.main([*argv, "--db", str(self.db)])
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, expect_rc)
         return out.getvalue().strip().splitlines()[-1]
+
+    def ext_worktree(self, m, name="ext-wt", branch="ext"):
+        ext = self.base / name
+        git(m, "worktree", "add", "-q", "-b", branch, str(ext))
+        return ext
+
+    def test_directory_marker_never_stops_the_others(self):
+        m = self.main_repo()
+        wt = self.claude_worktree(m)
+        ext = self.ext_worktree(m)  # listed before the current checkout
+        (ext / ".claude" / "telemetry").mkdir(parents=True)
+        (wt / ".claude").mkdir()
+        (wt / ".claude" / "telemetry").write_text("central\n")
+        summary = json.loads(self.run_manage(
+            "disable", "--cwd", str(wt), expect_rc=2))
+        self.assertTrue((ext / ".claude" / "telemetry").is_dir())
+        self.assertEqual([os.path.realpath(f["path"]) for f in summary["failed"]],
+                         [os.path.realpath(ext / ".claude" / "telemetry")])
+        self.assertEqual(len(summary["removed"]), 2)
+        self.assertFalse(os.path.lexists(wt / ".claude" / "telemetry"))
+        for cwd, sid in ((m, "a"), (wt, "b")):
+            self.capture(cwd, session=sid)
+        self.assertFalse(self.db.exists())
+
+    def test_newline_in_worktree_path_cannot_inject_an_entry(self):
+        m = self.main_repo()
+        other = make_repo(self.base / "other")
+        (other / ".claude").mkdir()
+        (other / ".claude" / "telemetry").write_text("central\n")
+        odd = self.base / f"odd\nworktree {other}"
+        git(m, "worktree", "add", "-q", "-b", "odd", str(odd))
+        summary = json.loads(self.run_manage("disable", "--cwd", str(m)))
+        self.assertTrue((other / ".claude" / "telemetry").exists())
+        self.assertEqual([os.path.realpath(w) for w in summary["worktrees"]],
+                         [os.path.realpath(odd)])
+
+    def test_symlinked_claude_is_refused_not_followed(self):
+        m = self.main_repo()
+        ext = self.ext_worktree(m)
+        target = self.base / "elsewhere"
+        target.mkdir()
+        (target / "telemetry").write_text("central\n")
+        (ext / ".claude").symlink_to(target)
+        summary = json.loads(self.run_manage(
+            "disable", "--cwd", str(m), expect_rc=2))
+        self.assertTrue((target / "telemetry").exists())
+        self.assertEqual(
+            os.path.realpath(pathlib.Path(summary["failed"][0]["path"]).parent.parent),
+            os.path.realpath(ext))
+        self.assertIn("symlink", summary["failed"][0]["reason"])
+
+    def test_git_failure_is_reported_not_silent(self):
+        m = self.main_repo()
+        wt = self.claude_worktree(m)
+        with open(m / ".git" / "config", "a") as f:
+            f.write("[broken\n")
+        summary = json.loads(self.run_manage(
+            "disable", "--cwd", str(wt), expect_rc=2))
+        self.assertIn("git worktree list failed", summary["worktree_error"])
+        # The main root's marker still goes: it does not depend on the listing.
+        self.assertFalse((m / ".claude" / "telemetry").exists())
 
     def test_resolve_root_from_worktree_is_main_with_its_worktrees(self):
         m = self.main_repo()
@@ -608,6 +669,16 @@ class TestWorktreeFold(Fixture):
         self.migrate()
         self.assertEqual(self.sessions_by_project(),
                          {str(m): 1, str(clone): 1})
+
+    def test_submodule_under_worktrees_is_not_folded(self):
+        lib_src = make_repo(self.base / "lib-src")
+        m = self.main_repo()
+        git(m, "submodule", "add", "-q", str(lib_src), ".claude/worktrees/sub")
+        sub = m / ".claude" / "worktrees" / "sub"
+        self.assertTrue((sub / ".git").is_file())
+        self.v7_db([(m, None, 1), (sub, None, 1)])
+        self.migrate()
+        self.assertEqual(self.sessions_by_project(), {str(m): 1, str(sub): 1})
 
     def test_unrelated_deeper_match_is_not_folded(self):
         # `<M>` = `<base>/vendor` is neither a project row nor a git repo.

@@ -15,7 +15,9 @@ Enable token telemetry for this project:
 
    It prints JSON; use its `root` as `<root>` in every step below. `worktrees` lists
    the repository's other checkouts, and `markers` any opt-in markers already present
-   (a worktree's own marker keeps selecting that worktree's storage mode).
+   (a worktree's own marker keeps selecting that worktree's storage mode). If
+   `worktree_error` is set, tell the user the repository's worktrees could not be listed
+   (quote it); enabling at `<root>` still covers them.
 2. Ask the user where the data should be stored (AskUserQuestion, two options):
    - **Central only** (default) — events go to `~/.claude/telemetry/usage.db` only.
    - **Project folder** — events go to the central DB *and* a project-local copy at

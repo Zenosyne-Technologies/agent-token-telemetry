@@ -509,15 +509,22 @@ def worktree_fold_target(path, other_paths):
     2. **Resolution** — ``path`` still exists and :func:`main_repo_root`
        resolves it to a different directory.
 
-    A path that still exists with its own ``.git`` DIRECTORY is a separate
-    repository (e.g. a real clone placed under ``.claude/worktrees/``) and is
-    never folded — capture keys its sessions at that path too.
+    A path that still exists with its own ``.git`` DIRECTORY (a real clone
+    placed under ``.claude/worktrees/``), or with a ``.git`` file that fails
+    :func:`main_repo_root`'s structural check (a submodule), is a separate
+    repository and is never folded — capture keys its sessions there too.
 
     :param path: the row's stored path.
     :param other_paths: every OTHER row's stored path.
     :returns: the main-root path string, or None.
     """
-    if os.path.isdir(os.path.join(path, ".git")):
+    dotgit = os.path.join(path, ".git")
+    if os.path.isdir(dotgit):
+        return None
+    # A `.git` FILE that is not a linked-worktree pointer (a submodule's
+    # `.git/modules/…` gitdir, anything malformed): capture keeps keying that
+    # checkout as its own project, so the fold must leave it too.
+    if os.path.lexists(dotgit) and main_repo_root(path) is None:
         return None
     i = path.find(WORKTREE_COMPONENT)
     if i > 0 and any(path[i + len(WORKTREE_COMPONENT):].split("/")):
