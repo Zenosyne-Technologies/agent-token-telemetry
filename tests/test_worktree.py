@@ -162,7 +162,19 @@ class TestMainRepoRoot(Fixture):
     def test_multiline_gitfile_falls_back(self):
         m = self.main_repo()
         wt = self.claude_worktree(m)
-        (wt / ".git").write_bytes(self.gitdir_line(wt) + b"extra\n")
+        # A second (blank) line: the parser strips the gitdir value, so ONLY
+        # the single-line rule can reject it.
+        (wt / ".git").write_bytes(self.gitdir_line(wt) + b"\n")
+        self.assertIsNone(capture.main_repo_root(wt))
+
+    def test_gitdir_outside_worktrees_falls_back(self):
+        m = self.main_repo()
+        wt = self.claude_worktree(m)
+        # A structurally valid pointer whose gitdir is not `<common>/worktrees/`
+        # (commondir still resolves to `.git`) — only that check rejects it.
+        (m / ".git" / "worktrees").rename(m / ".git" / "elsewhere")
+        (wt / ".git").write_text(
+            f"gitdir: {m / '.git' / 'elsewhere' / wt.name}\n")
         self.assertIsNone(capture.main_repo_root(wt))
 
     def test_non_gitdir_line_falls_back(self):
@@ -213,6 +225,9 @@ class TestWorktreeCapture(Fixture):
     def test_worktree_session_records_under_main_with_kit_name(self):
         m = self.main_repo()
         wt = self.claude_worktree(m)
+        # The name must come from the MAIN repo's PROJECT-INFO, not the
+        # worktree's checked-out copy.
+        (wt / ".marvin" / "PROJECT-INFO.md").unlink()
         self.capture(wt)
         self.assertEqual(self.projects(), [(str(m), "ecool-erp")])
 
@@ -265,6 +280,8 @@ class TestWorktreeCapture(Fixture):
         self.capture(wt)
         self.assertTrue(capture.mirror_db_path(m).exists())
         self.assertFalse(capture.mirror_db_path(wt).exists())
+        self.assertEqual(self.rows("SELECT mirror_path FROM projects"),
+                         [(str(capture.mirror_db_path(m)),)])
 
     def test_worktree_marker_wins_over_main(self):
         m = self.main_repo(marker="project\n")
@@ -418,6 +435,19 @@ class TestWorktreeFold(Fixture):
         conn.close()
         self.migrate()
         self.assertEqual(self.rows("SELECT * FROM projects ORDER BY id"), before)
+
+    def test_fold_runs_once_per_db(self):
+        m = self.main_repo()
+        self.v7_db([(m, None, 1)])
+        self.migrate()  # now v8
+        gone = m / ".claude" / "worktrees" / "later"
+        conn = sqlite3.connect(self.db)
+        conn.execute("INSERT INTO projects(path) VALUES (?)", (str(gone),))
+        conn.commit()
+        self.assertTrue(capture.migrate_v8(conn))
+        conn.close()
+        # One-time data step: a v8 DB is never folded again.
+        self.assertEqual(len(self.projects()), 2)
 
     def test_unrelated_deeper_match_is_not_folded(self):
         # `<M>` = `<base>/vendor` is neither a project row nor a git repo.

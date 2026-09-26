@@ -929,9 +929,10 @@ def _read_pointer_line(path):
     except OSError:
         return None
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > GITFILE_MAX_BYTES:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
+        # One byte past the cap is enough to tell "too big" — the read itself
+        # is the bound, so a file growing after an fstat cannot slip past it.
         data = os.read(fd, GITFILE_MAX_BYTES + 1)
     except OSError:
         return None
