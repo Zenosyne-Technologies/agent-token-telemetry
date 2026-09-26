@@ -916,8 +916,9 @@ WORKTREE_COMPONENT = "/.claude/worktrees/"
 def _read_pointer_line(path):
     """One bounded pointer line from ``path``, or None.
 
-    Accepts only a regular file (a symlink is refused: ``O_NOFOLLOW`` plus an
-    ``fstat`` check, so there is no lstat/open race) of at most
+    Accepts only a regular file (a symlink is refused by ``O_NOFOLLOW``; a
+    FIFO cannot block the hook thanks to ``O_NONBLOCK``; the ``fstat`` check
+    then rejects anything not regular, with no lstat/open race) of at most
     :data:`GITFILE_MAX_BYTES`, UTF-8, holding exactly one non-empty line (one
     trailing newline allowed).
 
@@ -925,7 +926,8 @@ def _read_pointer_line(path):
     :returns: the line without its newline, or None on any problem.
     """
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0))
     except OSError:
         return None
     try:

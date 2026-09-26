@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -192,6 +193,18 @@ class TestMainRepoRoot(Fixture):
         (wt / ".git").unlink()
         (wt / ".git").symlink_to(real_file)
         self.assertIsNone(capture.main_repo_root(wt))
+
+    def test_fifo_gitfile_never_blocks(self):
+        d = self.base / "fifo-checkout"
+        d.mkdir()
+        os.mkfifo(d / ".git")
+        out = []
+        t = threading.Thread(target=lambda: out.append(capture.main_repo_root(d)),
+                             daemon=True)
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "main_repo_root blocked on a FIFO")
+        self.assertEqual(out, [None])
 
     def test_commondir_mismatch_falls_back(self):
         m = self.main_repo()
