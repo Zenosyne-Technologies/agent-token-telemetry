@@ -134,7 +134,7 @@ spelling — an alias spelling and the real one, a worktree captured first and
 its main repo second, all land on one row in either order. It runs before
 `BEGIN IMMEDIATE` and is bounded for the hook's latency budget: an exact
 string match returns at once (the steady state — only the first capture under
-a new spelling goes further); a key that does not exist is never resolved;
+a new spelling goes further);
 candidates are only rows whose basename equals the key's or its realpath's
 (a string filter, no syscalls); and a candidate whose stored path no longer
 exists (a deleted worktree) is compared by string, never realpath-resolved.

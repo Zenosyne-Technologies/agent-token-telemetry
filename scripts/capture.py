@@ -1033,7 +1033,7 @@ def canonical_project_path(conn, path):
 
     * An exact string match wins — one indexed lookup, the steady-state path:
       only the FIRST capture under a new spelling goes further.
-    * Otherwise, when ``path`` exists, the first row that is realpath-equal to
+    * Otherwise the first row that is realpath-equal to
       it is returned with ITS stored spelling. Latency bound: only rows whose
       basename equals the basename of ``path`` or of its realpath are
       candidates (string filter, no syscalls), and a candidate whose stored
@@ -1049,8 +1049,6 @@ def canonical_project_path(conn, path):
     path = str(path)
     if conn.execute("SELECT 1 FROM projects WHERE path=?",
                     (path,)).fetchone():
-        return path
-    if not os.path.exists(path):
         return path
     real = os.path.realpath(path)
     names = {_basename(path), _basename(real)}
