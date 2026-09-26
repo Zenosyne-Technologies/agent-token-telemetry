@@ -8,9 +8,9 @@ level: project
 audience: user
 module: storage
 sources: [commands/enable-remote.md, commands/enable.md, scripts/remote_migrate.py, scripts/settings.py, scripts/supabase_backend.py, scripts/dashboard.py, scripts/dashboard.html, scripts/backfill_summary.py]
-related: ["[[operating-remote-telemetry]]", "[[migrating-to-remote]]", "[[migrating-local-logs-to-central]]", "[[reading-token-stats]]"]
+related: ["[[operating-remote-telemetry]]", "[[migrating-to-remote]]", "[[migrating-local-logs-to-central]]", "[[reading-token-stats]]", "[[enabling-telemetry]]"]
 created: 2026-09-22
-updated: 2026-09-23
+updated: 2026-09-26
 ---
 
 # Enabling Remote Telemetry
@@ -22,8 +22,8 @@ alongside the team's. **Supabase is the only remote option today**; more backend
 may follow.
 
 This is a machine-level storage choice, separate from turning capture on for a
-project (`/token-telemetry:enable`). Switching backends does not change your
-per-project setup, and it is always reversible.
+project ([[enabling-telemetry]], `/token-telemetry:enable`). Switching backends
+does not change your per-project setup, and it is always reversible.
 
 ## Remote telemetry, at a glance
 

@@ -6,7 +6,7 @@ summary: The table of contents for one handbook audience — every page in this 
 keywords: [handbook, index, pages, audience]
 level: project
 created: 2026-09-21
-updated: 2026-09-24
+updated: 2026-09-26
 ---
 
 # Handbook Index
@@ -19,6 +19,7 @@ updated: 2026-09-24
 
 | item | sources | what it covers | status | updated |
 |---|---|---|---|---|
+| [[enabling-telemetry]] | `commands/enable.md`, `commands/disable.md` | Turning capture on and off with `/token-telemetry:enable` and `/token-telemetry:disable` — one repository is one project, a worktree's sessions record under its main project's name, opting the main repository in now also covers its worktrees, and both commands act on the whole repository (main checkout and all worktrees) at once | active | 2026-09-26 |
 | [[reading-token-stats]] | `commands/token-stats.md`, `commands/project-stats.md`, `scripts/report.py`, `commands/pricing-update.md`, `commands/schedule-pricing.md`, `scripts/pricing_update.py` | What `/token-stats` shows, the all-time per-project table from `/project-stats`, scoped rollups by issue-key set and their three empty states, estimated-cost markers and the no-own-price footer, seed rates (undated) and the stale-price warning, a skipped-row warning and a refused refresh for a malformed page, cache hit rate, backfilling estimated pricing windows (bundles, the permission prompt, nothing applies unattended), and why the scheduled weekly refresh never backfills | active | 2026-09-24 |
 | [[migrating-local-logs-to-central]] | `commands/migrate-to-central.md`, `scripts/manage.py` | Importing a project's local mirror (or a storage-separate export) into the central DB with `/migrate-to-central`, the keep-a-copy default, what switching active collection means, and why re-running is safe | active | 2026-09-22 |
 | [[migrating-to-remote]] | `commands/migrate-to-remote.md`, `scripts/remote_migrate.py`, `scripts/supabase_backend.py` | Uploading the whole central DB to the remote Supabase project with `/migrate-to-remote` — login, the readiness check, the count-verified upload, the keep-local default, and that switching collection is reversible and re-running safe | active | 2026-09-22 |
