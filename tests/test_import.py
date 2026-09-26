@@ -257,7 +257,8 @@ class TestCompatSafeguard(ImportBase):
         conn = self.central_conn()
         self.addCleanup(conn.close)
         self.assertEqual(
-            conn.execute("PRAGMA user_version").fetchone()[0], 7)
+            conn.execute("PRAGMA user_version").fetchone()[0],
+            capture.SCHEMA_VERSION)
         self.assertEqual(
             conn.execute("SELECT name FROM users").fetchone()[0], "Grace Hopper")
         # the pre-v7 event row survives the migrate.

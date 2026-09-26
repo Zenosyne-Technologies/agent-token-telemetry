@@ -827,6 +827,27 @@ FROM priced""", rowids).fetchone()
             "unpriced": unpriced or 0, "estimated": estimated or 0}
 
 
+def project_key(conn, checkout):
+    """The ``projects.path`` this checkout's events are recorded under — the
+    same resolution capture uses: a linked worktree's main repository (under
+    the stored spelling of its existing row, when ``conn`` is given), else the
+    checkout itself.
+
+    :param conn: an open DB connection, or None.
+    :param checkout: :func:`capture.find_project_root` of the caller's cwd.
+    :returns: the path string.
+    """
+    main = capture.main_repo_root(checkout)
+    if main is None:
+        return str(checkout)
+    if conn is None:
+        return str(main)
+    try:
+        return capture.canonical_project_path(conn, str(main))
+    except Exception:
+        return str(main)
+
+
 def fetch_scoped_rollup(conn, cwd, scope_raw):
     """Caller-supplied issue-key-set scoping (the kit contract's per-issue
     recipe, summed across the set) — replaces the old milestone-branch-prefix
@@ -839,21 +860,22 @@ def fetch_scoped_rollup(conn, cwd, scope_raw):
     if conn is None:
         return {"state": "absent", "keys": valid, "invalid": invalid}
     root = capture.find_project_root(cwd)
+    key = project_key(conn, root)
     project_events = conn.execute(
         "SELECT COUNT(*) FROM events e"
         " JOIN sessions s ON s.id = e.session_id"
         " JOIN projects p ON p.id = s.project_id WHERE p.path = ?",
-        (str(root),)).fetchone()[0]
+        (key,)).fetchone()[0]
     if not project_events:
         return {"state": "absent", "keys": valid, "invalid": invalid}
 
     per_key = []
-    for key in valid:
-        rowids = rowids_for_issue_key(conn, str(root), key)
+    for issue in valid:
+        rowids = rowids_for_issue_key(conn, key, issue)
         if not rowids:
-            shas = commits_for_key(root, key)
-            rowids = rowids_for_commit_shas(conn, str(root), shas)
-        per_key.append({"key": key, **priced_sum_for_rowids(conn, rowids)})
+            shas = commits_for_key(root, issue)
+            rowids = rowids_for_commit_shas(conn, key, shas)
+        per_key.append({"key": issue, **priced_sum_for_rowids(conn, rowids)})
 
     covered = [k for k in per_key if k["events"] > 0]
     n, k = len(valid), len(covered)
@@ -1060,7 +1082,13 @@ def fetch_info_central(conn, project_path):
 
 def fetch_info(conn, db, cwd):
     """Everything the status block needs, as one plain dict."""
-    root = capture.find_project_root(cwd)
+    checkout = capture.find_project_root(cwd)
+    main = capture.main_repo_root(checkout)
+    # Inside a linked worktree the project is the main repository: its key,
+    # marker fallback and mirror; the sidecar is read worktree-first.
+    root = project_key(conn, checkout)
+    marker_root = (checkout if main is None or os.path.lexists(
+        Path(checkout) / ".claude" / "telemetry") else main)
     plugin = json.loads((Path(__file__).resolve().parent.parent
                          / ".claude-plugin" / "plugin.json").read_text())
     d = {"db": str(db), "root": str(root),
@@ -1070,15 +1098,17 @@ def fetch_info(conn, db, cwd):
          "events_here": None, "error_log": None, "mirror": None}
 
     if d["enabled"]:
-        d["storage_mode"] = capture.read_storage_mode(root)
+        d["storage_mode"] = capture.storage_mode_for(checkout, main)
         try:
-            first = (Path(root) / ".claude" / "telemetry").read_text() \
+            first = (Path(marker_root) / ".claude" / "telemetry").read_text() \
                 .splitlines()[0].strip().lower()
             d["mode_explicit"] = first in ("central", "project")
         except (OSError, IndexError):
             pass
 
-    sidecar = Path(root) / ".claude" / "telemetry-context.json"
+    sidecar = Path(checkout) / ".claude" / "telemetry-context.json"
+    if main is not None and not sidecar.exists():
+        sidecar = Path(main) / ".claude" / "telemetry-context.json"
     if sidecar.exists():
         try:
             sc = json.loads(sidecar.read_text())
@@ -1099,7 +1129,7 @@ def fetch_info(conn, db, cwd):
                           .fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")}
 
     if d["enabled"] and d["storage_mode"] == capture.STORAGE_PROJECT:
-        mirror = capture.mirror_db_path(root)
+        mirror = capture.mirror_db_path(main or checkout)
         mconn = open_ro(mirror)
         if mconn is None:
             d["mirror"] = {"path": str(mirror), "exists": False}

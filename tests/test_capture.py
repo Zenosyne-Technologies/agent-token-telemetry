@@ -793,7 +793,8 @@ class TestSchemaV7(unittest.TestCase):
     def test_fresh_db_is_user_version_7_with_identity_shape(self):
         conn = capture.connect(self.db)
         self.addCleanup(conn.close)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         self.assertIn("users", self.tables(conn))
         self.assertIn("owner_id", self.columns(conn, "sessions"))
         self.assertEqual(
@@ -803,7 +804,8 @@ class TestSchemaV7(unittest.TestCase):
         build_v6_db(self.db)
         migrated = capture.connect(self.db)
         self.addCleanup(migrated.close)
-        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 7)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         self.assertIn("users", self.tables(migrated))
         # existing session rows read back with NULL owner_id — pre-identity,
         # never backfilled.

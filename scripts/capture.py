@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -323,7 +324,9 @@ V6_COLUMNS = (("events", "api_calls", "INTEGER"),
 # (rows recorded before the identity feature), never backfilled except by a
 # later retro-link step. The `users` table itself lives in USERS_SCHEMA above.
 V7_COLUMNS = (("sessions", "owner_id", "TEXT REFERENCES users(uuid)"),)
-SCHEMA_VERSION = 7
+# v8: a DATA step, no shape change — the one-time fold of linked-worktree
+# project rows into their main repository's row (see migrate_v8).
+SCHEMA_VERSION = 8
 
 
 def table_columns(conn, table):
@@ -362,8 +365,8 @@ def migrate(conn):
     # Hops run in sequence and each returns whether its shape actually landed:
     # v3 must never be attempted - let alone stamped - on a DB that failed v2.
     if (migrate_v2(conn) and migrate_v3(conn) and migrate_v4(conn)
-            and migrate_v5(conn) and migrate_v6(conn)):
-        migrate_v7(conn)
+            and migrate_v5(conn) and migrate_v6(conn) and migrate_v7(conn)):
+        migrate_v8(conn)
 
 
 def migrate_v2(conn):
@@ -486,8 +489,121 @@ def migrate_v7(conn):
             and "owner_id" in table_columns(conn, "sessions")):
         return False  # next connect retries; the stamp stays at 6
     conn.commit()
-    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+    conn.execute("PRAGMA user_version=7")
     return True
+
+
+def worktree_fold_target(path, other_paths):
+    """Where a ``projects`` row recorded for a linked worktree belongs: the
+    main repository path to fold it into, or None to leave the row alone.
+
+    Two rules, in order:
+
+    1. **Path convention** (works after the worktree folder was deleted).
+       ``<M>`` is the prefix before the FIRST :data:`WORKTREE_COMPONENT` in
+       ``path``, followed by at least one non-empty name segment. Accepted only
+       when ``<M>`` is realpath-equal to another row's path, or ``<M>`` is an
+       existing directory holding a ``.git`` directory. Anything else (e.g. an
+       unrelated path that merely contains the component deeper down) falls
+       through to rule 2 and is otherwise left alone.
+    2. **Resolution** — ``path`` still exists and :func:`main_repo_root`
+       resolves it to a different directory.
+
+    :param path: the row's stored path.
+    :param other_paths: every OTHER row's stored path.
+    :returns: the main-root path string, or None.
+    """
+    i = path.find(WORKTREE_COMPONENT)
+    if i > 0 and any(path[i + len(WORKTREE_COMPONENT):].split("/")):
+        main = path[:i]
+        real = os.path.realpath(main)
+        if (any(os.path.realpath(p) == real for p in other_paths)
+                or (os.path.isdir(main)
+                    and os.path.isdir(os.path.join(main, ".git")))):
+            return main
+    if os.path.isdir(path):
+        main = main_repo_root(path)
+        if (main is not None
+                and os.path.realpath(main) != os.path.realpath(path)):
+            return str(main)
+    return None
+
+
+def fold_worktree_projects(conn):
+    """Fold every linked-worktree ``projects`` row into its main repository's
+    row (:func:`worktree_fold_target`). Caller owns the transaction.
+
+    Per folded row: ``sessions.project_id`` is reassigned (the only table keyed
+    by project id — events hang off sessions, cursors off transcripts); the
+    main row takes the worktree's ``name`` when it has none, and its
+    ``mirror_path``/``mirror_last_at`` pair when it has no mirror configured
+    (a main row's own pair is never overwritten); the worktree row is deleted.
+    A main row that does not exist yet is created with the target spelling.
+    ``audit_log.project`` is free text, a historical record — untouched.
+    Idempotent: a second run finds no worktree rows.
+
+    :param conn: an open DB connection inside a write transaction.
+    :returns: list of ``(worktree_path, main_path)`` pairs folded.
+    """
+    cols = table_columns(conn, "projects")
+    folded = []
+    for (pid, path) in conn.execute(
+            "SELECT id, path FROM projects ORDER BY id").fetchall():
+        others = [p for (p,) in conn.execute(
+            "SELECT path FROM projects WHERE id<>?", (pid,))]
+        target = worktree_fold_target(path, others)
+        if target is None:
+            continue
+        dest_path = canonical_project_path(conn, target)
+        row = conn.execute("SELECT id FROM projects WHERE path=?",
+                           (dest_path,)).fetchone()
+        dest = row[0] if row else conn.execute(
+            "INSERT INTO projects(path) VALUES (?)", (dest_path,)).lastrowid
+        if dest == pid:
+            continue
+        conn.execute("UPDATE sessions SET project_id=? WHERE project_id=?",
+                     (dest, pid))
+        if "name" in cols:
+            conn.execute(
+                "UPDATE projects SET name=(SELECT name FROM projects WHERE id=?)"
+                " WHERE id=? AND COALESCE(name,'')=''", (pid, dest))
+        if MIRROR_META <= cols:
+            conn.execute(
+                "UPDATE projects SET"
+                " mirror_path=(SELECT mirror_path FROM projects WHERE id=?),"
+                " mirror_last_at=(SELECT mirror_last_at FROM projects WHERE id=?)"
+                " WHERE id=? AND mirror_path IS NULL", (pid, pid, dest))
+        conn.execute("DELETE FROM projects WHERE id=?", (pid,))
+        folded.append((path, dest_path))
+    return folded
+
+
+def migrate_v8(conn):
+    """v7 -> v8: a one-time DATA step — fold linked-worktree project rows into
+    their main repository (:func:`fold_worktree_projects`). No shape change.
+
+    One ``BEGIN IMMEDIATE`` transaction holds the fold AND the version stamp
+    (``user_version`` is transactional), so a crash leaves both or neither;
+    the version is re-read under the lock, so a peer that folded first makes
+    this a no-op. Any failure rolls back and returns False — the next connect
+    retries, and capture is never failed over it.
+
+    :param conn: an open DB connection with no transaction in progress.
+    :returns: True once the DB is at v8.
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+            fold_worktree_projects(conn)
+            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.commit()
+        return True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
 
 
 def connect(path):
@@ -768,6 +884,16 @@ def mirror_events(root, *args, **kwargs):
 
 
 def find_project_root(cwd):
+    """The session's own checkout root: the nearest ancestor of ``cwd`` that
+    holds a ``.git`` entry (directory OR file), else ``cwd`` itself.
+
+    Inside a linked git worktree this is the WORKTREE folder (its ``.git`` is a
+    pointer file) — branch/sha and the commit-subject issue key are read from
+    here. The project key is :func:`main_repo_root` of this, when it has one.
+
+    :param cwd: the hook's working directory.
+    :returns: a :class:`Path`.
+    """
     p = Path(cwd)
     for candidate in (p, *p.parents):
         if (candidate / ".git").exists():
@@ -775,10 +901,154 @@ def find_project_root(cwd):
     return p
 
 
+# Cap on the two pointer files a linked worktree carries — its `.git` file
+# (`gitdir: <path>`) and the gitdir's `commondir` — so a hostile or runaway file
+# can never cost the hook path more than one small read. Git writes both as a
+# single short line.
+GITFILE_MAX_BYTES = 4096
+# Claude Code creates its worktrees at `<main>/.claude/worktrees/<name>`. The
+# prefix before the FIRST occurrence of this component is how the main repo's
+# own sessions already spell the project path (F1), and it is the only rule the
+# one-time fold can apply to a worktree folder that has since been deleted.
+WORKTREE_COMPONENT = "/.claude/worktrees/"
+
+
+def _read_pointer_line(path):
+    """One bounded pointer line from ``path``, or None.
+
+    Accepts only a regular file (a symlink is refused: ``O_NOFOLLOW`` plus an
+    ``fstat`` check, so there is no lstat/open race) of at most
+    :data:`GITFILE_MAX_BYTES`, UTF-8, holding exactly one non-empty line (one
+    trailing newline allowed).
+
+    :param path: the file to read.
+    :returns: the line without its newline, or None on any problem.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > GITFILE_MAX_BYTES:
+            return None
+        data = os.read(fd, GITFILE_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > GITFILE_MAX_BYTES:
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if text.endswith("\n"):
+        text = text[:-1]
+        if text.endswith("\r"):
+            text = text[:-1]
+    if not text or "\n" in text or "\r" in text:
+        return None
+    return text
+
+
+def main_repo_root(checkout):
+    """The MAIN repository root of a linked git worktree, or None.
+
+    Pure filesystem reads (no git subprocess — capture has a hard latency
+    budget), every read bounded. Accepted only when ALL of these hold,
+    otherwise None (the caller keeps today's behaviour — the checkout itself is
+    the project):
+
+    * ``<checkout>/.git`` is a regular file (not a symlink, not a directory) of
+      at most :data:`GITFILE_MAX_BYTES` holding a single ``gitdir:`` line;
+    * that gitdir, resolved, is a directory named ``<common>/worktrees/<id>``
+      whose ``commondir`` file (same bound) resolves to ``<common>``;
+    * ``<common>`` is a directory named ``.git``, and its parent is a directory.
+
+    A submodule's ``.git`` file points at ``.git/modules/…`` and fails the
+    ``worktrees/`` check, so a submodule stays its own project; a plain
+    checkout (``.git`` directory), a bare repo and a non-git directory have no
+    pointer file and return None.
+
+    Spelling (the project key must match the main repo's own sessions): when
+    ``checkout`` is ``<M>/.claude/worktrees/<…>`` and ``<M>`` resolves to the
+    same directory, the result is ``<M>`` exactly as spelled; otherwise it is
+    the realpath of ``<common>``'s parent.
+
+    :param checkout: a checkout root, as :func:`find_project_root` returns it.
+    :returns: a :class:`Path`, or None. Never raises.
+    """
+    try:
+        checkout = Path(checkout)
+        line = _read_pointer_line(checkout / ".git")
+        if line is None or not line.startswith("gitdir:"):
+            return None
+        target = line[len("gitdir:"):].strip()
+        if not target:
+            return None
+        gitdir = Path(os.path.realpath(os.path.join(checkout, target)))
+        if not gitdir.is_dir() or gitdir.parent.name != "worktrees":
+            return None
+        common = gitdir.parent.parent
+        common_line = _read_pointer_line(gitdir / "commondir")
+        if common_line is None:
+            return None
+        resolved_common = os.path.realpath(
+            os.path.join(gitdir, common_line.strip()))
+        if resolved_common != str(common):
+            return None
+        if common.name != ".git" or not common.is_dir():
+            return None
+        main = common.parent
+        if not main.is_dir():
+            return None
+        spelled = str(checkout)
+        i = spelled.find(WORKTREE_COMPONENT)
+        if i > 0 and os.path.realpath(spelled[:i]) == str(main):
+            return Path(spelled[:i])
+        return main
+    except Exception:
+        return None
+
+
+def canonical_project_path(conn, path):
+    """The stored spelling of the ``projects`` row for the directory ``path``
+    names, so a worktree session never creates a duplicate row for its repo.
+
+    An exact string match wins; otherwise the first row whose path is
+    realpath-equal to ``path`` is returned with ITS stored spelling; with no
+    such row, ``path`` itself (the caller's insert then creates it).
+
+    :param conn: an open DB connection with a ``projects`` table.
+    :param path: the candidate project path (string).
+    :returns: the path string to key the project by.
+    """
+    path = str(path)
+    if conn.execute("SELECT 1 FROM projects WHERE path=?",
+                    (path,)).fetchone():
+        return path
+    real = os.path.realpath(path)
+    for (stored,) in conn.execute("SELECT path FROM projects ORDER BY id"):
+        if os.path.realpath(stored) == real:
+            return stored
+    return path
+
+
 def is_enabled(cwd):
+    """Whether this project opted in: a ``.claude/telemetry`` marker in
+    ``cwd``, in the checkout root, or — inside a linked worktree — in the main
+    repository root (the main repo's opt-in covers its worktrees).
+
+    :param cwd: the hook's working directory.
+    :returns: bool.
+    """
     root = find_project_root(cwd)
-    return ((Path(cwd) / ".claude" / "telemetry").exists()
-            or (root / ".claude" / "telemetry").exists())
+    if ((Path(cwd) / ".claude" / "telemetry").exists()
+            or (root / ".claude" / "telemetry").exists()):
+        return True
+    main = main_repo_root(root)
+    return main is not None and (main / ".claude" / "telemetry").exists()
 
 
 STORAGE_CENTRAL = "central"
@@ -799,6 +1069,20 @@ def read_storage_mode(root):
         return STORAGE_PROJECT if first == STORAGE_PROJECT else STORAGE_CENTRAL
     except Exception:
         return STORAGE_CENTRAL
+
+
+def storage_mode_for(checkout, main=None):
+    """Storage mode for a session: the checkout's own marker decides when it
+    has one; inside a linked worktree without one, the main repo's marker
+    does (mirrors :func:`is_enabled`'s dual check).
+
+    :param checkout: the checkout root (:func:`find_project_root`).
+    :param main: :func:`main_repo_root` of it, or None.
+    :returns: :data:`STORAGE_PROJECT` or :data:`STORAGE_CENTRAL`.
+    """
+    if main is None or os.path.lexists(Path(checkout) / ".claude" / "telemetry"):
+        return read_storage_mode(checkout)
+    return read_storage_mode(main)
 
 
 def mirror_db_path(root):
@@ -965,13 +1249,23 @@ def main():
         # duration of the subprocess calls, and a peer process's own BEGIN
         # IMMEDIATE could exceed connect()'s 5s busy-wait and drop its event.
         branch, sha = git_meta(cwd)
+        # `root` is the session's own checkout; inside a linked worktree the
+        # project is the MAIN repository (`main_root`), which keys the row,
+        # names it, and owns the storage mode's mirror. Branch/sha and the
+        # commit-subject issue key stay with the checkout (cwd) above.
         root = find_project_root(cwd)
-        kit_name = project_name_from_kit(root)
-        ctx = read_sidecar(root) or {}
+        main_root = main_repo_root(root)
+        key_root = main_root or root
+        kit_name = project_name_from_kit(key_root)
+        # The kit writes the sidecar into the checkout the session runs in;
+        # a worktree without one falls back to the main repo's.
+        ctx = (read_sidecar(root)
+               or (read_sidecar(main_root) if main_root is not None else None)
+               or {})
         issue_key = sidecar_text(ctx.get("issue_key")) or issue_key_from_git(cwd)
         # Read once, before the write lock: the central transaction stamps the
         # mirror metadata (below) and the same decision gates the mirror write.
-        project_mode = read_storage_mode(root) == STORAGE_PROJECT
+        project_mode = storage_mode_for(root, main_root) == STORAGE_PROJECT
         # The owning user's uuid from central settings.json, read here (with the
         # rest of the enrichment, above the lock) so the hook path never blocks
         # on identity. None = no identity set yet = pre-identity; capture then
@@ -983,6 +1277,11 @@ def main():
         backend = storage.LocalSqliteBackend(db_path())
         backend.open()
         conn = backend.conn
+        project = str(key_root)
+        if main_root is not None:
+            # Before the write lock: reuse the main repo's existing row under
+            # its stored spelling (realpath-equal), never a duplicate.
+            project = canonical_project_path(conn, project)
         mirror_batch = []
         try:
             # Take the write lock up front so concurrent hook firings on the
@@ -1005,7 +1304,7 @@ def main():
             if groups or new_offset != offset:
                 # Built once and shared with the mirror call below, so the two
                 # writes cannot drift into recording different rows.
-                event_args = (str(root), hook.get("session_id") or "unknown",
+                event_args = (project, hook.get("session_id") or "unknown",
                               0, agent, groups)
                 # Gated on `groups` like the mirror write: a turn with no usage
                 # entries mirrors nothing, so there is no event timestamp to
@@ -1013,16 +1312,16 @@ def main():
                 # a mirror that was never written for an event that does not
                 # exist.
                 record(conn, *event_args, transcript, new_offset, *meta,
-                       mirror_path=(mirror_db_path(root)
+                       mirror_path=(mirror_db_path(key_root)
                                     if project_mode and groups else None),
                        first_capture=(offset == 0), owner_id=owner_id)
                 if groups:
                     mirror_batch.append(((*event_args, *meta), offset == 0))
             else:
                 conn.rollback()
-            stamp_project_name(conn, root, kit_name)
+            stamp_project_name(conn, project, kit_name)
             for swept, fc in sweep_subagents(
-                    conn, str(root), hook.get("session_id") or "unknown",
+                    conn, project, hook.get("session_id") or "unknown",
                     transcript, meta, agent, owner_id):
                 mirror_batch.append(((*swept, *meta), fc))
         finally:
@@ -1034,10 +1333,11 @@ def main():
         if mirror_batch and project_mode:
             for args, fc in mirror_batch:
                 try:
-                    mirror_events(root, *args, first_capture=fc,
+                    mirror_events(key_root, *args, first_capture=fc,
                                   owner_id=owner_id)
                 except Exception:
-                    log_error(f"mirror write failed: {mirror_db_path(root)}")
+                    log_error(
+                        f"mirror write failed: {mirror_db_path(key_root)}")
         # Optional remote backend (AOS-104 P6, guarded). When — and ONLY when —
         # the active backend is `supabase`, ALSO push the rows just committed
         # centrally to the remote store, after the central commit and outside

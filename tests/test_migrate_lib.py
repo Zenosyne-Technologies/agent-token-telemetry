@@ -37,7 +37,8 @@ class TestCompatReport(unittest.TestCase):
         self.addCleanup(src.close)
         self.addCleanup(dst.close)
         rep = migrate_lib.compat_report(src, dst, capture.SCHEMA_VERSION)
-        self.assertEqual((rep.src_version, rep.dst_version), (7, 7))
+        self.assertEqual((rep.src_version, rep.dst_version),
+                         (capture.SCHEMA_VERSION, capture.SCHEMA_VERSION))
         self.assertTrue(rep.versions_match)
         self.assertTrue(rep.src_matches_kit and rep.dst_matches_kit)
         self.assertTrue(rep.users_at_dst)
@@ -54,7 +55,8 @@ class TestCompatReport(unittest.TestCase):
         # structure/users diffs.
         dst.execute("PRAGMA user_version=6")
         rep = migrate_lib.compat_report(src, dst, capture.SCHEMA_VERSION)
-        self.assertEqual((rep.src_version, rep.dst_version), (7, 6))
+        self.assertEqual((rep.src_version, rep.dst_version),
+                         (capture.SCHEMA_VERSION, 6))
         self.assertFalse(rep.versions_match)
         self.assertTrue(rep.src_matches_kit)
         self.assertFalse(rep.dst_matches_kit)
@@ -85,7 +87,8 @@ class TestCompatReport(unittest.TestCase):
         self.addCleanup(dst.close)
         rep = migrate_lib.compat_report(src, dst, capture.SCHEMA_VERSION)
         self.assertFalse(rep.users_at_dst)
-        self.assertEqual((rep.src_version, rep.dst_version), (7, 6))
+        self.assertEqual((rep.src_version, rep.dst_version),
+                         (capture.SCHEMA_VERSION, 6))
         self.assertFalse(rep.versions_match)
         self.assertFalse(rep.compatible)
         # The users-table asymmetry shows up as a structure diff too.
@@ -98,7 +101,8 @@ class TestCompatReport(unittest.TestCase):
         self.addCleanup(dst.close)
         migrate_lib.compat_report(src, dst, capture.SCHEMA_VERSION)
         # user_version unchanged, users table still empty — no side effects.
-        self.assertEqual(dst.execute("PRAGMA user_version").fetchone()[0], 7)
+        self.assertEqual(dst.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         self.assertEqual(
             dst.execute("SELECT COUNT(*) FROM users").fetchone()[0], 0)
 
@@ -188,8 +192,9 @@ class TestEnsureUsersRow(unittest.TestCase):
 
         migrate_lib.ensure_users_row(conn, "u1", "Grace Hopper")
 
-        # The store reached v7 and the row landed.
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
+        # The store reached the current version and the row landed.
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                         capture.SCHEMA_VERSION)
         self.assertTrue(migrate_lib._has_table(conn, "users"))
         self.assertIn(
             "owner_id", {r[1] for r in conn.execute("PRAGMA table_info(sessions)")})
