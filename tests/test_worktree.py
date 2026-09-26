@@ -6,6 +6,7 @@ dir, so the stored spelling of a path differs from its realpath — the project
 key's spelling rule (the main repo's own sessions' spelling, never a duplicate
 row) is observable only that way.
 """
+import contextlib
 import io
 import json
 import os
@@ -20,6 +21,7 @@ from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 import capture
+import manage
 import report
 
 from tests.test_capture import entry, write_jsonl
@@ -345,6 +347,140 @@ class TestWorktreeCapture(Fixture):
         self.assertEqual(d["events_here"], 1)
 
 
+class TestProjectRowDedup(Fixture):
+    """One repository, one row — for EVERY capture, in either order."""
+
+    def real(self, p):
+        return pathlib.Path(os.path.realpath(p))
+
+    def paths(self):
+        return [p for p, _ in self.projects()]
+
+    def test_c_worktree_real_spelling_first_then_main_via_alias(self):
+        m = self.main_repo()
+        wt = self.claude_worktree(m)
+        self.capture(self.real(wt), session="wt-s")
+        self.capture(m, session="main-s")
+        self.assertEqual(self.paths(), [str(self.real(m))])
+
+    def test_c_reverse_main_via_alias_then_worktree_real_spelling(self):
+        m = self.main_repo()
+        wt = self.claude_worktree(m)
+        self.capture(m, session="main-s")
+        self.capture(self.real(wt), session="wt-s")
+        self.assertEqual(self.paths(), [str(m)])
+
+    def test_d_external_worktree_first_then_main_via_alias(self):
+        m = self.main_repo()
+        ext = self.base / "ext-wt"
+        git(m, "worktree", "add", "-q", "-b", "ext", str(ext))
+        self.capture(ext, session="ext-s")
+        self.capture(m, session="main-s")
+        self.assertEqual(self.paths(), [str(self.real(m))])
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM sessions"), [(2,)])
+
+    def test_d_reverse_main_via_alias_then_external_worktree(self):
+        m = self.main_repo()
+        ext = self.base / "ext-wt"
+        git(m, "worktree", "add", "-q", "-b", "ext", str(ext))
+        self.capture(m, session="main-s")
+        self.capture(ext, session="ext-s")
+        self.assertEqual(self.paths(), [str(m)])
+
+    def test_plain_repo_alias_and_real_spelling_share_one_row(self):
+        m = self.main_repo()
+        self.capture(self.real(m), session="a")
+        self.capture(m, session="b")
+        self.assertEqual(self.paths(), [str(self.real(m))])
+
+    def record_realpaths(self, fn):
+        seen = []
+        orig = os.path.realpath
+
+        def spy(p, *a, **k):
+            seen.append(str(p))
+            return orig(p, *a, **k)
+
+        with mock.patch("os.path.realpath", spy):
+            fn()
+        return seen
+
+    def seed(self, paths):
+        conn = capture.connect(self.db)
+        for p in paths:
+            conn.execute("INSERT INTO projects(path) VALUES (?)", (str(p),))
+        conn.commit()
+        conn.close()
+
+    def test_dead_rows_are_never_realpathed(self):
+        m = self.main_repo()
+        dead = self.base / "gone" / m.name  # same basename, no longer exists
+        self.seed([dead])
+        seen = self.record_realpaths(lambda: self.capture(m))
+        self.assertNotIn(str(dead), seen)
+        self.assertEqual(self.paths(), [str(dead), str(m)])
+
+    def test_rows_with_another_basename_are_never_realpathed(self):
+        m = self.main_repo()
+        other = make_repo(self.base / "other")
+        self.seed([other])
+        seen = self.record_realpaths(lambda: self.capture(m))
+        self.assertNotIn(str(other), seen)
+
+
+class TestEnableDisableScope(Fixture):
+    """/enable and /disable act on the repository capture keys to."""
+
+    def run_manage(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = manage.main([*argv, "--db", str(self.db)])
+        self.assertEqual(rc, 0)
+        return out.getvalue().strip().splitlines()[-1]
+
+    def test_resolve_root_from_worktree_is_main_with_its_worktrees(self):
+        m = self.main_repo()
+        wt = self.claude_worktree(m)
+        scope = json.loads(self.run_manage("resolve-root", "--cwd", str(wt)))
+        self.assertEqual(scope["root"], str(m))
+        self.assertTrue(scope["is_worktree"])
+        self.assertEqual([os.path.realpath(w) for w in scope["worktrees"]],
+                         [os.path.realpath(wt)])
+        self.assertEqual(scope["markers"], [str(m / ".claude" / "telemetry")])
+
+    def test_resolve_root_uses_the_stored_row_spelling(self):
+        m = self.main_repo()
+        real = os.path.realpath(m)
+        self.capture(real, session="r")
+        scope = json.loads(self.run_manage("resolve-root", "--cwd", str(m)))
+        self.assertEqual(scope["root"], real)
+
+    def test_disable_in_worktree_stops_capture_in_every_checkout(self):
+        m = self.main_repo()
+        wt = self.claude_worktree(m)
+        ext = self.base / "ext-wt"
+        git(m, "worktree", "add", "-q", "-b", "ext", str(ext))
+        (ext / ".claude").mkdir()
+        (ext / ".claude" / "telemetry").write_text("project\n")
+        summary = json.loads(self.run_manage("disable", "--cwd", str(wt)))
+        self.assertEqual(summary["root"], str(m))
+        self.assertEqual(len(summary["removed"]), 2)
+        for cwd, sid in ((m, "a"), (wt, "b"), (ext, "c")):
+            self.assertFalse(capture.is_enabled(cwd), cwd)
+            self.capture(cwd, session=sid)
+        self.assertFalse(self.db.exists())
+
+    def test_disable_clears_mirror_meta_on_the_main_row(self):
+        m = self.main_repo(marker="project\n")
+        wt = self.claude_worktree(m)
+        self.capture(wt)
+        self.assertEqual(len(self.rows(
+            "SELECT 1 FROM projects WHERE mirror_path IS NOT NULL")), 1)
+        self.run_manage("disable", "--cwd", str(wt))
+        self.assertEqual(self.rows(
+            "SELECT mirror_path FROM projects"), [(None,)])
+
+
 class TestWorktreeFold(Fixture):
     """The one-time v8 data step, on DB copies built at v7."""
 
@@ -461,6 +597,17 @@ class TestWorktreeFold(Fixture):
         conn.close()
         # One-time data step: a v8 DB is never folded again.
         self.assertEqual(len(self.projects()), 2)
+
+    def test_real_clone_under_worktrees_is_not_folded(self):
+        m = self.main_repo()
+        clone = m / ".claude" / "worktrees" / "clone"
+        subprocess.run(GIT + ["clone", "-q", str(m), str(clone)], check=True,
+                       capture_output=True)
+        self.assertTrue((clone / ".git").is_dir())
+        self.v7_db([(m, None, 1), (clone, None, 1)])
+        self.migrate()
+        self.assertEqual(self.sessions_by_project(),
+                         {str(m): 1, str(clone): 1})
 
     def test_unrelated_deeper_match_is_not_folded(self):
         # `<M>` = `<base>/vendor` is neither a project row nor a git repo.

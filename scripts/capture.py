@@ -509,10 +509,16 @@ def worktree_fold_target(path, other_paths):
     2. **Resolution** — ``path`` still exists and :func:`main_repo_root`
        resolves it to a different directory.
 
+    A path that still exists with its own ``.git`` DIRECTORY is a separate
+    repository (e.g. a real clone placed under ``.claude/worktrees/``) and is
+    never folded — capture keys its sessions at that path too.
+
     :param path: the row's stored path.
     :param other_paths: every OTHER row's stored path.
     :returns: the main-root path string, or None.
     """
+    if os.path.isdir(os.path.join(path, ".git")):
+        return None
     i = path.find(WORKTREE_COMPONENT)
     if i > 0 and any(path[i + len(WORKTREE_COMPONENT):].split("/")):
         main = path[:i]
@@ -540,7 +546,8 @@ def fold_worktree_projects(conn):
     (a main row's own pair is never overwritten); the worktree row is deleted.
     A main row that does not exist yet is created with the target spelling.
     ``audit_log.project`` is free text, a historical record — untouched.
-    Idempotent: a second run finds no worktree rows.
+    Idempotent: a second run finds no worktree rows (so the self-heal re-run
+    of a v8 DB whose shape check failed changes nothing already folded).
 
     :param conn: an open DB connection inside a write transaction.
     :returns: list of ``(worktree_path, main_path)`` pairs folded.
@@ -554,7 +561,7 @@ def fold_worktree_projects(conn):
         target = worktree_fold_target(path, others)
         if target is None:
             continue
-        dest_path = canonical_project_path(conn, target)
+        dest_path = _fold_dest_path(conn, target)
         row = conn.execute("SELECT id FROM projects WHERE path=?",
                            (dest_path,)).fetchone()
         dest = row[0] if row else conn.execute(
@@ -1015,13 +1022,25 @@ def main_repo_root(checkout):
         return None
 
 
+def _basename(path):
+    return os.path.basename(str(path).rstrip("/"))
+
+
 def canonical_project_path(conn, path):
     """The stored spelling of the ``projects`` row for the directory ``path``
-    names, so a worktree session never creates a duplicate row for its repo.
+    names, so no capture ever creates a second row for one repository (a
+    symlinked alias, a worktree keyed by realpath, …).
 
-    An exact string match wins; otherwise the first row whose path is
-    realpath-equal to ``path`` is returned with ITS stored spelling; with no
-    such row, ``path`` itself (the caller's insert then creates it).
+    * An exact string match wins — one indexed lookup, the steady-state path:
+      only the FIRST capture under a new spelling goes further.
+    * Otherwise, when ``path`` exists, the first row that is realpath-equal to
+      it is returned with ITS stored spelling. Latency bound: only rows whose
+      basename equals the basename of ``path`` or of its realpath are
+      candidates (string filter, no syscalls), and a candidate whose stored
+      path no longer exists (a deleted worktree) is compared by string only —
+      it is never realpath-resolved. Known gap: an alias whose LAST component
+      is itself a differently named symlink is not matched.
+    * Else ``path`` itself (the caller's insert then creates the row).
 
     :param conn: an open DB connection with a ``projects`` table.
     :param path: the candidate project path (string).
@@ -1031,11 +1050,35 @@ def canonical_project_path(conn, path):
     if conn.execute("SELECT 1 FROM projects WHERE path=?",
                     (path,)).fetchone():
         return path
+    if not os.path.exists(path):
+        return path
     real = os.path.realpath(path)
+    names = {_basename(path), _basename(real)}
+    for (stored,) in conn.execute("SELECT path FROM projects ORDER BY id"):
+        if (_basename(stored) in names and os.path.exists(stored)
+                and os.path.realpath(stored) == real):
+            return stored
+    return path
+
+
+def _fold_dest_path(conn, target):
+    """The fold's destination spelling for ``target``: an exact row, else a
+    realpath-equal row (the main folder may itself be gone, so no existence
+    guard here — the fold runs once, off the hook's steady-state path), else
+    ``target``.
+
+    :param conn: an open DB connection.
+    :param target: the main-root path the fold resolved.
+    :returns: the path string.
+    """
+    if conn.execute("SELECT 1 FROM projects WHERE path=?",
+                    (target,)).fetchone():
+        return target
+    real = os.path.realpath(target)
     for (stored,) in conn.execute("SELECT path FROM projects ORDER BY id"):
         if os.path.realpath(stored) == real:
             return stored
-    return path
+    return target
 
 
 def is_enabled(cwd):
@@ -1280,11 +1323,11 @@ def main():
         backend = storage.LocalSqliteBackend(db_path())
         backend.open()
         conn = backend.conn
-        project = str(key_root)
-        if main_root is not None:
-            # Before the write lock: reuse the main repo's existing row under
-            # its stored spelling (realpath-equal), never a duplicate.
-            project = canonical_project_path(conn, project)
+        # Before the write lock, for EVERY capture: reuse an existing row that
+        # is realpath-equal to the key under its stored spelling — never a
+        # second row for one repository (alias spellings, worktrees keyed by
+        # realpath, in either order). One indexed lookup once the row exists.
+        project = canonical_project_path(conn, str(key_root))
         mirror_batch = []
         try:
             # Take the write lock up front so concurrent hook firings on the

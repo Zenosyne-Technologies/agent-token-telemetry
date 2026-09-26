@@ -13,12 +13,16 @@ prompts hold NO raw SQL and their permission grants pin to this one script:
   clear-mirror-meta --project P     forget a project-level copy (bookkeeping)
   register-name --project P --name N
   register-user --name N            mint/reuse the central identity, upsert users
+  resolve-root [--cwd D]            JSON: the repository /enable and /disable act on
+  disable [--cwd D]                 remove every opt-in marker of that repository
+                                    (main + all worktrees + cwd), clear mirror meta
 
 DBs are opened through capture.connect() (the schema owner) for writes. Shared
 table copies introspect the COMMON columns of source and destination, so an
 export never silently drops a column added by a later schema version.
 """
 import argparse
+import json
 import os
 import sqlite3
 import sys
@@ -481,12 +485,89 @@ def import_project(db, source, project, name=None):
     return 0
 
 
+def repo_scope(cwd, db):
+    """The repository ``/enable`` and ``/disable`` act on — resolved exactly as
+    capture resolves its project key, so the commands and capture can never
+    disagree about which project a directory belongs to.
+
+    Inside a linked worktree that is the MAIN repository
+    (:func:`capture.main_repo_root`), and the scope covers the main checkout
+    and ALL its worktrees (listed with ``git worktree list --porcelain``
+    through :func:`capture.git`'s hardened call). ``root`` is spelled as the
+    central DB already stores it (:func:`capture.canonical_project_path`), so
+    ``clear-mirror-meta``/``register-name`` hit the captured row.
+
+    :param cwd: the directory the command runs from.
+    :param db: the central DB path (may not exist yet).
+    :returns: dict — ``root`` (project key), ``checkout``, ``is_worktree``,
+        ``worktrees`` (other checkouts of the repo), ``markers`` (existing
+        ``.claude/telemetry`` files in root, worktrees, checkout and cwd).
+    """
+    cwd = Path(cwd)
+    checkout = capture.find_project_root(cwd)
+    main_root = capture.main_repo_root(checkout)
+    base = main_root or checkout
+    root = str(base)
+    if Path(db).exists():
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                root = capture.canonical_project_path(conn, root)
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass
+    worktrees = []
+    if (Path(base) / ".git").is_dir():
+        out = capture.git(base, "worktree", "list", "--porcelain") or ""
+        base_real = os.path.realpath(base)
+        for line in out.splitlines():
+            if line.startswith("worktree "):
+                wt = line[len("worktree "):]
+                if os.path.realpath(wt) != base_real:
+                    worktrees.append(wt)
+    markers, seen = [], set()
+    for d in (base, *worktrees, checkout, cwd):
+        m = Path(d) / ".claude" / "telemetry"
+        key = os.path.realpath(m)
+        if key not in seen and os.path.lexists(m):
+            seen.add(key)
+            markers.append(str(m))
+    return {"root": root, "checkout": str(checkout),
+            "is_worktree": main_root is not None, "worktrees": worktrees,
+            "markers": markers}
+
+
+def disable(db, cwd):
+    """Turn capture off for the WHOLE repository ``cwd`` belongs to: remove
+    every opt-in marker :func:`repo_scope` finds (main root, every worktree,
+    the checkout and cwd — a symlinked marker is unlinked, never followed),
+    then clear the root row's mirror metadata. Prints one JSON summary.
+
+    :param db: the central DB path.
+    :param cwd: the directory the command runs from.
+    :returns: exit code 0.
+    """
+    scope = repo_scope(cwd, db)
+    removed = []
+    for m in scope["markers"]:
+        try:
+            os.unlink(m)
+            removed.append(m)
+        except FileNotFoundError:
+            pass
+    clear_mirror_meta(db, scope["root"])
+    print(json.dumps({"root": scope["root"], "worktrees": scope["worktrees"],
+                      "removed": removed}))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="manage.py")
     ap.add_argument("command", choices=[
         "list-projects", "counts", "export", "delete", "audit",
         "clear-mirror-meta", "register-name", "register-user",
-        "import-check", "import-project"])
+        "import-check", "import-project", "resolve-root", "disable"])
     ap.add_argument("--db", default=None)
     ap.add_argument("--project", default=None)
     ap.add_argument("--out", default=None)
@@ -494,6 +575,7 @@ def main(argv=None):
     ap.add_argument("--action", default=None)
     ap.add_argument("--detail", default="")
     ap.add_argument("--name", default=None)
+    ap.add_argument("--cwd", default=None)
     a = ap.parse_args(argv)
     db = a.db or capture.db_path()
     need = {"counts": ("project",), "export": ("project", "out"),
@@ -506,6 +588,11 @@ def main(argv=None):
     for arg in need.get(a.command, ()):
         if getattr(a, arg) is None:
             return fail(f"{a.command} requires --{arg}")
+    if a.command == "resolve-root":
+        print(json.dumps(repo_scope(a.cwd or os.getcwd(), db)))
+        return 0
+    if a.command == "disable":
+        return disable(db, a.cwd or os.getcwd())
     if a.command == "list-projects":
         return list_projects(db)
     if a.command == "counts":

@@ -31,9 +31,17 @@ A submodule (`gitdir` under `.git/modules/…`), a bare repo's worktree (common 
 named `.git`), a plain checkout and a non-git directory are their own project, unchanged.
 **Spelling:** a checkout at `<M>/.claude/worktrees/<…>` keys as `<M>` exactly as spelled
 (how the main repo's own sessions write it); any other worktree keys as the realpath of
-the main root, and capture reuses an existing row that is realpath-equal to it under
-that row's stored spelling — one repository, one row. A consumer running inside a
-worktree resolves its own project root the same way. Branch, commit sha and the
+the main root. Every capture (worktree or not) then reuses an existing row that is
+realpath-equal to its key under that row's stored spelling, so symlinked and real
+spellings of one repository share one row in either order. The lookup is exact-match
+first; only a key with no exact row compares by realpath, and only against rows with
+the same basename (of the key or its realpath) whose stored path still exists — a
+deleted path is compared by string. Known gap: an alias whose last component is itself
+a differently named symlink is not matched. A consumer running inside a
+worktree resolves its own project root the same way. `/token-telemetry:enable` and
+`/token-telemetry:disable` resolve the same root (`manage.py resolve-root`), so they act
+on the main repository and all its worktrees; disable removes the opt-in marker from
+the main root, every worktree, the current checkout and the cwd. Branch, commit sha and the
 commit-subject `issue_key` fallback still come from the worktree checkout.
 
 ## Storage modes (v0.3.0)
@@ -178,8 +186,12 @@ heals itself.
   the main row takes the worktree's `name` only if it has none, and its
   `mirror_path`/`mirror_last_at` pair only if it has no mirror configured; the worktree
   row is deleted. `events` and `cursors` hang off sessions/transcripts and do not move;
-  `audit_log.project` is historical free text and stays untouched. Fold and stamp share
-  one transaction; a v8 DB is never folded again. **Limitation:** a worktree that lived
+  `audit_log.project` is historical free text and stays untouched. A path that still
+  exists with its own `.git` directory (a real clone under `.claude/worktrees/`) is a
+  separate repository and never folds. Fold and stamp share one transaction. The fold is
+  idempotent: a DB at v8 skips it on the fast path; a v8 DB whose shape check fails
+  (the self-heal path) re-walks the hop chain, runs the fold again and changes nothing
+  already folded — it folds only worktree rows that appeared since. **Limitation:** a worktree that lived
   outside `.claude/worktrees/` and has since been deleted cannot be recognised, so its
   row stays. **Remote (Supabase):** new captures key correctly (same resolution), but
   remote history is **not** folded — see the developer handbook `capture-pipeline.md`.

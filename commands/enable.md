@@ -5,7 +5,17 @@ allowed-tools: Bash(mkdir:*), Bash(printf:*), Bash(python3 "${CLAUDE_PLUGIN_ROOT
 
 Enable token telemetry for this project:
 
-1. Find the project root: the git root of the current directory, else the current directory.
+1. Resolve the project root the same way capture does — inside a git worktree it is the
+   worktree's **main repository**, and enabling applies to the main checkout **and all
+   its worktrees**:
+
+   ```
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/manage.py" resolve-root --cwd "<current directory>"
+   ```
+
+   It prints JSON; use its `root` as `<root>` in every step below. `worktrees` lists
+   the repository's other checkouts, and `markers` any opt-in markers already present
+   (a worktree's own marker keeps selecting that worktree's storage mode).
 2. Ask the user where the data should be stored (AskUserQuestion, two options):
    - **Central only** (default) — events go to `~/.claude/telemetry/usage.db` only.
    - **Project folder** — events go to the central DB *and* a project-local copy at
@@ -78,7 +88,8 @@ Enable token telemetry for this project:
    a commit, an issue, a URL, or a log. Skipping this step entirely is fine —
    capture then leaves `owner_id` NULL (pre-identity) and works exactly as before.
 
-9. Tell the user: telemetry is enabled for this project. **Restart warning — always state it**: capture hooks load at Claude Code session start, so if the token-telemetry plugin was installed during THIS session (or this is the first enable after installing), nothing is recorded until Claude Code restarts — restart now to start capturing. Every completed turn and
+9. Tell the user: telemetry is enabled for `<root>` — **this applies to `<root>` and
+   all its worktrees** (name them from `worktrees` when there are any). **Restart warning — always state it**: capture hooks load at Claude Code session start, so if the token-telemetry plugin was installed during THIS session (or this is the first enable after installing), nothing is recorded until Claude Code restarts — restart now to start capturing. Every completed turn and
    subagent is recorded (no tokens are consumed by capture). The marker file can be
    committed to enable it for the whole team. Use `/token-telemetry:info` to check
    status and `/token-telemetry:disable` to turn it off.

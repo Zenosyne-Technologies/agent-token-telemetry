@@ -829,23 +829,21 @@ FROM priced""", rowids).fetchone()
 
 def project_key(conn, checkout):
     """The ``projects.path`` this checkout's events are recorded under — the
-    same resolution capture uses: a linked worktree's main repository (under
-    the stored spelling of its existing row, when ``conn`` is given), else the
-    checkout itself.
+    same resolution capture uses: a linked worktree's main repository, else
+    the checkout itself — under the stored spelling of a realpath-equal
+    existing row when ``conn`` is given.
 
     :param conn: an open DB connection, or None.
     :param checkout: :func:`capture.find_project_root` of the caller's cwd.
     :returns: the path string.
     """
-    main = capture.main_repo_root(checkout)
-    if main is None:
-        return str(checkout)
+    key = str(capture.main_repo_root(checkout) or checkout)
     if conn is None:
-        return str(main)
+        return key
     try:
-        return capture.canonical_project_path(conn, str(main))
+        return capture.canonical_project_path(conn, key)
     except Exception:
-        return str(main)
+        return key
 
 
 def fetch_scoped_rollup(conn, cwd, scope_raw):

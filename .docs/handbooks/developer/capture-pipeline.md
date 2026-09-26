@@ -128,13 +128,30 @@ The key's **spelling** must equal how the main repo's own sessions spell it, or
 one repository would split into two rows. A checkout at
 `<M>/.claude/worktrees/<…>` therefore keys as `<M>` string-for-string (when
 `<M>` realpaths to the resolved main); any other worktree keys as the realpath
-of the main root, and `canonical_project_path()` then reuses an existing row
-that is realpath-equal to it, under that row's stored spelling. That lookup
-runs only for worktree sessions and before `BEGIN IMMEDIATE`. `report.py`'s
+of the main root. For EVERY capture, `canonical_project_path()` then reuses an
+existing row that is realpath-equal to the key, under that row's stored
+spelling — an alias spelling and the real one, a worktree captured first and
+its main repo second, all land on one row in either order. It runs before
+`BEGIN IMMEDIATE` and is bounded for the hook's latency budget: an exact
+string match returns at once (the steady state — only the first capture under
+a new spelling goes further); a key that does not exist is never resolved;
+candidates are only rows whose basename equals the key's or its realpath's
+(a string filter, no syscalls); and a candidate whose stored path no longer
+exists (a deleted worktree) is compared by string, never realpath-resolved.
+Known gap: an alias whose last component is itself a differently named
+symlink is not matched. The fold uses its own unguarded realpath lookup
+(`_fold_dest_path`), since a main folder may itself be gone and the fold runs
+once, off the steady-state path. `report.py`'s
 this-project views (`/info`, scoped roll-ups) resolve the same key, so they
-show the main project's numbers from inside a worktree. The enable/disable
-commands still resolve `git rev-parse --show-toplevel`, i.e. the worktree —
-a marker written there simply counts as the worktree's own.
+show the main project's numbers from inside a worktree. `/enable` and
+`/disable` resolve the same root through `manage.py resolve-root` /
+`manage.py disable` (`repo_scope()`): the main repository plus every checkout
+`git worktree list --porcelain` names. Enable writes the marker at the main
+root and tells the user it applies to the main repo and all its worktrees;
+disable removes the marker from the main root, every worktree, the current
+checkout and the cwd, then clears the root row's mirror metadata — so a
+disable run inside a worktree really stops capture in every checkout. A
+marker hand-placed in some other subdirectory is not searched for.
 
 ## One-time fold of existing worktree rows (v8)
 
@@ -152,6 +169,10 @@ row by either of two rules (`worktree_fold_target()`):
 2. **Resolution** — the path still exists and `main_repo_root()` maps it to a
    different directory (worktrees created outside `.claude/worktrees/`).
 
+A row whose path still exists with its own `.git` DIRECTORY is never folded
+by either rule: it is a separate repository (a real clone placed under
+`.claude/worktrees/`), and capture keys its sessions at that path too.
+
 The target row is found by realpath equality (stored spelling kept) or created
 spelled `<M>`. Tables: `sessions.project_id` is reassigned — the only column
 keyed by project id; `events` (via `session_id`) and `cursors` (via transcript)
@@ -165,7 +186,10 @@ The fold and the `user_version=8` stamp share one `BEGIN IMMEDIATE`
 transaction (`user_version` is transactional), the version is re-read under
 the lock so a peer that folded first makes it a no-op, and any exception rolls
 back and returns False so the next `connect()` retries — the capture itself is
-never failed over it. A v8 DB is never folded again. **Limitation:** a
+never failed over it. The fold is idempotent: a DB at v8 skips it on the
+fast path; a v8 DB whose shape check fails (the self-heal path) re-walks the
+hop chain — `migrate_v7` restamps 7 and the fold runs again, changing nothing
+already folded and folding only worktree rows that appeared since. **Limitation:** a
 worktree created outside `.claude/worktrees/` whose folder has been deleted
 matches neither rule, so its row stays separate.
 
