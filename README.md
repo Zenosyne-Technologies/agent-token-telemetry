@@ -11,6 +11,8 @@ default** — local SQLite stays the default and the durable store — and is
 enabled with `/token-telemetry:enable-remote`. See the user handbook for the
 enable/migrate flow and the operator/security guide.
 
+v0.16.1 hardens **sub-agent capture under parallel load**. The sweep committed up to 40 sub-agent transcripts in ONE transaction, so when a hook was killed at its timeout — a large session running 3-6 agents in parallel on a slow or contended working directory (e.g. a cloud-drive mount) — the whole batch rolled back and the cursors froze: capture silently stopped for that session (no `error.log`, since a kill logs nothing) while small, quiet projects kept recording. Each sub-agent file now commits in its **own** transaction and the sweep stops on a wall-clock budget, so progress is always durable and the remainder resumes on the next firing; the Stop/SubagentStop hook timeout is raised 10s -> 30s for headroom on cold cloud-drive cwds.
+
 v0.10.0 (schema v6) records **per-event agent metrics** — `api_calls` (how many
 API calls a turn or sub-agent slice contained) and `ctx_tokens` (context size
 when it ended: the last call's input side, i.e. the number Claude Code's own

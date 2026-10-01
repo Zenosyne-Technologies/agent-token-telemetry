@@ -3,6 +3,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 import capture
@@ -1065,6 +1066,42 @@ class TestSubagentSweep(unittest.TestCase):
         write_jsonl(other, [entry()])
         self.assertEqual(capture.sweep_subagents(
             self.conn, "/proj", "s1", str(other), self.META, None), [])
+
+    def test_each_file_commits_independently(self):
+        # A failure (stand-in for a hook SIGKILL) partway through the sweep must
+        # keep every file already processed — the frozen-cursor stall came from
+        # one 40-file transaction being rolled back as a whole.
+        for i in range(4):
+            self.add_agent(f"a{i}", "marvin:developer", out=10 + i)
+        real_insert = capture.insert_events
+        n = {"calls": 0}
+
+        def boom(*a, **k):
+            n["calls"] += 1
+            if n["calls"] == 3:          # die on the third file
+                raise RuntimeError("killed mid-sweep")
+            return real_insert(*a, **k)
+
+        with mock.patch.object(capture, "insert_events", boom):
+            with self.assertRaises(RuntimeError):
+                self.sweep()
+        self.assertEqual(len(self.events()), 2)   # first two durable
+        self.assertEqual(len(self.sweep()), 2)    # remainder recovers next firing
+        self.assertEqual(len(self.events()), 4)
+
+    def test_deadline_defers_remainder_to_next_firing(self):
+        # Once the wall-clock budget passes, the sweep stops and leaves the rest
+        # for the next firing — so one firing never crosses the hook timeout.
+        for i in range(5):
+            self.add_agent(f"a{i:02d}", "marvin:developer")
+        clock = iter([100.0, 100.0, 200.0])   # third check trips deadline=150
+        with mock.patch.object(capture.time, "monotonic", lambda: next(clock)):
+            first = capture.sweep_subagents(
+                self.conn, "/proj", "s1", str(self.main), self.META,
+                "hook-agent", deadline=150.0)
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(self.sweep()), 3)    # no deadline — drains the rest
+        self.assertEqual(len(self.events()), 5)
 
     def test_main_transcript_rows_never_wear_the_agent_label(self):
         # The SubagentStop payload names an agent, but the main transcript it
