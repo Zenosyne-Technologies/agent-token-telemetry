@@ -801,10 +801,15 @@ def record(conn, project, session_uuid, kind_hint, agent, groups,
         write_cursor(conn, transcript, new_offset, session_id)
 
 
-# At most this many sub-agent transcript files advance per hook firing, so a
-# large backlog (the first sweep after upgrading, or a subagent-heavy session)
-# cannot blow the hook timeout — the remainder lands on subsequent firings.
+# A sub-agent sweep stops at this many committed files OR this many wall-clock
+# seconds since the hook started, whichever comes first, so one firing never
+# crosses the hook timeout — the remainder lands on subsequent firings. Each
+# file commits in its own transaction (below), so progress survives even if the
+# hook is killed partway: a subagent-heavy, highly-parallel session can no
+# longer freeze its cursors by losing a whole 40-file transaction to the kill.
 SUBAGENT_BATCH = 40
+SWEEP_BUDGET_S = 20.0
+_HOOK_START = time.monotonic()   # process start — the sweep deadline is relative to this
 
 
 def subagents_dir(transcript):
@@ -827,41 +832,55 @@ def subagent_label(jsonl_path):
 
 
 def sweep_subagents(conn, project, session_uuid, transcript, meta,
-                    hook_agent, owner_id=None):
+                    hook_agent, owner_id=None, deadline=None):
     """Capture new usage from the session's sub-agent transcript files —
     per-file cursors, one kind=1 event batch per file, labeled from its
-    meta.json. Bounded by SUBAGENT_BATCH per firing. Wraps its own BEGIN
-    IMMEDIATE (the caller's main-transcript transaction has already
-    committed). Returns the inserted event-arg tuples for mirroring."""
+    meta.json.
+
+    Each file commits in its OWN BEGIN IMMEDIATE transaction (the caller's
+    main-transcript transaction has already committed), so a hook killed
+    mid-sweep keeps every file it had already processed — the frozen-cursor
+    stall came from a single 40-file transaction being rolled back by the kill.
+    Stops at SUBAGENT_BATCH committed files or, when given, once `deadline`
+    (a time.monotonic() value) passes; the remainder lands on the next firing.
+    Returns the inserted event-arg tuples for mirroring."""
     d = subagents_dir(transcript)
     try:
         files = sorted(p for p in d.iterdir() if p.suffix == ".jsonl")
     except OSError:
         return []  # no subagents directory — nothing to sweep
     inserted = []
-    conn.execute("BEGIN IMMEDIATE")
-    with conn:
-        for f in files:
-            if len(inserted) >= SUBAGENT_BATCH:
-                break
-            offset = get_offset(conn, f)
-            try:
-                if f.stat().st_size <= offset:
-                    continue  # nothing new — skip without opening the file
-            except OSError:
+    for f in files:
+        if len(inserted) >= SUBAGENT_BATCH:
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            break  # out of time budget — the rest lands on the next firing
+        # Cheap skip of untouched files WITHOUT taking the write lock: a dirty
+        # cursor read plus a stat. Only a file with new bytes pays for a lock;
+        # the authoritative offset is re-read under the lock below.
+        try:
+            if f.stat().st_size <= get_offset(conn, f):
                 continue
-            entries, new_offset = read_new_entries(f, offset)
-            groups = aggregate(entries)
-            if not groups and new_offset == offset:
-                continue
-            event_args = (project, session_uuid, 1,
-                          subagent_label(f) or hook_agent, groups)
-            session_id = insert_events(conn, *event_args, *meta,
-                                       first_capture=(offset == 0),
-                                       owner_id=owner_id)
-            write_cursor(conn, f, new_offset, session_id)
-            if groups:
-                inserted.append((event_args, offset == 0))
+        except OSError:
+            continue
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            with conn:
+                offset = get_offset(conn, f)
+                entries, new_offset = read_new_entries(f, offset)
+                groups = aggregate(entries)
+                if not groups and new_offset == offset:
+                    continue  # commits the empty txn and moves on
+                event_args = (project, session_uuid, 1,
+                              subagent_label(f) or hook_agent, groups)
+                session_id = insert_events(conn, *event_args, *meta,
+                                           first_capture=(offset == 0),
+                                           owner_id=owner_id)
+                write_cursor(conn, f, new_offset, session_id)
+        except sqlite3.OperationalError:
+            break  # lock contention — stop; committed files stay, rest next firing
+        if groups:
+            inserted.append((event_args, offset == 0))
     return inserted
 
 
@@ -1372,7 +1391,8 @@ def main():
             stamp_project_name(conn, project, kit_name)
             for swept, fc in sweep_subagents(
                     conn, project, hook.get("session_id") or "unknown",
-                    transcript, meta, agent, owner_id):
+                    transcript, meta, agent, owner_id,
+                    deadline=_HOOK_START + SWEEP_BUDGET_S):
                 mirror_batch.append(((*swept, *meta), fc))
         finally:
             backend.close()
